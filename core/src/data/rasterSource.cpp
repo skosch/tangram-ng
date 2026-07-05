@@ -7,7 +7,113 @@
 #include "util/mapProjection.h"
 #include "log.h"
 
+#include <cstring>
+#include <vector>
+
 namespace Tangram {
+
+namespace {
+
+// Copy one WxW cell (raw bytes, `bpp` bytes/pixel) into the mosaic buffer at grid position
+// (dx+1, dy+1), dx/dy in {-1, 0, 1}. See stitchElevationMosaic() for the overall layout.
+void copyMosaicCell(GLubyte* mosaic, size_t mosaicRowBytes, int W, int bpp,
+                     int dx, int dy, const GLubyte* srcData) {
+    size_t rowOff = size_t(dy + 1) * size_t(W);
+    size_t colOff = size_t(dx + 1) * size_t(W) * size_t(bpp);
+    for (int r = 0; r < W; r++) {
+        GLubyte* dst = mosaic + (rowOff + size_t(r)) * mosaicRowBytes + colOff;
+        const GLubyte* src = srcData + size_t(r) * size_t(W) * size_t(bpp);
+        std::memcpy(dst, src, size_t(W) * size_t(bpp));
+    }
+}
+
+// Synthesize a missing neighbor cell at grid position (dx+1, dy+1) by mirror-extrapolating
+// `ownData` (the tile's own WxW buffer): flip vertically for a N/S neighbor (dy != 0),
+// horizontally for an E/W neighbor (dx != 0), both ways for a diagonal neighbor. This is a
+// pure byte/index shuffle -- no pixel decode -- so it's agnostic to the source's pixel
+// encoding (terrarium-RGB, float, etc.) and only ever feeds the coarsest mip levels of the
+// shader-side pyramid, where exactness doesn't matter.
+void fillMirroredNeighborCell(GLubyte* mosaic, size_t mosaicRowBytes, int W, int bpp,
+                               int dx, int dy, const GLubyte* ownData) {
+    size_t rowOff = size_t(dy + 1) * size_t(W);
+    size_t colOff = size_t(dx + 1) * size_t(W) * size_t(bpp);
+    for (int r = 0; r < W; r++) {
+        int srcRow = (dy == 0) ? r : (W - 1 - r);
+        const GLubyte* srcRowPtr = ownData + size_t(srcRow) * size_t(W) * size_t(bpp);
+        GLubyte* dstRowPtr = mosaic + (rowOff + size_t(r)) * mosaicRowBytes + colOff;
+        if (dx == 0) {
+            std::memcpy(dstRowPtr, srcRowPtr, size_t(W) * size_t(bpp));
+        } else {
+            for (int c = 0; c < W; c++) {
+                int srcCol = W - 1 - c;
+                std::memcpy(dstRowPtr + size_t(c) * size_t(bpp), srcRowPtr + size_t(srcCol) * size_t(bpp), size_t(bpp));
+            }
+        }
+    }
+}
+
+} // namespace
+
+std::shared_ptr<Texture> stitchElevationMosaic(const std::shared_ptr<Texture>& own,
+                                                const std::array<std::shared_ptr<Texture>, 9>& neighbors) {
+    if (!own) { return nullptr; }
+
+    int W = own->width();
+    if (W <= 0 || W != own->height()) {
+        LOGE("stitchElevationMosaic: source texture must be square (got %dx%d)", own->width(), own->height());
+        return nullptr;
+    }
+
+    const GLubyte* ownData = own->bufferData();
+    if (!ownData) {
+        LOGE("stitchElevationMosaic: source texture has no CPU buffer data"
+             " (RasterSource::m_keepTextureData must be set for the elevation source)");
+        return nullptr;
+    }
+
+    TextureOptions options = own->getOptions();
+    int bpp = options.bytesPerPixel();
+
+    int mosaicW = 3 * W;
+    size_t mosaicRowBytes = size_t(mosaicW) * size_t(bpp);
+    std::vector<GLubyte> mosaic(mosaicRowBytes * size_t(mosaicW));
+
+    // Tile's own data occupies the center third [W, 2W) x [W, 2W) -- see
+    // docs/texture-shading-plan.md "Frozen Interface Contract".
+    copyMosaicCell(mosaic.data(), mosaicRowBytes, W, bpp, 0, 0, ownData);
+
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) { continue; }
+
+            const auto& neighborTex = neighbors[size_t(dy + 1) * 3 + size_t(dx + 1)];
+
+            if (neighborTex && neighborTex->bufferData() &&
+                neighborTex->width() == W && neighborTex->height() == W &&
+                neighborTex->getOptions().bytesPerPixel() == bpp) {
+                copyMosaicCell(mosaic.data(), mosaicRowBytes, W, bpp, dx, dy, neighborTex->bufferData());
+            } else {
+                fillMirroredNeighborCell(mosaic.data(), mosaicRowBytes, W, bpp, dx, dy, ownData);
+            }
+        }
+    }
+
+    // Frozen Interface Contract: mosaic must be uploaded with hardware mipmaps and
+    // LINEAR_MIPMAP_LINEAR/LINEAR filtering; wrap stays CLAMP_TO_EDGE (the mosaic already
+    // contains real neighbor data -- or a mirrored approximation of it -- so it must not rely
+    // on GL texture repeat/wrap). This is a per-texture override: `own`'s own TextureOptions
+    // (e.g. plain "nearest" filtering used by the per-tile cache) is left untouched.
+    options.generateMipmaps = true;
+    options.minFilter = TextureMinFilter::LINEAR_MIPMAP_LINEAR;
+    options.magFilter = TextureMagFilter::LINEAR;
+    options.wrapS = TextureWrap::CLAMP_TO_EDGE;
+    options.wrapT = TextureWrap::CLAMP_TO_EDGE;
+
+    auto tex = std::make_shared<Texture>(options);
+    tex->setPixelData(mosaicW, mosaicW, bpp, mosaic.data(), mosaic.size());
+
+    return tex;
+}
 
 class RasterTileTask : public BinaryTileTask {
 public:
@@ -66,6 +172,20 @@ public:
         if (!raster) {
           auto tex = source->cacheTexture(m_tileId, std::move(texture));
           raster = std::make_unique<Raster>(m_tileId, tex);
+        }
+        // `raster->texture` is always the plain per-tile texture from RasterSource::m_textures
+        // at this point (whether just decoded above, or found via the createRasterTask() reuse
+        // path) -- for the elevation source, replace it with a freshly-stitched neighbor mosaic
+        // for rendering, without disturbing what's cached in m_textures (other tiles still need
+        // the plain per-tile texture as *their* neighbor data). See
+        // docs/texture-shading-plan.md Phase 2.
+        if (source->m_buildElevationMosaic) {
+            if (auto mosaicTex = source->buildElevationMosaic(m_tileId, raster->texture)) {
+                _tile.rasters().emplace_back(raster->tileID, mosaicTex);
+                return;
+            }
+            // Fall through to the plain texture if the mosaic couldn't be built (e.g. no
+            // CPU-side buffer data was retained).
         }
         _tile.rasters().emplace_back(raster->tileID, raster->texture);
     }
@@ -220,6 +340,38 @@ std::shared_ptr<Texture> RasterSource::cacheTexture(const TileID& _tileId, std::
 std::shared_ptr<Texture> RasterSource::getTexture(TileID _tile) {
     auto texIt = m_textures->find(_tile);
     return texIt != m_textures->end() ? texIt->second.lock() : nullptr;
+}
+
+std::shared_ptr<Texture> RasterSource::buildElevationMosaic(TileID _tile, const std::shared_ptr<Texture>& _ownTexture) {
+    // Look up whichever of the 8 same-zoom neighbors are already cached (getTexture() is only
+    // safe to call here because addRaster()/complete() run on the main thread -- see the
+    // thread-safety note on RasterTileTask::addRaster()). Missing neighbors are left null;
+    // stitchElevationMosaic() synthesizes them via mirror-extrapolation.
+    std::array<std::shared_ptr<Texture>, 9> neighbors;
+    int32_t max = 1 << _tile.z;
+
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) { continue; }
+
+            int32_t ny = _tile.y + dy;
+            if (ny < 0 || ny >= max) { continue; }  // no tile across a pole -- leave as "missing"
+
+            int32_t nx = ((_tile.x + dx) % max + max) % max;  // wrap around the antimeridian
+
+            neighbors[size_t(dy + 1) * 3 + size_t(dx + 1)] = getTexture(TileID(nx, ny, _tile.z, _tile.s));
+        }
+    }
+
+    auto mosaic = stitchElevationMosaic(_ownTexture, neighbors);
+
+    if (mosaic) {
+        LOGD("Elevation mosaic for tile %s: %dx%d (own tile %dx%d)", _tile.toString().c_str(),
+             mosaic->width(), mosaic->height(),
+             _ownTexture ? _ownTexture->width() : 0, _ownTexture ? _ownTexture->height() : 0);
+    }
+
+    return mosaic;
 }
 
 Raster RasterSource::getRaster(ProjectedMeters _meters) {
