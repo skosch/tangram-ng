@@ -43,6 +43,14 @@ public:
 
     bool m_keepTextureData = false;
 
+    // Phase 1 (docs/texture-shading-plan.md "Frozen Interface Contract"): when true,
+    // TileManager::enqueueNeighborPrefetch() will proactively enqueue low-priority
+    // background fetches for a visible tile's 8 same-zoom neighbor tiles, so that a
+    // later mosaic-stitching step has real (not extrapolated) neighbor data available
+    // more often. Only ever set for the elevation raster source (see scene.cpp, near
+    // where m_keepTextureData is set). Must not affect any other raster source.
+    bool m_prefetchNeighbors = false;
+
     RasterSource(const std::string& _name, std::unique_ptr<DataSource> _sources,
                  TextureOptions _options, TileSource::ZoomOptions _zoomOptions = {});
 

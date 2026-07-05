@@ -36,6 +36,15 @@ struct TileManager::TileEntry {
     // is tile in TileSet.visibleTiles?
     bool m_visible = false;
 
+    // Phase 1 (docs/texture-shading-plan.md): true for entries created purely to
+    // prefetch a same-zoom neighbor of some visible elevation tile (see
+    // TileManager::enqueueNeighborPrefetch). Such entries must never be treated as
+    // visible or as a real proxy - they exist only to keep their TileTask alive long
+    // enough to finish loading and get cached, so must be kept out of m_tiles (i.e.
+    // never rendered) and out of label/mesh-driving logic despite living in the same
+    // TileSet::tiles map as real tiles.
+    bool m_prefetchOnly = false;
+
     bool isInProgress() {
         return bool(task) && !task->isCanceled();
     }
@@ -104,6 +113,8 @@ struct TileManager::TileEntry {
 
     void setVisible(bool _visible) {
         m_visible = _visible;
+        // a tile that becomes genuinely visible is no longer just a prefetch stub
+        if (_visible) { m_prefetchOnly = false; }
     }
 };
 
@@ -304,6 +315,12 @@ void TileManager::updateTileSet(TileSet& _tileSet, const ViewState& _view) {
     auto& tiles = _tileSet.tiles;
     const auto& visibleTiles = _tileSet.visibleTiles;
 
+    // Phase 1 (docs/texture-shading-plan.md): for the elevation source only, make sure
+    // each visible tile's 8 same-zoom neighbors are also being fetched in the
+    // background. Must run before the diff loop below so freshly-added prefetch
+    // entries are picked up by the same-frame proxy/cleanup passes.
+    enqueueNeighborPrefetch(_tileSet, _view);
+
     // Pending proxy tiles too far from current zoom level will be canceled
     int maxProxyZ = 0, minProxyZ = 0, maxVisS = 0;
     if (!visibleTiles.empty()) {
@@ -445,7 +462,15 @@ void TileManager::updateTileSet(TileSet& _tileSet, const ViewState& _view) {
 #endif
 
         bool canLoad = entry.isInProgress() && (tileId.z < maxProxyZ && tileId.z > minProxyZ);
-        if (entry.isVisible() || (entry.m_proxyCounter > 0 && (entry.tile || canLoad))) {
+        // Phase 1 (docs/texture-shading-plan.md): keep a neighbor-prefetch-only entry
+        // alive while its fetch is still in flight, without treating it as visible or
+        // as a real proxy. Note entry.tile and entry.isInProgress() are mutually
+        // exclusive (completeTileTask() resets task exactly when tile is assigned), so
+        // this can never cause a prefetch-only tile to reach the `if (entry.tile)`
+        // rendering branch below - once its tile is ready this condition is false and
+        // it falls through to the cache/erase branch instead.
+        bool keepPrefetching = entry.m_prefetchOnly && entry.isInProgress();
+        if (entry.isVisible() || keepPrefetching || (entry.m_proxyCounter > 0 && (entry.tile || canLoad))) {
             if (entry.tile) {
                 entry.tile->setProxyDepth(entry.m_proxyCounter > 0 ? std::max(maxVisS - tileId.s, 1) : 0);
                 m_tiles.push_back(entry.tile);
@@ -483,17 +508,91 @@ void TileManager::updateTileSet(TileSet& _tileSet, const ViewState& _view) {
                 double scaleDiv = exp2(tileId.z - _view.zoom);
                 if (scaleDiv < 1) { scaleDiv = 0.1/scaleDiv; } // prefer parent tiles
                 task->setPriority(glm::length2(tileCenter - _view.center) * scaleDiv);
-                task->setProxyState(entry.m_proxyCounter > 0);
+                // keep prefetch-only fetches deprioritized in the TileWorker queue
+                // (same mechanism used for real proxy tiles) every frame, since this
+                // would otherwise reset it back to false each update
+                task->setProxyState(entry.m_proxyCounter > 0 || entry.m_prefetchOnly);
             }
             entry.m_proxyCounter = 0;  // reset for next update
             ++curTilesIt;
         } else {
             // Remove entry and move tile (if present) to cache
             if (entry.tile) {
+                if (entry.m_prefetchOnly) {
+                    LOGD("Neighbor prefetch: %s finished loading, texture now cached (source '%s')",
+                         tileId.toString().c_str(), _tileSet.source->name().c_str());
+                }
                 m_tileCache->put(_tileSet.source->id(), entry.tile);
             }
             // Remove tile from set - this will call clearTask() and thus cancelLoadingTile() as appropriate
             curTilesIt = tiles.erase(curTilesIt);
+        }
+    }
+}
+
+// Phase 1 (docs/texture-shading-plan.md "Neighbor tile prefetching"): for a RasterSource
+// with m_prefetchNeighbors set (only the elevation source used by ElevationManager, see
+// scene.cpp), proactively enqueue background fetches for each visible tile's 8 same-zoom
+// neighbor tiles (N/S/E/W/NE/NW/SE/SW), wrapping in x at the antimeridian (2^z) and
+// skipping out-of-range y at the poles - TileID has no existing helper for this, so it is
+// computed here. This is a no-op for every other source.
+//
+// Neighbor entries are inserted into the *same* TileSet::tiles map used for real tiles
+// (reusing the existing task-creation path, RasterSource::createTask(), so caching/
+// dedup/subtask logic all behave exactly as for a real tile) but are never added to
+// TileSet::visibleTiles, are marked TileEntry::m_prefetchOnly, and are deprioritized in
+// the TileWorker queue via TileTask::setProxyState(true) (the same mechanism used for
+// real proxy tiles) - see the retention/priority logic in updateTileSet() above for how
+// this keeps them from ever being rendered or affecting label/mesh building for real
+// tiles, while still letting their task run to completion and populate
+// RasterSource::m_textures. Once loaded they are cached via TileManager's normal
+// TileCache so the texture stays resident like any other recently-used tile.
+//
+// Known limitation: if a neighbor fetch permanently fails (e.g. 404 at a data edge), its
+// entry is dropped and will be retried again next frame for as long as the tile it is a
+// neighbor of stays visible. This is bounded (at most 8 extra requests per visible tile
+// per frame) and considered acceptable for this low-volume background prefetch; revisit
+// if it proves noisy in practice.
+void TileManager::enqueueNeighborPrefetch(TileSet& _tileSet, const ViewState& _view) {
+
+    auto* rasterSource = dynamic_cast<RasterSource*>(_tileSet.source.get());
+    if (!rasterSource || !rasterSource->m_prefetchNeighbors) { return; }
+
+    static const int neighborDx[8] = { -1,  0,  1, -1, 1, -1, 0, 1 };
+    static const int neighborDy[8] = { -1, -1, -1,  0, 0,  1, 1, 1 };
+
+    auto& tiles = _tileSet.tiles;
+    auto& visibleTiles = _tileSet.visibleTiles;
+
+    for (const TileID& visId : visibleTiles) {
+
+        int maxCoord = 1 << visId.z;
+
+        for (int ii = 0; ii < 8; ++ii) {
+            int ny = visId.y + neighborDy[ii];
+            if (ny < 0 || ny >= maxCoord) { continue; }  // no tile past the poles - don't wrap y
+            int nx = ((visId.x + neighborDx[ii]) % maxCoord + maxCoord) % maxCoord;  // wrap x at antimeridian
+
+            TileID neighborId(nx, ny, visId.z, visId.s);
+
+            if (visibleTiles.count(neighborId)) { continue; }  // already being fetched as a real visible tile
+            if (tiles.count(neighborId)) { continue; }  // already tracked (in-flight prefetch or stale entry)
+            if (rasterSource->getTexture(neighborId)) {
+                LOGD("Neighbor prefetch: %s already cached (neighbor of visible %s, source '%s')",
+                     neighborId.toString().c_str(), visId.toString().c_str(), rasterSource->name().c_str());
+                continue;
+            }
+
+            std::shared_ptr<Tile> noTile;
+            auto entryit = tiles.emplace(neighborId, noTile);
+            TileEntry& entry = entryit.first->second;
+            entry.task = _tileSet.source->createTask(neighborId);
+            entry.m_prefetchOnly = true;
+
+            enqueueTask(_tileSet, neighborId, _view);
+
+            LOGD("Neighbor prefetch: enqueued %s (neighbor of visible %s, source '%s')",
+                 neighborId.toString().c_str(), visId.toString().c_str(), rasterSource->name().c_str());
         }
     }
 }

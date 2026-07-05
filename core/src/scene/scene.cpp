@@ -289,6 +289,10 @@ bool Scene::load() {
     // need to keep elevation data if 3D terrain or contour labels enabled
     if (m_elevationManager || (terrainSrc && terrainSrc->TileSource::generateGeometry())) {
         terrainSrc->m_keepTextureData = true;
+        // Phase 1 (docs/texture-shading-plan.md): prefetch neighbor tiles only for the
+        // elevation raster source, so a later mosaic-stitching step has real neighbor
+        // data more often. Must not affect any other raster source.
+        terrainSrc->m_prefetchNeighbors = true;
     }
     LOGTO("<<< elevationManager");
 

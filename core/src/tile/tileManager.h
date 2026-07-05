@@ -93,6 +93,13 @@ protected:
 
     void enqueueTask(TileSet& _tileSet, const TileID& _tileID, const ViewState& _view);
 
+    // Phase 1 (docs/texture-shading-plan.md): for TileSets whose source has
+    // RasterSource::m_prefetchNeighbors set, proactively enqueue low-priority
+    // background fetches of each visible tile's 8 same-zoom neighbor tiles. No-op for
+    // any other source. See TileEntry::m_prefetchOnly for how these are kept from
+    // affecting rendering/proxy logic for real (visible) tiles.
+    void enqueueNeighborPrefetch(TileSet& _tileSet, const ViewState& _view);
+
     void loadTiles();
 
     // add new visible tile to TileSet
