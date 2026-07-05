@@ -290,6 +290,16 @@ bool Scene::load() {
     if (m_elevationManager || (terrainSrc && terrainSrc->TileSource::generateGeometry())) {
         terrainSrc->m_keepTextureData = true;
     }
+    // Live texture shading (docs/texture-shading-plan.md, Phase 2): only the elevation source
+    // that actually powers ElevationManager/hillshade gets CPU-side neighbor-mosaic stitching
+    // -- must not affect any other raster source. This must be set before any elevation tiles
+    // are requested (m_tileManager->setTileSources() above only registers sources; tiles are
+    // requested later from the render/update loop) and it applies to every texture this
+    // RasterSource creates from here on, including neighbor tiles, since RasterTileTask reads
+    // m_buildElevationMosaic (and m_keepTextureData, which this depends on) fresh each time.
+    if (m_elevationManager) {
+        terrainSrc->m_buildElevationMosaic = true;
+    }
     LOGTO("<<< elevationManager");
 
     // won't be initialized until sky is visible
