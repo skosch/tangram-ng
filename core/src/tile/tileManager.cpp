@@ -670,6 +670,25 @@ bool TileManager::addTile(TileSet& _tileSet, const TileID& _tileID) {
         if (tile->sourceGeneration() == _tileSet.source->generation()) {
             // Reset tile on potential internal dynamic data set
             tile->resetState();
+
+            // A tile built while it was prefetch-only (or proxy) was cached holding the plain
+            // per-tile elevation texture (RasterTileTask::addRaster() skips mosaic stitching
+            // for isProxy() tasks); now that it's becoming visible, upgrade it to the shared
+            // 3Wx3W mosaic the ELEVATION_MOSAIC shader path expects. Pointer equality with
+            // the RasterSource texture cache identifies a plain texture (a raster holding the
+            // plain texture keeps exactly that cache entry alive); a tile already holding a
+            // mosaic gets it back unchanged from buildElevationMosaic()'s registry.
+            auto* rs = static_cast<RasterSource*>(_tileSet.source.get());
+            if (_tileSet.source->isRaster() && rs->m_buildElevationMosaic && !tile->rasters().empty()) {
+                auto& raster = tile->rasters().front();
+                // 3-arg TileID (s = z) to match the texture cache's normalized keys
+                TileID texId(raster.tileID.x, raster.tileID.y, raster.tileID.z);
+                if (raster.texture && raster.texture == rs->getTexture(texId)) {
+                    if (auto mosaic = rs->buildElevationMosaic(raster.tileID, raster.texture)) {
+                        raster.texture = mosaic;
+                    }
+                }
+            }
         } else {
             // Clear stale tile data
             tile.reset();

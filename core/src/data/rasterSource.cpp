@@ -7,6 +7,7 @@
 #include "util/mapProjection.h"
 #include "log.h"
 
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -14,38 +15,71 @@ namespace Tangram {
 
 namespace {
 
-// Copy one WxW cell (raw bytes, `bpp` bytes/pixel) into the mosaic buffer at grid position
-// (dx+1, dy+1), dx/dy in {-1, 0, 1}. See stitchElevationMosaic() for the overall layout.
+// Mosaic cell placement for a neighbor at tile offset (dx, dy):
+//
+// Texture rows run SOUTH -> NORTH (row 0 is the tile's south edge: rasters are sampled with
+// v = 0 at MapProjection::tileSouthWestCorner - see ElevationManager::elevationLerp), while
+// tile y runs north -> south. So a neighbor's ROW band in the mosaic is (1 - dy), not
+// (dy + 1): the north neighbor (dy = -1) occupies the TOP rows [2W, 3W). Columns and tile x
+// both run west -> east, so the column band is (dx + 1) as expected. Getting the row
+// direction wrong shows up as bright/dark bands hugging every horizontal tile boundary (a
+// high-pass filter across the resulting elevation step).
+//
+// `overlap` (o): elevation tiles that are (2^n + 1) px wide (e.g. 257) are node-registered -
+// their outermost row/col is shared with (duplicates) the adjacent tile's edge. Naively
+// tiling such cells side by side duplicates that shared line, shifting all neighbor data by
+// one texel and leaving a thin high-pass seam along every boundary. So neighbor source
+// reads are offset by o toward the shared edge (skipping the duplicate), with the far edge
+// clamped (one duplicated texel at the mosaic's outer border, harmlessly far from the tile).
+inline size_t cellRowOffset(int dy, int W) { return size_t(1 - dy) * size_t(W); }
+
+// Copy one WxW cell (raw bytes, `bpp` bytes/pixel) from a real tile buffer into the mosaic.
+// dx/dy in {-1, 0, 1} are TILE offsets (dx = 1: east neighbor, dy = 1: south neighbor).
 void copyMosaicCell(GLubyte* mosaic, size_t mosaicRowBytes, int W, int bpp,
-                     int dx, int dy, const GLubyte* srcData) {
-    size_t rowOff = size_t(dy + 1) * size_t(W);
+                     int dx, int dy, int overlap, const GLubyte* srcData) {
+    size_t rowOff = cellRowOffset(dy, W);
     size_t colOff = size_t(dx + 1) * size_t(W) * size_t(bpp);
+    size_t rowBytes = size_t(W) * size_t(bpp);
     for (int r = 0; r < W; r++) {
+        // row space runs opposite to tile y: the south neighbor (dy = 1) continues own data
+        // downward in row space, so skip its shared (northmost-in-cell) rows via -dy
+        int srcRow = std::min(std::max(r - dy * overlap, 0), W - 1);
         GLubyte* dst = mosaic + (rowOff + size_t(r)) * mosaicRowBytes + colOff;
-        const GLubyte* src = srcData + size_t(r) * size_t(W) * size_t(bpp);
-        std::memcpy(dst, src, size_t(W) * size_t(bpp));
+        const GLubyte* src = srcData + size_t(srcRow) * rowBytes;
+        if (dx == 0 || overlap == 0) {
+            std::memcpy(dst, src, rowBytes);
+        } else if (dx > 0) {  // east neighbor: skip its shared first (westmost) column
+            std::memcpy(dst, src + size_t(overlap) * size_t(bpp), rowBytes - size_t(overlap) * size_t(bpp));
+            std::memcpy(dst + rowBytes - size_t(bpp), src + rowBytes - size_t(bpp), size_t(bpp));  // clamp far edge
+        } else {  // west neighbor: skip its shared last (eastmost) column
+            std::memcpy(dst, src, size_t(bpp));  // clamp far edge
+            std::memcpy(dst + size_t(overlap) * size_t(bpp), src, rowBytes - size_t(overlap) * size_t(bpp));
+        }
     }
 }
 
-// Synthesize a missing neighbor cell at grid position (dx+1, dy+1) by mirror-extrapolating
-// `ownData` (the tile's own WxW buffer): flip vertically for a N/S neighbor (dy != 0),
-// horizontally for an E/W neighbor (dx != 0), both ways for a diagonal neighbor. This is a
-// pure byte/index shuffle -- no pixel decode -- so it's agnostic to the source's pixel
-// encoding (terrarium-RGB, float, etc.) and only ever feeds the coarsest mip levels of the
-// shader-side pyramid, where exactness doesn't matter.
+// Synthesize a missing neighbor cell by mirror-extrapolating `ownData` (the tile's own WxW
+// buffer) about the shared tile edge: flip vertically for a N/S neighbor (dy != 0),
+// horizontally for an E/W neighbor (dx != 0), both ways for a diagonal neighbor; for
+// node-registered tiles (overlap = 1) the reflection axis is the shared edge node itself,
+// so the shared line isn't duplicated. This is a pure byte/index shuffle -- no pixel decode
+// -- so it's agnostic to the source's pixel encoding (terrarium-RGB, float, etc.) and only
+// ever feeds the coarsest mip levels of the shader-side pyramid, where exactness doesn't
+// matter; it is also transient, replaced with real data by patchNeighborMosaics() as
+// neighbor tiles arrive.
 void fillMirroredNeighborCell(GLubyte* mosaic, size_t mosaicRowBytes, int W, int bpp,
-                               int dx, int dy, const GLubyte* ownData) {
-    size_t rowOff = size_t(dy + 1) * size_t(W);
+                               int dx, int dy, int overlap, const GLubyte* ownData) {
+    size_t rowOff = cellRowOffset(dy, W);
     size_t colOff = size_t(dx + 1) * size_t(W) * size_t(bpp);
     for (int r = 0; r < W; r++) {
-        int srcRow = (dy == 0) ? r : (W - 1 - r);
+        int srcRow = (dy == 0) ? r : std::min(std::max((W - 1 - r) + dy * overlap, 0), W - 1);
         const GLubyte* srcRowPtr = ownData + size_t(srcRow) * size_t(W) * size_t(bpp);
         GLubyte* dstRowPtr = mosaic + (rowOff + size_t(r)) * mosaicRowBytes + colOff;
         if (dx == 0) {
             std::memcpy(dstRowPtr, srcRowPtr, size_t(W) * size_t(bpp));
         } else {
             for (int c = 0; c < W; c++) {
-                int srcCol = W - 1 - c;
+                int srcCol = std::min(std::max((W - 1 - c) - dx * overlap, 0), W - 1);
                 std::memcpy(dstRowPtr + size_t(c) * size_t(bpp), srcRowPtr + size_t(srcCol) * size_t(bpp), size_t(bpp));
             }
         }
@@ -78,9 +112,13 @@ std::shared_ptr<Texture> stitchElevationMosaic(const std::shared_ptr<Texture>& o
     size_t mosaicRowBytes = size_t(mosaicW) * size_t(bpp);
     std::vector<GLubyte> mosaic(mosaicRowBytes * size_t(mosaicW));
 
+    // odd width = node-registered tiles (e.g. 257 = 2^8 + 1) whose outermost row/col is
+    // shared with the adjacent tile - see the `overlap` note on copyMosaicCell() above
+    int overlap = W % 2;
+
     // Tile's own data occupies the center third [W, 2W) x [W, 2W) -- see
     // docs/texture-shading-plan.md "Frozen Interface Contract".
-    copyMosaicCell(mosaic.data(), mosaicRowBytes, W, bpp, 0, 0, ownData);
+    copyMosaicCell(mosaic.data(), mosaicRowBytes, W, bpp, 0, 0, overlap, ownData);
 
     for (int dy = -1; dy <= 1; dy++) {
         for (int dx = -1; dx <= 1; dx++) {
@@ -91,9 +129,9 @@ std::shared_ptr<Texture> stitchElevationMosaic(const std::shared_ptr<Texture>& o
             if (neighborTex && neighborTex->bufferData() &&
                 neighborTex->width() == W && neighborTex->height() == W &&
                 neighborTex->getOptions().bytesPerPixel() == bpp) {
-                copyMosaicCell(mosaic.data(), mosaicRowBytes, W, bpp, dx, dy, neighborTex->bufferData());
+                copyMosaicCell(mosaic.data(), mosaicRowBytes, W, bpp, dx, dy, overlap, neighborTex->bufferData());
             } else {
-                fillMirroredNeighborCell(mosaic.data(), mosaicRowBytes, W, bpp, dx, dy, ownData);
+                fillMirroredNeighborCell(mosaic.data(), mosaicRowBytes, W, bpp, dx, dy, overlap, ownData);
             }
         }
     }
@@ -109,7 +147,10 @@ std::shared_ptr<Texture> stitchElevationMosaic(const std::shared_ptr<Texture>& o
     options.wrapS = TextureWrap::CLAMP_TO_EDGE;
     options.wrapT = TextureWrap::CLAMP_TO_EDGE;
 
-    auto tex = std::make_shared<Texture>(options);
+    // disposeBuffer = false: the CPU-side buffer must stay resident so
+    // RasterSource::patchNeighborMosaics() can overwrite individual cells in place when
+    // late-arriving neighbor tiles replace their mirror-extrapolated placeholders.
+    auto tex = std::make_shared<Texture>(options, false);
     tex->setPixelData(mosaicW, mosaicW, bpp, mosaic.data(), mosaic.size());
 
     return tex;
@@ -347,6 +388,14 @@ std::shared_ptr<Texture> RasterSource::cacheTexture(const TileID& _tileId, std::
     textureEntry = texture;
     LOGV("%d - added %s", m_textures->size(), id.toString().c_str());
 
+    // A new elevation tile has arrived (visible tile or Phase 1 neighbor prefetch): replace
+    // the mirror-extrapolated placeholder cell it corresponds to in any live neighboring
+    // mosaic with its real data. This is what makes mirrored fallback data transient rather
+    // than permanent - see docs/texture-shading-plan.md.
+    if (m_buildElevationMosaic) {
+        patchNeighborMosaics(id, texture);
+    }
+
     return texture;
 }
 
@@ -356,6 +405,17 @@ std::shared_ptr<Texture> RasterSource::getTexture(TileID _tile) {
 }
 
 std::shared_ptr<Texture> RasterSource::buildElevationMosaic(TileID _tile, const std::shared_ptr<Texture>& _ownTexture) {
+    TileID id(_tile.x, _tile.y, _tile.z);
+
+    // Reuse a live registered mosaic: every Tile referencing this elevation tile shares one
+    // stitched texture (previously each addRaster() call stitched its own 3Wx3W copy - a
+    // large part of the Phase 4 congestion finding), and a live mosaic's cells are already
+    // kept current by patchNeighborMosaics(), so it is never staler than a fresh stitch.
+    auto mosaicIt = m_mosaics.find(id);
+    if (mosaicIt != m_mosaics.end()) {
+        if (auto mosaic = mosaicIt->second.lock()) { return mosaic; }
+    }
+
     // Look up whichever of the 8 same-zoom neighbors are already cached (getTexture() is only
     // safe to call here because addRaster()/complete() run on the main thread -- see the
     // thread-safety note on RasterTileTask::addRaster()). Missing neighbors are left null;
@@ -372,19 +432,69 @@ std::shared_ptr<Texture> RasterSource::buildElevationMosaic(TileID _tile, const 
 
             int32_t nx = ((_tile.x + dx) % max + max) % max;  // wrap around the antimeridian
 
-            neighbors[size_t(dy + 1) * 3 + size_t(dx + 1)] = getTexture(TileID(nx, ny, _tile.z, _tile.s));
+            // 3-arg TileID (s = z): cacheTexture() normalizes keys the same way, and TileID's
+            // ordering compares s first - looking up with _tile.s (styling zoom) would miss
+            // every cached neighbor for overzoomed tiles (s > z).
+            neighbors[size_t(dy + 1) * 3 + size_t(dx + 1)] = getTexture(TileID(nx, ny, _tile.z));
         }
     }
 
     auto mosaic = stitchElevationMosaic(_ownTexture, neighbors);
 
     if (mosaic) {
-        LOGD("Elevation mosaic for tile %s: %dx%d (own tile %dx%d)", _tile.toString().c_str(),
-             mosaic->width(), mosaic->height(),
-             _ownTexture ? _ownTexture->width() : 0, _ownTexture ? _ownTexture->height() : 0);
+        // Register for reuse and for in-place patching by later-arriving neighbors; prune
+        // dead entries while we're here (mosaics die when their last referencing Tile does).
+        for (auto it = m_mosaics.begin(); it != m_mosaics.end();) {
+            it = it->second.expired() ? m_mosaics.erase(it) : std::next(it);
+        }
+        m_mosaics[id] = mosaic;
+        LOGD("Elevation mosaic for tile %s: %dx%d (own tile %dx%d, %d live mosaics)",
+             _tile.toString().c_str(), mosaic->width(), mosaic->height(),
+             _ownTexture ? _ownTexture->width() : 0, _ownTexture ? _ownTexture->height() : 0,
+             int(m_mosaics.size()));
     }
 
     return mosaic;
+}
+
+void RasterSource::patchNeighborMosaics(const TileID& _tileId, const std::shared_ptr<Texture>& _texture) {
+    if (!_texture || !_texture->bufferData()) { return; }
+
+    int W = _texture->width();
+    int bpp = _texture->getOptions().bytesPerPixel();
+    if (W <= 0 || W != _texture->height()) { return; }
+
+    int32_t max = 1 << _tileId.z;
+
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) { continue; }
+
+            int32_t ny = _tileId.y + dy;
+            if (ny < 0 || ny >= max) { continue; }
+            int32_t nx = ((_tileId.x + dx) % max + max) % max;
+
+            auto mosaicIt = m_mosaics.find(TileID(nx, ny, _tileId.z));
+            if (mosaicIt == m_mosaics.end()) { continue; }
+            auto mosaic = mosaicIt->second.lock();
+            if (!mosaic) { m_mosaics.erase(mosaicIt); continue; }
+
+            if (!mosaic->bufferData() || mosaic->width() != 3 * W ||
+                mosaic->getOptions().bytesPerPixel() != bpp) { continue; }
+
+            // The new tile sits at grid offset (-dx, -dy) relative to the neighboring tile
+            // whose mosaic we're patching. resize() with unchanged dimensions just flags the
+            // texture for re-upload (and thus mipmap regeneration) on next bind - the Tiles
+            // rendering this mosaic share the same Texture object, so they pick up the
+            // patched data without any further bookkeeping.
+            copyMosaicCell(mosaic->bufferData(), size_t(mosaic->width()) * size_t(bpp), W, bpp,
+                           -dx, -dy, W % 2, _texture->bufferData());
+            mosaic->resize(mosaic->width(), mosaic->height());
+
+            LOGD("Patched mosaic %s cell (%d,%d) with real data from tile %s",
+                 mosaicIt->first.toString().c_str(), -dx, -dy, _tileId.toString().c_str());
+        }
+    }
 }
 
 Raster RasterSource::getRaster(ProjectedMeters _meters) {

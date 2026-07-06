@@ -286,22 +286,25 @@ bool Scene::load() {
             LOGE("Unable to find elevation source or raster style needed for 3D terrain!");
         }
     }
-    // need to keep elevation data if 3D terrain or contour labels enabled
-    if (m_elevationManager || (terrainSrc && terrainSrc->TileSource::generateGeometry())) {
+    // Live texture shading (docs/texture-shading-plan.md): gated on the same scene global
+    // that compiles the ELEVATION_MOSAIC shader code in (see elevation.yaml), so the mosaic
+    // machinery costs nothing when texture shading is toggled off, and works in both 2D and
+    // 3D-terrain modes. The app flips this global via SceneUpdate on scene (re)load.
+    bool elevMosaic = terrainSrc &&
+        YamlUtil::getBoolOrDefault(m_config["global"]["elevation_mosaic"], false);
+    // need to keep elevation data if 3D terrain, contour labels or mosaics enabled
+    if (m_elevationManager || elevMosaic || (terrainSrc && terrainSrc->TileSource::generateGeometry())) {
         terrainSrc->m_keepTextureData = true;
-        // Phase 1 (docs/texture-shading-plan.md): prefetch neighbor tiles only for the
-        // elevation raster source, so a later mosaic-stitching step has real neighbor
-        // data more often. Must not affect any other raster source.
-        terrainSrc->m_prefetchNeighbors = true;
     }
-    // Live texture shading (docs/texture-shading-plan.md, Phase 2): only the elevation source
-    // that actually powers ElevationManager/hillshade gets CPU-side neighbor-mosaic stitching
-    // -- must not affect any other raster source. This must be set before any elevation tiles
-    // are requested (m_tileManager->setTileSources() above only registers sources; tiles are
-    // requested later from the render/update loop) and it applies to every texture this
-    // RasterSource creates from here on, including neighbor tiles, since RasterTileTask reads
-    // m_buildElevationMosaic (and m_keepTextureData, which this depends on) fresh each time.
-    if (m_elevationManager) {
+    // Only the elevation source gets neighbor prefetching (Phase 1) and CPU-side
+    // neighbor-mosaic stitching (Phase 2) -- must not affect any other raster source. This
+    // must be set before any elevation tiles are requested (m_tileManager->setTileSources()
+    // above only registers sources; tiles are requested later from the render/update loop)
+    // and it applies to every texture this RasterSource creates from here on, including
+    // neighbor tiles, since RasterTileTask reads m_buildElevationMosaic (and
+    // m_keepTextureData, which this depends on) fresh each time.
+    if (elevMosaic) {
+        terrainSrc->m_prefetchNeighbors = true;
         terrainSrc->m_buildElevationMosaic = true;
     }
     LOGTO("<<< elevationManager");

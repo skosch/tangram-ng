@@ -119,7 +119,10 @@ TEST_CASE("Elevation mosaic - all 8 neighbor cells land in the correct grid posi
     for (int dy = -1; dy <= 1; dy++) {
         for (int dx = -1; dx <= 1; dx++) {
             if (dx == 0 && dy == 0) { continue; }
-            int rowOff = (dy + 1) * W;
+            // buffer rows run south -> north, OPPOSITE to tile y: the north neighbor (dy=-1)
+            // lands in the mosaic's top row band [2W, 3W) - see cell layout notes in
+            // rasterSource.h/.cpp
+            int rowOff = (1 - dy) * W;
             int colOff = (dx + 1) * W;
             uint8_t expect = expected[gridIndex(dx, dy)];
             INFO("dx=" << dx << " dy=" << dy);
@@ -147,19 +150,21 @@ TEST_CASE("Elevation mosaic - missing neighbors fall back to mirrored (not garba
     auto mosaic = stitchElevationMosaic(own, neighbors);
     REQUIRE(mosaic != nullptr);
 
-    // Present neighbors copied through unchanged.
+    // Present neighbors copied through unchanged (S cell = bottom row band [0, W), since
+    // buffer rows run south -> north).
     for (int r = 0; r < W; r++) {
         for (int c = 0; c < W; c++) {
-            REQUIRE(mosaicPixel(*mosaic, 2 * W + r, W + c) == 77);  // S cell
-            REQUIRE(mosaicPixel(*mosaic, W + r, c) == 88);          // W cell
+            REQUIRE(mosaicPixel(*mosaic, r, W + c) == 77);  // S cell
+            REQUIRE(mosaicPixel(*mosaic, W + r, c) == 88);  // W cell
         }
     }
 
-    // N (dx=0, dy=-1): vertical mirror of own, no column flip -- cell row r == own row (W-1-r).
+    // N (dx=0, dy=-1, top row band [2W, 3W)): vertical mirror of own, no column flip --
+    // cell row r == own row (W-1-r).
     for (int r = 0; r < W; r++) {
         for (int c = 0; c < W; c++) {
             uint8_t expect = uint8_t((W - 1 - r + 1) * 10 + c);
-            uint8_t actual = mosaicPixel(*mosaic, r, W + c);
+            uint8_t actual = mosaicPixel(*mosaic, 2 * W + r, W + c);
             REQUIRE(actual == expect);
             REQUIRE(actual != 0);  // not garbage/zero
         }
@@ -175,13 +180,59 @@ TEST_CASE("Elevation mosaic - missing neighbors fall back to mirrored (not garba
         }
     }
 
-    // NE (dx=1, dy=-1): mirrored both ways -- row (W-1-r), col (W-1-c).
+    // NE (dx=1, dy=-1): mirrored both ways -- row (W-1-r), col (W-1-c) -- in the top-right cell.
     for (int r = 0; r < W; r++) {
         for (int c = 0; c < W; c++) {
             uint8_t expect = uint8_t((W - 1 - r + 1) * 10 + (W - 1 - c));
-            uint8_t actual = mosaicPixel(*mosaic, r, 2 * W + c);
+            uint8_t actual = mosaicPixel(*mosaic, 2 * W + r, 2 * W + c);
             REQUIRE(actual == expect);
             REQUIRE(actual != 0);
+        }
+    }
+}
+
+TEST_CASE("Elevation mosaic - node-registered (odd W) tiles stitch into a globally seamless field", "[RasterMosaic]") {
+    // Odd-width tiles (e.g. real 257x257 elevation tiles) are node-registered: a tile's
+    // outermost row/col duplicates the adjacent tile's edge. Model a global linear field
+    // f(rowCoord, colCoord) sampled by a 3x3 block of such tiles: tile (dx, dy) covers
+    // rowCoord = r - dy*(W-1), colCoord = c + dx*(W-1) (buffer rows run opposite to tile y,
+    // and adjacent tiles share their edge node, hence the W-1 stride). A correct stitch must
+    // reproduce f exactly across the whole mosaic interior - any orientation flip, cell
+    // misplacement, or duplicated shared edge breaks the linear ramp somewhere.
+    const int W = 5;
+    auto f = [&](int rowCoord, int colCoord) { return uint8_t(100 + 10 * rowCoord + colCoord); };
+
+    auto makeTile = [&](int dx, int dy) {
+        auto tex = std::make_shared<Texture>(testOptions());
+        std::vector<GLubyte> data(size_t(W) * size_t(W));
+        for (int r = 0; r < W; r++) {
+            for (int c = 0; c < W; c++) {
+                data[size_t(r) * W + c] = f(r - dy * (W - 1), c + dx * (W - 1));
+            }
+        }
+        tex->setPixelData(W, W, 1, data.data(), data.size());
+        return tex;
+    };
+
+    auto own = makeTile(0, 0);
+    std::array<std::shared_ptr<Texture>, 9> neighbors;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) { continue; }
+            neighbors[gridIndex(dx, dy)] = makeTile(dx, dy);
+        }
+    }
+
+    auto mosaic = stitchElevationMosaic(own, neighbors);
+    REQUIRE(mosaic != nullptr);
+
+    // Mosaic pixel (m, n) corresponds to (rowCoord, colCoord) = (m - W, n - W). The outermost
+    // row/col on each far edge is a clamped duplicate (data past the neighbor ring doesn't
+    // exist), so check the interior [1, 3W-1).
+    for (int m = 1; m < 3 * W - 1; m++) {
+        for (int n = 1; n < 3 * W - 1; n++) {
+            INFO("mosaic row " << m << " col " << n);
+            REQUIRE(mosaicPixel(*mosaic, m, n) == f(m - W, n - W));
         }
     }
 }

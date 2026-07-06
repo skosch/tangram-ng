@@ -21,21 +21,25 @@ class RasterTileTask;
 // tile boundary (see docs/texture-shading-plan.md, "Frozen Interface Contract" + "Phase 2").
 //
 // Exact cell layout (this is the part other phases depend on staying stable):
-//   `neighbors` is a 3x3 grid flattened row-major: index (dy+1)*3 + (dx+1) for dx, dy in
-//   {-1, 0, 1}. Index 4 (dx=0, dy=0) is ignored -- `own` is always used for the center cell.
-//   The resulting mosaic buffer places `own` in pixel range [W, 2W) x [W, 2W) (the center
-//   third), and each neighbor cell (dx, dy) at pixel range [(dx+1)*W, (dx+2)*W) x
-//   [(dy+1)*W, (dy+2)*W) -- the natural grid arrangement, using the same row/column
-//   handedness as the raw per-tile buffers themselves (no flipping needed, since TileID x/y
-//   offsets and buffer row/col offsets increase in the same direction for every tile of a
-//   given source).
+//   `neighbors` is a 3x3 grid flattened row-major in TILE offsets: index (dy+1)*3 + (dx+1)
+//   for dx, dy in {-1, 0, 1} (dy = -1: north neighbor, tile y - 1). Index 4 (dx=0, dy=0) is
+//   ignored -- `own` is always used for the center cell. The resulting mosaic buffer places
+//   `own` in pixel range [W, 2W) x [W, 2W) (the center third), each neighbor cell at column
+//   range [(dx+1)*W, (dx+2)*W) and row range [(1-dy)*W, (2-dy)*W): buffer rows run south ->
+//   north (row 0 = tile's south edge, matching how rasters are sampled - see
+//   ElevationManager::elevationLerp), i.e. OPPOSITE to tile y, so the north neighbor
+//   (dy = -1) occupies the mosaic's top rows [2W, 3W). Node-registered tiles (odd W, e.g.
+//   257: outermost row/col shared with the adjacent tile) have the duplicated shared line
+//   skipped when copying neighbor cells -- see the `overlap` note in rasterSource.cpp.
 //
 // A null entry in `neighbors` (tile not cached yet) is synthesized via mirror-extrapolation
-// of `own`'s data: flipped vertically for a N/S neighbor, horizontally for an E/W neighbor,
-// and both ways for a diagonal neighbor. This is a cheap, byte-only (no pixel decode)
-// fallback -- it only ever feeds the coarsest mip levels of the shader-side pyramid, so
-// exactness doesn't matter, and it works unmodified for both terrarium-RGB and float
-// elevation encodings since it never interprets pixel values.
+// of `own`'s data about the shared tile edge: flipped vertically for a N/S neighbor,
+// horizontally for an E/W neighbor, and both ways for a diagonal neighbor. This is a cheap,
+// byte-only (no pixel decode) fallback -- it only ever feeds the coarsest mip levels of the
+// shader-side pyramid, so exactness doesn't matter, it works unmodified for both
+// terrarium-RGB and float elevation encodings since it never interprets pixel values, and
+// it is transient: RasterSource::patchNeighborMosaics() overwrites it with real data in
+// place when the neighbor tile arrives.
 //
 // Returns nullptr if `own` has no CPU-side buffer data (RasterSource::m_keepTextureData must
 // be true for the source for this to be usable) or its width/height aren't equal and > 0.
@@ -49,6 +53,17 @@ class RasterSource : public TileSource {
 
     using Cache = std::map<TileID, std::weak_ptr<Texture>>;
     std::shared_ptr<Cache> m_textures;
+
+    // Live mosaic registry (elevation source only, i.e. m_buildElevationMosaic set): one
+    // shared mosaic texture per TileID, kept alive by the Tile(s) whose rasters() reference
+    // it. Serves two purposes: (1) dedup - every Tile referencing the same elevation tile
+    // shares one stitched mosaic instead of each addRaster() call stitching its own copy;
+    // (2) live patching - when a tile texture later lands in m_textures (e.g. a Phase 1
+    // neighbor prefetch completing), patchNeighborMosaics() copies its pixels over the
+    // mirror-extrapolated placeholder cell in each registered neighboring mosaic, in place,
+    // so mirrored fallback data is only ever transient. Main-thread only (same threading
+    // rule as m_textures, see RasterTileTask::addRaster()).
+    std::map<TileID, std::weak_ptr<Texture>> m_mosaics;
 
     TextureOptions m_texOptions;
 
@@ -70,11 +85,23 @@ protected:
 
     std::shared_ptr<Texture> cacheTexture(const TileID& _tileId, std::unique_ptr<Texture> _texture);
 
-    // Build the 3W x 3W mosaic texture for `_tile` out of `_ownTexture` plus whatever of its
-    // 8 same-zoom neighbors are already in `m_textures` (looked up via getTexture()); missing
-    // neighbors are mirror-extrapolated. See stitchElevationMosaic() above for the exact
-    // layout. Only ever called when m_buildElevationMosaic is set (elevation source only).
+    // Copy `_texture` (the freshly-cached tile texture for `_tileId`) over the corresponding
+    // cell of each still-alive neighboring mosaic in m_mosaics, replacing whatever was there
+    // (typically a mirror-extrapolated placeholder), and flag those mosaics for GPU
+    // re-upload (+ mipmap regeneration) on next bind. Called from cacheTexture() whenever a
+    // new texture lands in m_textures and m_buildElevationMosaic is set.
+    void patchNeighborMosaics(const TileID& _tileId, const std::shared_ptr<Texture>& _texture);
+
+public:
+    // Get-or-build the shared 3W x 3W mosaic texture for `_tile`: an already-registered live
+    // mosaic is returned as-is (its cells are kept current by patchNeighborMosaics());
+    // otherwise one is stitched from `_ownTexture` plus whatever of its 8 same-zoom neighbors
+    // are already in `m_textures`, with missing neighbors mirror-extrapolated, and registered
+    // in m_mosaics for later in-place patching. See stitchElevationMosaic() above for the
+    // exact layout. Only ever called when m_buildElevationMosaic is set (elevation source
+    // only), on the main thread.
     std::shared_ptr<Texture> buildElevationMosaic(TileID _tile, const std::shared_ptr<Texture>& _ownTexture);
+protected:
 
 public:
 
