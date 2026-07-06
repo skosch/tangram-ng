@@ -16,21 +16,25 @@ namespace Tangram {
 class RasterTileTask;
 
 // Combine a tile's own WxW texture with (up to) 8 neighbor textures (same zoom: N, S, E, W,
-// NE, NW, SE, SW) into a single padded 3W x 3W "mosaic" texture, so hillshading/texture-
-// shading shaders can read real neighbor data across tile edges instead of clamping at the
-// tile boundary (see docs/texture-shading-plan.md, "Frozen Interface Contract" + "Phase 2").
+// NE, NW, SE, SW) into a single padded 3Wp x 3Wp "mosaic" texture (Wp = W - overlap, see
+// below), so hillshading/texture-shading shaders can read real neighbor data across tile
+// edges instead of clamping at the tile boundary (see docs/texture-shading-plan.md,
+// "Frozen Interface Contract" + "Phase 2").
 //
 // Exact cell layout (this is the part other phases depend on staying stable):
 //   `neighbors` is a 3x3 grid flattened row-major in TILE offsets: index (dy+1)*3 + (dx+1)
 //   for dx, dy in {-1, 0, 1} (dy = -1: north neighbor, tile y - 1). Index 4 (dx=0, dy=0) is
-//   ignored -- `own` is always used for the center cell. The resulting mosaic buffer places
-//   `own` in pixel range [W, 2W) x [W, 2W) (the center third), each neighbor cell at column
-//   range [(dx+1)*W, (dx+2)*W) and row range [(1-dy)*W, (2-dy)*W): buffer rows run south ->
-//   north (row 0 = tile's south edge, matching how rasters are sampled - see
-//   ElevationManager::elevationLerp), i.e. OPPOSITE to tile y, so the north neighbor
-//   (dy = -1) occupies the mosaic's top rows [2W, 3W). Node-registered tiles (odd W, e.g.
-//   257: outermost row/col shared with the adjacent tile) have the duplicated shared line
-//   skipped when copying neighbor cells -- see the `overlap` note in rasterSource.cpp.
+//   ignored -- `own` is always used for the center cell. Each cell is that tile's buffer
+//   cropped to its first Wp rows/columns, where Wp = W - (W % 2): node-registered tiles
+//   (odd W, e.g. 257) share their outermost row/col with the adjacent tile, and dropping
+//   that duplicate line keeps the mosaic an evenly-spaced global sample grid AND keeps
+//   neighboring tiles' mosaic mip grids aligned (mosaic width 3*Wp halves evenly through
+//   the whole mip chain) so the high-pass texture shading is seam-free across tiles -- see
+//   the layout notes in rasterSource.cpp. `own` occupies the center third [Wp, 2Wp) x
+//   [Wp, 2Wp); each neighbor cell is at column range [(dx+1)*Wp, (dx+2)*Wp) and row range
+//   [(1-dy)*Wp, (2-dy)*Wp): buffer rows run south -> north (row 0 = tile's south edge,
+//   matching how rasters are sampled - see ElevationManager::elevationLerp), i.e. OPPOSITE
+//   to tile y, so the north neighbor (dy = -1) occupies the mosaic's top rows [2Wp, 3Wp).
 //
 // A null entry in `neighbors` (tile not cached yet) is synthesized via mirror-extrapolation
 // of `own`'s data about the shared tile edge: flipped vertically for a N/S neighbor,

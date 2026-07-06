@@ -193,11 +193,13 @@ TEST_CASE("Elevation mosaic - missing neighbors fall back to mirrored (not garba
 
 TEST_CASE("Elevation mosaic - node-registered (odd W) tiles stitch into a globally seamless field", "[RasterMosaic]") {
     // Odd-width tiles (e.g. real 257x257 elevation tiles) are node-registered: a tile's
-    // outermost row/col duplicates the adjacent tile's edge. Model a global linear field
+    // outermost row/col duplicates the adjacent tile's edge, and each mosaic cell is the
+    // tile cropped to Wp = W-1 rows/cols (so the mosaic is 3*(W-1) wide and stays
+    // mip-grid-aligned with neighboring tiles' mosaics). Model a global linear field
     // f(rowCoord, colCoord) sampled by a 3x3 block of such tiles: tile (dx, dy) covers
     // rowCoord = r - dy*(W-1), colCoord = c + dx*(W-1) (buffer rows run opposite to tile y,
     // and adjacent tiles share their edge node, hence the W-1 stride). A correct stitch must
-    // reproduce f exactly across the whole mosaic interior - any orientation flip, cell
+    // reproduce f exactly across the ENTIRE mosaic - any orientation flip, cell
     // misplacement, or duplicated shared edge breaks the linear ramp somewhere.
     const int W = 5;
     auto f = [&](int rowCoord, int colCoord) { return uint8_t(100 + 10 * rowCoord + colCoord); };
@@ -226,13 +228,17 @@ TEST_CASE("Elevation mosaic - node-registered (odd W) tiles stitch into a global
     auto mosaic = stitchElevationMosaic(own, neighbors);
     REQUIRE(mosaic != nullptr);
 
-    // Mosaic pixel (m, n) corresponds to (rowCoord, colCoord) = (m - W, n - W). The outermost
-    // row/col on each far edge is a clamped duplicate (data past the neighbor ring doesn't
-    // exist), so check the interior [1, 3W-1).
-    for (int m = 1; m < 3 * W - 1; m++) {
-        for (int n = 1; n < 3 * W - 1; n++) {
+    // Cells are cropped to Wp = W-1, so the mosaic is 3*(W-1) wide...
+    const int Wp = W - 1;
+    REQUIRE(mosaic->width() == 3 * Wp);
+    REQUIRE(mosaic->height() == 3 * Wp);
+
+    // ...and pixel (m, n) corresponds to (rowCoord, colCoord) = (m - Wp, n - Wp), exact over
+    // the entire mosaic (every pixel is a real sample of some tile - no clamped duplicates).
+    for (int m = 0; m < 3 * Wp; m++) {
+        for (int n = 0; n < 3 * Wp; n++) {
             INFO("mosaic row " << m << " col " << n);
-            REQUIRE(mosaicPixel(*mosaic, m, n) == f(m - W, n - W));
+            REQUIRE(mosaicPixel(*mosaic, m, n) == f(m - Wp, n - Wp));
         }
     }
 }
