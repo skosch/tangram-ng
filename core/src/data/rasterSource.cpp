@@ -179,7 +179,20 @@ public:
         // for rendering, without disturbing what's cached in m_textures (other tiles still need
         // the plain per-tile texture as *their* neighbor data). See
         // docs/texture-shading-plan.md Phase 2.
-        if (source->m_buildElevationMosaic) {
+        //
+        // Phase 4 finding: skip this for isProxy() tasks -- that covers both
+        // TileManager::TileEntry::m_prefetchOnly tiles (Phase 1; set via setProxyState() in
+        // tileManager.cpp, never rendered at all -- building a mosaic for them is pure wasted
+        // CPU/memory) and genuine lower-zoom placeholder/proxy tiles (rendered only briefly
+        // while the real tile loads). At any view showing more than a handful of tiles, doing a
+        // full 3Wx3W stitch (with its own 8 getTexture() lookups) for every one of the ~8x as
+        // many prefetch-only tiles as real tiles was saturating the tile-worker pool badly enough
+        // to stall real (non-elevation) tile loading entirely -- see docs/texture-shading-plan.md
+        // Frozen Interface Contract addendum. A proxy tile falls back to its plain per-tile
+        // texture below, which briefly mis-samples the ELEVATION_MOSAIC shader path (muv
+        // remapping assumes a 3Wx3W layout); that's an acceptable, transient cost given proxy
+        // tiles are onscreen only until the real tile replaces them.
+        if (source->m_buildElevationMosaic && !isProxy()) {
             if (auto mosaicTex = source->buildElevationMosaic(m_tileId, raster->texture)) {
                 _tile.rasters().emplace_back(raster->tileID, mosaicTex);
                 return;
