@@ -349,9 +349,19 @@ void TileManager::updateTileSet(TileSet& _tileSet, const ViewState& _view) {
             auto& entry = curTilesIt->second;
             entry.setVisible(true);
 
+            // The task's proxy flag was set true on previous frames while this entry was
+            // prefetch-only (or a proxy) and is only refreshed further down; clear it BEFORE
+            // completing the task so RasterTileTask::addRaster() doesn't skip the elevation
+            // mosaic for a tile that is in fact becoming visible right now.
+            if (entry.task) { entry.task->setProxyState(false); }
+
             if (entry.completeTileTask()) {
                 m_tileSetChanged = true;
             }
+
+            // A tile completed on an earlier frame while prefetch-only/proxy still holds the
+            // plain (mip-less) elevation texture; swap in the shared mosaic (no-op otherwise).
+            if (entry.tile) { upgradeElevationMosaic(_tileSet, *entry.tile); }
 
             if (entry.needsLoading()) {
                 // Not yet available - enqueue for loading
@@ -662,6 +672,28 @@ void TileManager::loadTiles() {
     m_loadTasks.clear();
 }
 
+// A tile built while it was prefetch-only (or a lower-zoom proxy) holds the plain per-tile
+// elevation texture (RasterTileTask::addRaster() skips mosaic stitching for isProxy() tasks;
+// the plain texture has no mip chain, so texture shading comes out exactly neutral for the
+// tile, and the ELEVATION_MOSAIC UV remap mis-samples it). When such a tile is (re)used as a
+// visible tile, upgrade its raster to the shared 3Wx3W mosaic. Pointer equality with the
+// RasterSource texture cache identifies a plain texture (a raster holding the plain texture
+// keeps exactly that cache entry alive); a tile already holding a mosaic fails the pointer
+// test and is left unchanged, so this is cheap to call per update.
+void TileManager::upgradeElevationMosaic(TileSet& _tileSet, Tile& _tile) {
+    if (!_tileSet.source->isRaster()) { return; }
+    auto* rs = static_cast<RasterSource*>(_tileSet.source.get());
+    if (!rs->m_buildElevationMosaic || _tile.rasters().empty()) { return; }
+    auto& raster = _tile.rasters().front();
+    // 3-arg TileID (s = z) to match the texture cache's normalized keys
+    TileID texId(raster.tileID.x, raster.tileID.y, raster.tileID.z);
+    if (raster.texture && raster.texture == rs->getTexture(texId)) {
+        if (auto mosaic = rs->buildElevationMosaic(raster.tileID, raster.texture)) {
+            raster.texture = mosaic;
+        }
+    }
+}
+
 bool TileManager::addTile(TileSet& _tileSet, const TileID& _tileID) {
 
     auto tile = m_tileCache->get(_tileSet.source->id(), _tileID);
@@ -671,24 +703,7 @@ bool TileManager::addTile(TileSet& _tileSet, const TileID& _tileID) {
             // Reset tile on potential internal dynamic data set
             tile->resetState();
 
-            // A tile built while it was prefetch-only (or proxy) was cached holding the plain
-            // per-tile elevation texture (RasterTileTask::addRaster() skips mosaic stitching
-            // for isProxy() tasks); now that it's becoming visible, upgrade it to the shared
-            // 3Wx3W mosaic the ELEVATION_MOSAIC shader path expects. Pointer equality with
-            // the RasterSource texture cache identifies a plain texture (a raster holding the
-            // plain texture keeps exactly that cache entry alive); a tile already holding a
-            // mosaic gets it back unchanged from buildElevationMosaic()'s registry.
-            auto* rs = static_cast<RasterSource*>(_tileSet.source.get());
-            if (_tileSet.source->isRaster() && rs->m_buildElevationMosaic && !tile->rasters().empty()) {
-                auto& raster = tile->rasters().front();
-                // 3-arg TileID (s = z) to match the texture cache's normalized keys
-                TileID texId(raster.tileID.x, raster.tileID.y, raster.tileID.z);
-                if (raster.texture && raster.texture == rs->getTexture(texId)) {
-                    if (auto mosaic = rs->buildElevationMosaic(raster.tileID, raster.texture)) {
-                        raster.texture = mosaic;
-                    }
-                }
-            }
+            upgradeElevationMosaic(_tileSet, *tile);
         } else {
             // Clear stale tile data
             tile.reset();

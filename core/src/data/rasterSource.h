@@ -53,6 +53,19 @@ class RasterTileTask;
 std::shared_ptr<Texture> stitchElevationMosaic(const std::shared_ptr<Texture>& own,
                                                 const std::array<std::shared_ptr<Texture>, 9>& neighbors);
 
+// Attached to every elevation mosaic texture via Texture::userData (see
+// RasterSource::buildElevationMosaic).
+struct ElevationMosaicInfo {
+    // keeps the original per-tile texture alive for as long as the mosaic lives: m_textures
+    // only holds weak refs and Tiles reference the mosaic instead of the original, so without
+    // this the original expires immediately and neighbors stitched later would permanently
+    // fall back to mirror-extrapolation for this tile's cell (-> texture shading tile seams)
+    std::shared_ptr<Texture> ownTexture;
+    // dimensionless RMS-slope statistic of the tile at a mid-pyramid-band scale, input for
+    // texture shading auto-contrast (see RasterSource::aggregateRugosity)
+    float rugosity = 0.f;
+};
+
 class RasterSource : public TileSource {
 
     using Cache = std::map<TileID, std::weak_ptr<Texture>>;
@@ -97,6 +110,13 @@ protected:
     void patchNeighborMosaics(const TileID& _tileId, const std::shared_ptr<Texture>& _texture);
 
 public:
+    // Area-mean of ElevationMosaicInfo::rugosity over all live mosaics - i.e. over roughly the
+    // visible tiles plus the prefetched neighbor ring, a window a few times the viewport, so
+    // panning changes it only gradually. Input for texture shading auto-contrast (see
+    // MapsApp::mapUpdate). Returns -1 when no mosaics are live. Main thread only, like all
+    // other m_mosaics access.
+    float aggregateRugosity();
+
     // Get-or-build the shared 3W x 3W mosaic texture for `_tile`: an already-registered live
     // mosaic is returned as-is (its cells are kept current by patchNeighborMosaics());
     // otherwise one is stitched from `_ownTexture` plus whatever of its 8 same-zoom neighbors

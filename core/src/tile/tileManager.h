@@ -105,6 +105,10 @@ protected:
     // add new visible tile to TileSet
     bool addTile(TileSet& _tileSet, const TileID& _tileID);
 
+    // swap a plain per-tile elevation texture for the shared 3Wx3W mosaic on a tile becoming
+    // visible after being built as prefetch-only/proxy (see definition for details)
+    void upgradeElevationMosaic(TileSet& _tileSet, Tile& _tile);
+
     // check cache for proxy for new tile
     void updateProxyTiles(TileSet& _tileSet, const TileID& _tileID, TileEntry& _tile);
 

@@ -86,6 +86,41 @@ void fillMirroredNeighborCell(GLubyte* mosaic, int Wp, int W, int bpp,
     }
 }
 
+// Dimensionless RMS-slope statistic of a tile's elevation data, sampled at a stride of
+// ~W/32 texels (a mid-pyramid-band scale, matching the scales texture shading emphasizes),
+// normalized by true ground distance so it is comparable across zoom levels and latitudes.
+// Used for texture shading auto-contrast - see RasterSource::aggregateRugosity().
+float computeRugosity(const Tangram::Texture& tex, const Tangram::TileID& id) {
+    int W = tex.width();
+    const GLubyte* data = tex.bufferData();
+    if (W < 64 || !data) { return 0.f; }
+    bool isFloat = tex.getOptions().pixelFormat == Tangram::PixelFormat::FLOAT;
+    auto elevAt = [&](int c, int r) -> double {  // decode matches getElevationAt in elevation.yaml
+        if (isFloat) { return ((const float*)data)[size_t(r) * W + c]; }
+        const GLubyte* p = data + (size_t(r) * W + c) * 4;
+        return (p[0]*256 + p[1] + p[2]/256.0) - 32768;  // mapzen terrarium
+    };
+    int s = W / 32;
+    double sum2 = 0;
+    int n = 0;
+    for (int r = 0; r + s < W; r += s) {
+        for (int c = 0; c + s < W; c += s) {
+            double h = elevAt(c, r);
+            double dx = elevAt(c + s, r) - h;
+            double dy = elevAt(c, r + s) - h;
+            sum2 += dx*dx + dy*dy;
+            n += 2;
+        }
+    }
+    if (n == 0) { return 0.f; }
+    // true meters per texel = projected meters * Mercator scale factor cos(lat)
+    Tangram::ProjectedMeters center = Tangram::MapProjection::tileCenter(id);
+    double unproj = std::exp(center.y / Tangram::MapProjection::EARTH_RADIUS_METERS);
+    double coslat = 2.0 / (unproj + 1.0 / unproj);
+    double metersPerTexel = Tangram::MapProjection::metersPerTileAtZoom(id.z) * coslat / W;
+    return float(std::sqrt(sum2 / n) / (double(s) * metersPerTexel));
+}
+
 } // namespace
 
 std::shared_ptr<Texture> stitchElevationMosaic(const std::shared_ptr<Texture>& own,
@@ -453,7 +488,11 @@ std::shared_ptr<Texture> RasterSource::buildElevationMosaic(TileID _tile, const 
         //  patchNeighborMosaics() only fires when a tile is newly cached. The resulting
         //  mirrored-vs-real content mismatch between adjacent mosaics showed up as a
         //  deterministic texture-shading seam on every tile boundary.
-        mosaic->userData = _ownTexture;
+        //  ElevationMosaicInfo also carries the tile's ruggedness statistic for auto-contrast.
+        auto info = std::make_shared<ElevationMosaicInfo>();
+        info->ownTexture = _ownTexture;
+        info->rugosity = computeRugosity(*_ownTexture, id);
+        mosaic->userData = std::move(info);
         // Register for reuse and for in-place patching by later-arriving neighbors; prune
         // dead entries while we're here (mosaics die when their last referencing Tile does).
         for (auto it = m_mosaics.begin(); it != m_mosaics.end();) {
@@ -467,6 +506,22 @@ std::shared_ptr<Texture> RasterSource::buildElevationMosaic(TileID _tile, const 
     }
 
     return mosaic;
+}
+
+float RasterSource::aggregateRugosity() {
+    double sum = 0;
+    int n = 0;
+    for (auto& kv : m_mosaics) {
+        auto mosaic = kv.second.lock();
+        if (!mosaic || !mosaic->userData) { continue; }
+        float rug = static_cast<ElevationMosaicInfo*>(mosaic->userData.get())->rugosity;
+        // skip water/void tiles (essentially zero relief) so coastal views aren't biased
+        //  toward cranked-up contrast by the flat ocean half of the window
+        if (rug < 0.005f) { continue; }
+        sum += rug;
+        n++;
+    }
+    return n > 0 ? float(sum / n) : -1.f;
 }
 
 void RasterSource::patchNeighborMosaics(const TileID& _tileId, const std::shared_ptr<Texture>& _texture) {
