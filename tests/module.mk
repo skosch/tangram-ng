@@ -6,6 +6,7 @@ MODULE_BASE = $(MAKE_BASE)
 
 # unit tests
 MODULE_SOURCES = \
+  unit/buildersTests.cpp \
   unit/curlTests.cpp \
   unit/drawRuleTests.cpp \
   unit/dukTests.cpp \

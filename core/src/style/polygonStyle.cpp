@@ -3,6 +3,7 @@
 #include "gl/mesh.h"
 #include "gl/shaderProgram.h"
 #include "map.h"
+#include "scene/scene.h"
 #include "marker/marker.h"
 #include "material.h"
 #include "platform.h"
@@ -77,6 +78,13 @@ void PolygonStyle::constructVertexLayout() {
 
 }
 
+void PolygonStyle::build(const Scene& _scene) {
+    Style::build(_scene);
+    // grid tessellation is only useful when polygons are draped over 3D terrain; without an
+    //  ElevationManager plain earcut output is used regardless of the terrain_grid style param
+    m_activeTerrainGrid = _scene.elevationManager() ? m_terrainGrid : 0;
+}
+
 void PolygonStyle::constructShaderProgram() {
 
     m_shaderSource->setSourceStrings(polygon_fs, polygon_vs);
@@ -104,12 +112,16 @@ public:
         m_tileUnitsPerMeter = _tile.getInverseScale();
         m_zoom = _tile.getID().z;
         m_meshData.clear();
+        m_builder.gridRes = m_style.activeTerrainGrid();
     }
 
     void setup(const Marker& _marker, int zoom) override {
         m_zoom = zoom;
         m_tileUnitsPerMeter = 1.f / _marker.extent();
         m_meshData.clear();
+        // markers use their own local coordinate extent, not tile-local [0,1]^2, so the terrain
+        //  grid (which must align with the tile grid) does not apply
+        m_builder.gridRes = 0;
     }
 
     bool addPolygon(const Polygon& _polygon, const Properties& _props, const DrawRule& _rule) override;

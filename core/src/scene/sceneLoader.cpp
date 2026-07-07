@@ -991,6 +991,22 @@ void SceneLoader::loadStyleProps(const Node& _styleNode, Style& _style, SceneTex
         }
     }
 
+    if (const Node& terrainGridNode = _styleNode["terrain_grid"]) {
+        if (auto polygonStyle = dynamic_cast<PolygonStyle*>(&_style)) {
+            // tessellate polygons on a grid for accurate draping over 3D terrain; 'true' selects the
+            //  RasterStyle terrain mesh resolution (64), which grid cells must line up with
+            int intValue;
+            bool boolValue;
+            if (YamlUtil::getInt(terrainGridNode, intValue)) {
+                polygonStyle->setTerrainGrid(intValue);
+            } else if (YamlUtil::getBool(terrainGridNode, boolValue)) {
+                polygonStyle->setTerrainGrid(boolValue ? 64 : 0);
+            }
+        } else {
+            LOGW("terrain_grid style parameter is only supported for polygon styles");
+        }
+    }
+
     if (const Node& dashNode = _styleNode["dash"]) {
         if (auto polylineStyle = dynamic_cast<PolylineStyle*>(&_style)) {
             if (dashNode.IsSequence()) {

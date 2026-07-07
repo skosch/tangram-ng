@@ -45,6 +45,13 @@ struct PolygonBuilder {
     size_t numVertices = 0;
     bool keepTileEdges;
     bool useTexCoords;
+    // if > 0, tessellate polygons on a gridRes x gridRes grid over tile-local [0,1]^2 so that, with 3D
+    //  terrain, per-vertex elevation makes the polygon follow the terrain surface instead of spanning
+    //  it with a few huge earcut triangles (which lets terrain poke through the polygon interior, or the
+    //  polygon bleed through ridges in front of it). Must match the RasterStyle terrain mesh resolution
+    //  (64, see rasterStyle.cpp) so grid cells - and thus the piecewise-linear elevation surface - line
+    //  up exactly with the terrain mesh on fully-covered cells. See Builders::buildPolygon().
+    int gridRes = 0;
 
     mapbox::detail::Earcut<uint16_t> earcut;
 

@@ -445,6 +445,15 @@ std::shared_ptr<Texture> RasterSource::buildElevationMosaic(TileID _tile, const 
     auto mosaic = stitchElevationMosaic(_ownTexture, neighbors);
 
     if (mosaic) {
+        // Keep the original per-tile texture alive for as long as the mosaic lives: m_textures
+        //  only holds weak refs, and Tiles reference the mosaic INSTEAD of the original, so
+        //  without this the original expires as soon as the mosaic replaces it - then any
+        //  neighbor stitched later can't find this (still rendered!) tile's data in the cache
+        //  and permanently falls back to mirror-extrapolation for its cell, since
+        //  patchNeighborMosaics() only fires when a tile is newly cached. The resulting
+        //  mirrored-vs-real content mismatch between adjacent mosaics showed up as a
+        //  deterministic texture-shading seam on every tile boundary.
+        mosaic->userData = _ownTexture;
         // Register for reuse and for in-place patching by later-arriving neighbors; prune
         // dead entries while we're here (mosaics die when their last referencing Tile does).
         for (auto it = m_mosaics.begin(); it != m_mosaics.end();) {
