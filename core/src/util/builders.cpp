@@ -143,8 +143,6 @@ static void buildPolygonGrid(const Polygon& _polygon, float _height, glm::vec2 _
         return idx;
     };
     auto emitTriangle = [&](glm::vec2 a, glm::vec2 b, glm::vec2 c) {
-        // uint16 index headroom; big landuse polygons stay far below this in practice
-        if (_ctx.numVertices > 65200) { truncated = true; return; }
         _ctx.indices.push_back(emitVertex(a));
         _ctx.indices.push_back(emitVertex(b));
         _ctx.indices.push_back(emitVertex(c));
@@ -160,6 +158,17 @@ static void buildPolygonGrid(const Polygon& _polygon, float _height, glm::vec2 _
         int tx0 = int(std::floor(lo.x * res)), tx1 = int(std::ceil(hi.x * res));
         int ty0 = int(std::floor(lo.y * res)), ty1 = int(std::ceil(hi.y * res));
         if (tx1 - tx0 <= 1 && ty1 - ty0 <= 1) {  // triangle already fits in a single cell
+            emitTriangle(A, B, C);
+            continue;
+        }
+        // uint16 index headroom: checked once per earcut triangle (not per emitted grid
+        //  triangle) so that once the budget is close, we fail safe by emitting the REST of
+        //  the earcut triangles whole (undraped, just like the plain earcut path) rather than
+        //  silently dropping them - a coarser drape on the excess portion of a pathological
+        //  polygon is much better than a hole in the mesh (which shows the bare terrain/earth
+        //  background through, i.e. a visible "missing data" patch).
+        if (_ctx.numVertices > 64000) {
+            truncated = true;
             emitTriangle(A, B, C);
             continue;
         }
@@ -214,7 +223,7 @@ static void buildPolygonGrid(const Polygon& _polygon, float _height, glm::vec2 _
             }
         }
     }
-    if (truncated) { LOGW("buildPolygonGrid: vertex limit reached, polygon truncated"); }
+    if (truncated) { LOGW("buildPolygonGrid: vertex budget reached, remaining triangles drawn undraped (no hole)"); }
 }
 
 void Builders::buildPolygon(const Polygon& _polygon, float _height, PolygonBuilder& _ctx) {

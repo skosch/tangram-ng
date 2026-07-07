@@ -125,6 +125,12 @@ public:
     // exact layout. Only ever called when m_buildElevationMosaic is set (elevation source
     // only), on the main thread.
     std::shared_ptr<Texture> buildElevationMosaic(TileID _tile, const std::shared_ptr<Texture>& _ownTexture);
+
+    // Cheap reuse-only lookup (single map find + weak_ptr lock, no stitching): returns an
+    // already-registered live mosaic for `_tile` if one exists, else nullptr. Safe to call for
+    // proxy/prefetch-only tiles, which must never trigger the expensive full stitch in
+    // buildElevationMosaic() above (see RasterTileTask::addRaster()).
+    std::shared_ptr<Texture> getExistingMosaic(TileID _tile);
 protected:
 
 public:

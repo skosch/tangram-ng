@@ -259,25 +259,33 @@ public:
         // the plain per-tile texture as *their* neighbor data). See
         // docs/texture-shading-plan.md Phase 2.
         //
-        // Phase 4 finding: skip this for isProxy() tasks -- that covers both
+        // Phase 4 finding: skip the EXPENSIVE full stitch (8 getTexture() lookups + a fresh
+        // 3Wx3W CPU buffer) for isProxy() tasks -- that covers both
         // TileManager::TileEntry::m_prefetchOnly tiles (Phase 1; set via setProxyState() in
-        // tileManager.cpp, never rendered at all -- building a mosaic for them is pure wasted
-        // CPU/memory) and genuine lower-zoom placeholder/proxy tiles (rendered only briefly
-        // while the real tile loads). At any view showing more than a handful of tiles, doing a
-        // full 3Wx3W stitch (with its own 8 getTexture() lookups) for every one of the ~8x as
-        // many prefetch-only tiles as real tiles was saturating the tile-worker pool badly enough
-        // to stall real (non-elevation) tile loading entirely -- see docs/texture-shading-plan.md
-        // Frozen Interface Contract addendum. A proxy tile falls back to its plain per-tile
-        // texture below, which briefly mis-samples the ELEVATION_MOSAIC shader path (muv
-        // remapping assumes a 3Wx3W layout); that's an acceptable, transient cost given proxy
-        // tiles are onscreen only until the real tile replaces them.
-        if (source->m_buildElevationMosaic && !isProxy()) {
-            if (auto mosaicTex = source->buildElevationMosaic(m_tileId, raster->texture)) {
+        // tileManager.cpp, never rendered at all) and genuine lower-zoom placeholder/proxy
+        // tiles (rendered only briefly while the real tile loads). Doing a full stitch for
+        // every one of the ~8x as many prefetch-only tiles as real tiles was saturating the
+        // tile-worker pool badly enough to stall real (non-elevation) tile loading entirely --
+        // see docs/texture-shading-plan.md Frozen Interface Contract addendum.
+        //
+        // But a proxy tile CAN still cheaply reuse an already-registered mosaic (getExistingMosaic:
+        // one map lookup, no stitching) -- and during ordinary panning one usually already exists,
+        // since the visible tile(s) that this proxy is standing in for typically already triggered
+        // a real stitch nearby. Without this, a proxy tile's shader falls back to its plain
+        // per-tile texture while ELEVATION_MOSAIC's UV remap still assumes a 3Wx3W mosaic layout
+        // (elevationMosaicUV() in elevation.yaml), reading roughly 1/9th of the correct area --
+        // visible as a flat, pale, wrongly-shaded patch over any tile still shown as a proxy
+        // (reported by user as "little white patches"; worse the slower tiles load, since proxies
+        // then persist longer -- see docs/tile-pipeline-perf-plan.md).
+        if (source->m_buildElevationMosaic) {
+            auto mosaicTex = isProxy() ? source->getExistingMosaic(m_tileId)
+                                        : source->buildElevationMosaic(m_tileId, raster->texture);
+            if (mosaicTex) {
                 _tile.rasters().emplace_back(raster->tileID, mosaicTex);
                 return;
             }
-            // Fall through to the plain texture if the mosaic couldn't be built (e.g. no
-            // CPU-side buffer data was retained).
+            // Fall through to the plain texture if no mosaic is available yet (e.g. no other
+            // tile in the area has stitched one, or the CPU-side buffer wasn't retained).
         }
         _tile.rasters().emplace_back(raster->tileID, raster->texture);
     }
@@ -442,6 +450,12 @@ std::shared_ptr<Texture> RasterSource::getTexture(TileID _tile) {
     return texIt != m_textures->end() ? texIt->second.lock() : nullptr;
 }
 
+std::shared_ptr<Texture> RasterSource::getExistingMosaic(TileID _tile) {
+    auto mosaicIt = m_mosaics.find(TileID(_tile.x, _tile.y, _tile.z));
+    if (mosaicIt == m_mosaics.end()) { return nullptr; }
+    return mosaicIt->second.lock();
+}
+
 std::shared_ptr<Texture> RasterSource::buildElevationMosaic(TileID _tile, const std::shared_ptr<Texture>& _ownTexture) {
     TileID id(_tile.x, _tile.y, _tile.z);
 
@@ -449,10 +463,7 @@ std::shared_ptr<Texture> RasterSource::buildElevationMosaic(TileID _tile, const 
     // stitched texture (previously each addRaster() call stitched its own 3Wx3W copy - a
     // large part of the Phase 4 congestion finding), and a live mosaic's cells are already
     // kept current by patchNeighborMosaics(), so it is never staler than a fresh stitch.
-    auto mosaicIt = m_mosaics.find(id);
-    if (mosaicIt != m_mosaics.end()) {
-        if (auto mosaic = mosaicIt->second.lock()) { return mosaic; }
-    }
+    if (auto mosaic = getExistingMosaic(id)) { return mosaic; }
 
     // Look up whichever of the 8 same-zoom neighbors are already cached (getTexture() is only
     // safe to call here because addRaster()/complete() run on the main thread -- see the
