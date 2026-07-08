@@ -53,6 +53,41 @@ class RasterTileTask;
 std::shared_ptr<Texture> stitchElevationMosaic(const std::shared_ptr<Texture>& own,
                                                 const std::array<std::shared_ptr<Texture>, 9>& neighbors);
 
+// Opportunistic overzoom-compensation composite (docs/terrain-illumination-plan.md, "raster-zoom
+// mismatch" section): when an elevation raster is attached to a primary vector tile task that is
+// itself overzoomed relative to its own source (TileID s > z, e.g. an `osm` vector tile whose
+// source caps at z14 being displayed at z16), RasterSource::addRasterTask attaches the elevation
+// raster at the PRIMARY task's coarse data zoom (z), never at the elevation source's own finer
+// native zoom nor at the true display zoom (s) -- so draped polygon geometry samples genuinely
+// coarser elevation data than the co-located `terrain-ground` mesh, which always fetches its own
+// tiles natively. This produces a real (not just resolution/tessellation) vertical mismatch
+// between the two nominally-coincident surfaces, which parallax-amplifies into visible pale
+// "white patch" gaps at grazing camera angles on rugged terrain.
+//
+// This function builds a single composite texture covering the SAME [0,1] UV footprint as `own`
+// (the primary tile's plain coarse texture), stitched from an N x N grid of `children` -- same-
+// size descendant tiles at a finer target zoom (N = 2^levels) -- laid out row-major in TILE
+// coordinate order: children[row * N + col], col = west -> east (u ascending), row = north ->
+// south (tile y ascending). A missing or dimension-mismatched cell (nullptr entry, or a texture
+// that isn't square / doesn't match `own`'s width or pixel format) is filled by nearest-neighbor
+// upsampling the corresponding sub-rectangle of `own` -- never a hole, just locally-coarser detail
+// where finer data isn't available. Because the composite keeps the exact same UV footprint as
+// `own`, callers can register the result at the PRIMARY task's own (coarse) TileID unchanged --
+// see Style::setupTileShaderUniforms's tileID.z vs raster.tileID.z crop logic (style.cpp) -- with
+// no shader or crop-math changes needed.
+//
+// Deliberately takes "whatever textures are available" (nulls allowed) as input rather than an
+// active-fetch guarantee, so it can be reused unchanged by a future fuller fix that actively
+// fetches the N children via subtasks instead of only opportunistically finding them already
+// cached -- see RasterSource::buildOverzoomElevationMosaic's cache-only lookup for the current,
+// deliberately scoped-down, first pass.
+//
+// Returns nullptr if `own` has no CPU-side buffer data, isn't square, `children.size()` !=
+// N * N, or N <= 1.
+std::shared_ptr<Texture> stitchElevationOverzoomMosaic(const std::shared_ptr<Texture>& own,
+                                                        const std::vector<std::shared_ptr<Texture>>& children,
+                                                        int N);
+
 // Attached to every elevation mosaic texture via Texture::userData (see
 // RasterSource::buildElevationMosaic).
 struct ElevationMosaicInfo {
@@ -81,6 +116,16 @@ class RasterSource : public TileSource {
     // so mirrored fallback data is only ever transient. Main-thread only (same threading
     // rule as m_textures, see RasterTileTask::addRaster()).
     std::map<TileID, std::weak_ptr<Texture>> m_mosaics;
+
+    // Live registry for the opportunistic overzoom-compensation composite (see
+    // stitchElevationOverzoomMosaic() above and buildOverzoomElevationMosaic() below): one
+    // shared composite per full TileID (x,y,z,s -- s matters here, since the target zoom the
+    // composite compensates up to depends on s), kept alive by the Tile(s) whose rasters()
+    // reference it. Deliberately separate from m_mosaics: that registry's entries are
+    // 3Wp x 3Wp neighbor-ring mosaics for the unrelated texture-shading feature and are patched
+    // in place by patchNeighborMosaics() under a different layout contract -- mixing the two
+    // would corrupt both. Main-thread only, same rule as m_textures/m_mosaics.
+    std::map<TileID, std::weak_ptr<Texture>> m_overzoomMosaics;
 
     TextureOptions m_texOptions;
 
@@ -131,6 +176,25 @@ public:
     // proxy/prefetch-only tiles, which must never trigger the expensive full stitch in
     // buildElevationMosaic() above (see RasterTileTask::addRaster()).
     std::shared_ptr<Texture> getExistingMosaic(TileID _tile);
+
+    // Get-or-build the opportunistic overzoom-compensation composite for `_primary` (see
+    // stitchElevationOverzoomMosaic() above for the "why"). No-op (returns nullptr) unless
+    // `_primary` is actually overzoomed relative to both this source's own zoomOptions.maxZoom
+    // and `_primary.s` (i.e. there is real finer data to opportunistically pull in). Only ever
+    // looks up descendant tiles already resident in `m_textures` -- this cache-only lookup is
+    // the deliberately scoped-down first pass (docs/terrain-illumination-plan.md); it never
+    // triggers a new network fetch, so callers must keep falling back to `_ownTexture` when this
+    // returns nullptr (e.g. no descendant is cached yet). Requires m_keepTextureData (the CPU
+    // buffer of `_ownTexture` is used to fill any composite cell for which no descendant is
+    // cached). Registered in m_overzoomMosaics for reuse across repeated calls for the same
+    // TileID. Main thread only, like all other m_textures/m_mosaics access.
+    std::shared_ptr<Texture> buildOverzoomElevationMosaic(TileID _primary, const std::shared_ptr<Texture>& _ownTexture);
+
+    // Cheap reuse-only lookup (single map find + weak_ptr lock, no stitching) for
+    // m_overzoomMosaics, mirroring getExistingMosaic() above -- safe for proxy/prefetch-only
+    // tasks, which must never trigger the (mildly) more expensive full build above.
+    std::shared_ptr<Texture> getExistingOverzoomMosaic(TileID _primary);
+
 protected:
 
 public:

@@ -262,3 +262,169 @@ TEST_CASE("Elevation mosaic - refuses to build without CPU buffer data or a squa
         REQUIRE(stitchElevationMosaic(nullptr, neighbors) == nullptr);
     }
 }
+
+// --- stitchElevationOverzoomMosaic (docs/terrain-illumination-plan.md "raster-zoom mismatch") ---
+//
+// Unlike stitchElevationMosaic()'s 3x3 neighbor RING (own centered, 8 same-zoom neighbors
+// around it), this stitches an N x N grid of FINER descendant tiles that together cover the
+// exact same [0,1] footprint as `own` -- a direct higher-resolution replacement, not a padded
+// neighbor mosaic. `children` is row-major in TILE coordinate order: children[row*N+col], col
+// west->east, row north->south (matching child TileID x/y order) -- see the doc comment on the
+// function.
+
+uint8_t compositePixel(const Texture& composite, int row, int col) {
+    return composite.bufferData()[size_t(row) * size_t(composite.width()) + size_t(col)];
+}
+
+TEST_CASE("Overzoom mosaic - dimensions and real children land in the correct grid cell", "[RasterMosaic]") {
+    const int W = 4;
+    const int N = 2;
+    auto own = makeConstTexture(W, 200);  // must never show through: every cell is a real child
+
+    // children[row*N+col]: (row=0,col=0)=NW, (row=0,col=1)=NE, (row=1,col=0)=SW, (row=1,col=1)=SE
+    std::vector<std::shared_ptr<Texture>> children(N * N);
+    children[0 * N + 0] = makeConstTexture(W, 1);   // NW
+    children[0 * N + 1] = makeConstTexture(W, 2);   // NE
+    children[1 * N + 0] = makeConstTexture(W, 3);   // SW
+    children[1 * N + 1] = makeConstTexture(W, 4);   // SE
+
+    auto composite = stitchElevationOverzoomMosaic(own, children, N);
+    REQUIRE(composite != nullptr);
+
+    // W is even (no node-registration crop), so Wp = W and the composite is exactly N*W wide.
+    REQUIRE(composite->width() == N * W);
+    REQUIRE(composite->height() == N * W);
+
+    // row=0 (north) children land in the TOP band [Wp, 2Wp) of the composite -- buffer rows run
+    // south -> north like stitchElevationMosaic(), opposite to tile y -- and col=0 (west) lands
+    // in the LEFT band [0, Wp), matching normal west->east column order.
+    for (int r = 0; r < W; r++) {
+        for (int c = 0; c < W; c++) {
+            REQUIRE(compositePixel(*composite, W + r, c) == 1);          // NW
+            REQUIRE(compositePixel(*composite, W + r, W + c) == 2);      // NE
+            REQUIRE(compositePixel(*composite, r, c) == 3);              // SW
+            REQUIRE(compositePixel(*composite, r, W + c) == 4);          // SE
+        }
+    }
+}
+
+TEST_CASE("Overzoom mosaic - missing children fall back to nearest-neighbor upsample of own, not garbage", "[RasterMosaic]") {
+    const int W = 2;
+    const int N = 2;
+    // own[r][c] = (r+1)*10 + c -- own(0,0)=10, own(0,1)=11, own(1,0)=20, own(1,1)=21. Buffer
+    // rows run south -> north (row 0 = south), so own row 1 is the "northern" half, row 0 the
+    // "southern" half, matching stitchElevationMosaic()'s convention.
+    auto own = makeRampTexture(W);
+
+    std::vector<std::shared_ptr<Texture>> children(N * N);  // all missing -> full fallback
+
+    auto composite = stitchElevationOverzoomMosaic(own, children, N);
+    REQUIRE(composite != nullptr);
+    REQUIRE(composite->width() == N * W);
+    REQUIRE(composite->height() == N * W);
+
+    // Every fallback-filled quadrant should be a CONSTANT nearest-neighbor sample of own (W=2,
+    // N=2 means each quadrant's whole Wp x Wp footprint maps to a single own texel), and it
+    // must be the geographically-correct texel: the NW quadrant of the composite should sample
+    // own's own north-west corner, etc.
+    for (int r = 0; r < W; r++) {
+        for (int c = 0; c < W; c++) {
+            REQUIRE(compositePixel(*composite, W + r, c) == 20);          // NW <- own(row=1,col=0)
+            REQUIRE(compositePixel(*composite, W + r, W + c) == 21);      // NE <- own(row=1,col=1)
+            REQUIRE(compositePixel(*composite, r, c) == 10);              // SW <- own(row=0,col=0)
+            REQUIRE(compositePixel(*composite, r, W + c) == 11);          // SE <- own(row=0,col=1)
+        }
+    }
+}
+
+TEST_CASE("Overzoom mosaic - partial availability: present cells are real, missing cells fall back", "[RasterMosaic]") {
+    const int W = 2;
+    const int N = 2;
+    auto own = makeRampTexture(W);  // own(0,0)=10, own(0,1)=11, own(1,0)=20, own(1,1)=21
+
+    std::vector<std::shared_ptr<Texture>> children(N * N);
+    children[0 * N + 0] = makeConstTexture(W, 99);  // NW is real data
+    // NE, SW, SE deliberately left null -> mirrored fallback from own
+
+    auto composite = stitchElevationOverzoomMosaic(own, children, N);
+    REQUIRE(composite != nullptr);
+
+    for (int r = 0; r < W; r++) {
+        for (int c = 0; c < W; c++) {
+            REQUIRE(compositePixel(*composite, W + r, c) == 99);          // NW: real child data
+            REQUIRE(compositePixel(*composite, W + r, W + c) == 21);      // NE: fallback <- own(1,1)
+            REQUIRE(compositePixel(*composite, r, c) == 10);              // SW: fallback <- own(0,0)
+            REQUIRE(compositePixel(*composite, r, W + c) == 11);          // SE: fallback <- own(0,1)
+        }
+    }
+}
+
+TEST_CASE("Overzoom mosaic - a child with mismatched dimensions is treated as missing (fallback, not garbage)", "[RasterMosaic]") {
+    const int W = 4;
+    const int N = 2;
+    auto own = makeConstTexture(W, 55);
+
+    std::vector<std::shared_ptr<Texture>> children(N * N);
+    children[0 * N + 0] = makeConstTexture(W - 1, 1);  // wrong size -- must be rejected, not copied
+
+    auto composite = stitchElevationOverzoomMosaic(own, children, N);
+    REQUIRE(composite != nullptr);
+
+    // Falls back to own (constant 55) rather than reading out-of-bounds or copying mismatched data.
+    for (int r = 0; r < W; r++) {
+        for (int c = 0; c < W; c++) {
+            REQUIRE(compositePixel(*composite, W + r, c) == 55);
+        }
+    }
+}
+
+TEST_CASE("Overzoom mosaic - node-registered (odd W) own texture crops cells to Wp = W - 1", "[RasterMosaic]") {
+    const int W = 5;
+    const int N = 2;
+    auto own = makeConstTexture(W, 7);
+    std::vector<std::shared_ptr<Texture>> children(N * N);  // all fallback from own
+
+    auto composite = stitchElevationOverzoomMosaic(own, children, N);
+    REQUIRE(composite != nullptr);
+
+    const int Wp = W - 1;
+    REQUIRE(composite->width() == N * Wp);
+    REQUIRE(composite->height() == N * Wp);
+}
+
+TEST_CASE("Overzoom mosaic - refuses invalid input", "[RasterMosaic]") {
+    const int W = 4;
+    const int N = 2;
+
+    SECTION("null own texture") {
+        std::vector<std::shared_ptr<Texture>> children(N * N);
+        REQUIRE(stitchElevationOverzoomMosaic(nullptr, children, N) == nullptr);
+    }
+
+    SECTION("N <= 1 (no overzoom to compensate for)") {
+        auto own = makeConstTexture(W, 1);
+        std::vector<std::shared_ptr<Texture>> children(1);
+        REQUIRE(stitchElevationOverzoomMosaic(own, children, 1) == nullptr);
+        REQUIRE(stitchElevationOverzoomMosaic(own, children, 0) == nullptr);
+    }
+
+    SECTION("children.size() != N*N") {
+        auto own = makeConstTexture(W, 1);
+        std::vector<std::shared_ptr<Texture>> children(N * N - 1);
+        REQUIRE(stitchElevationOverzoomMosaic(own, children, N) == nullptr);
+    }
+
+    SECTION("own texture with no pixel data set") {
+        auto own = std::make_shared<Texture>(testOptions());
+        std::vector<std::shared_ptr<Texture>> children(N * N);
+        REQUIRE(stitchElevationOverzoomMosaic(own, children, N) == nullptr);
+    }
+
+    SECTION("non-square own texture") {
+        auto own = std::make_shared<Texture>(testOptions());
+        std::vector<GLubyte> data(4 * 5, 1);
+        own->setPixelData(4, 5, 1, data.data(), data.size());
+        std::vector<std::shared_ptr<Texture>> children(N * N);
+        REQUIRE(stitchElevationOverzoomMosaic(own, children, N) == nullptr);
+    }
+}

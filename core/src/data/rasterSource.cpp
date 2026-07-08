@@ -121,6 +121,48 @@ float computeRugosity(const Tangram::Texture& tex, const Tangram::TileID& id) {
     return float(std::sqrt(sum2 / n) / (double(s) * metersPerTexel));
 }
 
+// Copy one Wp x Wp cell (raw bytes, `bpp` bytes/pixel, cropped to the first Wp rows/cols like
+// copyMosaicCell above) from a real descendant tile buffer into an N x N grid composite of
+// total width N*Wp. `col`/`row` are TILE-grid indices (col: west -> east, row: north -> south --
+// see stitchElevationOverzoomMosaic below for why `row` is placed at composite band (N-1-row)).
+void copyOverzoomGridCell(GLubyte* composite, int Wp, int W, int bpp, int N,
+                           int col, int row, const GLubyte* srcData) {
+    size_t compositeRowBytes = size_t(N) * size_t(Wp) * size_t(bpp);
+    size_t rowOff = size_t(N - 1 - row) * size_t(Wp);
+    size_t colOff = size_t(col) * size_t(Wp) * size_t(bpp);
+    for (int r = 0; r < Wp; r++) {
+        std::memcpy(composite + (rowOff + size_t(r)) * compositeRowBytes + colOff,
+                    srcData + size_t(r) * size_t(W) * size_t(bpp),
+                    size_t(Wp) * size_t(bpp));
+    }
+}
+
+// Fill a missing/mismatched grid cell by nearest-neighbor upsampling the corresponding
+// sub-rectangle of `ownData` (the primary tile's own WxW buffer, covering the composite's full
+// [0,1] footprint) -- i.e. exactly what that cell would show today (before this fix), just
+// cropped to its own sub-region so the rest of the composite can still hold real finer data.
+// Nearest (not bilinear) sampling is a deliberate simplification: this is a same-resolution-as-
+// today fallback for cells where no better data is cached yet, not a quality upgrade in itself,
+// and staying byte-copy-only keeps it agnostic to pixel encoding (terrarium-RGB vs float) with
+// no decode/re-encode round trip.
+void fillUpsampledOverzoomCell(GLubyte* composite, int Wp, int N, int bpp, int col, int row,
+                                const GLubyte* ownData, int ownW) {
+    size_t compositeRowBytes = size_t(N) * size_t(Wp) * size_t(bpp);
+    size_t rowOff = size_t(N - 1 - row) * size_t(Wp);
+    size_t colOff = size_t(col) * size_t(Wp) * size_t(bpp);
+    for (int r = 0; r < Wp; r++) {
+        double v = (double(N - 1 - row) + (double(r) + 0.5) / double(Wp)) / double(N);
+        int ownRow = std::min(ownW - 1, std::max(0, int(v * ownW)));
+        GLubyte* dstRow = composite + (rowOff + size_t(r)) * compositeRowBytes + colOff;
+        const GLubyte* srcRow = ownData + size_t(ownRow) * size_t(ownW) * size_t(bpp);
+        for (int c = 0; c < Wp; c++) {
+            double u = (double(col) + (double(c) + 0.5) / double(Wp)) / double(N);
+            int ownCol = std::min(ownW - 1, std::max(0, int(u * ownW)));
+            std::memcpy(dstRow + size_t(c) * size_t(bpp), srcRow + size_t(ownCol) * size_t(bpp), size_t(bpp));
+        }
+    }
+}
+
 } // namespace
 
 std::shared_ptr<Texture> stitchElevationMosaic(const std::shared_ptr<Texture>& own,
@@ -190,6 +232,68 @@ std::shared_ptr<Texture> stitchElevationMosaic(const std::shared_ptr<Texture>& o
     // late-arriving neighbor tiles replace their mirror-extrapolated placeholders.
     auto tex = std::make_shared<Texture>(options, false);
     tex->setPixelData(mosaicW, mosaicW, bpp, mosaic.data(), mosaic.size());
+
+    return tex;
+}
+
+std::shared_ptr<Texture> stitchElevationOverzoomMosaic(const std::shared_ptr<Texture>& own,
+                                                        const std::vector<std::shared_ptr<Texture>>& children,
+                                                        int N) {
+    if (!own || N <= 1) { return nullptr; }
+    if (int(children.size()) != N * N) { return nullptr; }
+
+    int ownW = own->width();
+    if (ownW <= 0 || ownW != own->height()) { return nullptr; }
+
+    const GLubyte* ownData = own->bufferData();
+    if (!ownData) { return nullptr; }
+
+    TextureOptions options = own->getOptions();
+    int bpp = options.bytesPerPixel();
+
+    // Same node-registration crop as stitchElevationMosaic() above: every cell (real or
+    // fallback-filled) is cropped to its first Wp = W - overlap rows/cols, so the composite is
+    // an evenly-spaced sample grid with no duplicated shared-edge lines between cells. This
+    // shrinks the composite's true footprint by one texel's width out of N*Wp (well under 1%
+    // for any N used here) versus `own`'s exact extent -- negligible given `own`'s UV is
+    // remapped 0..1 across whatever width the composite ends up being (see
+    // Style::setupTileShaderUniforms), so there's no visible seam or stretch, just a
+    // sub-texel-scale approximation.
+    int overlap = ownW % 2;
+    int Wp = ownW - overlap;
+    if (Wp <= 0) { return nullptr; }
+
+    int compositeW = N * Wp;
+    size_t rowBytes = size_t(compositeW) * size_t(bpp);
+    std::vector<GLubyte> buf(rowBytes * size_t(compositeW));
+
+    for (int row = 0; row < N; row++) {
+        for (int col = 0; col < N; col++) {
+            const auto& child = children[size_t(row) * size_t(N) + size_t(col)];
+            if (child && child->bufferData() &&
+                child->width() == ownW && child->height() == ownW &&
+                child->getOptions().bytesPerPixel() == bpp) {
+                copyOverzoomGridCell(buf.data(), Wp, ownW, bpp, N, col, row, child->bufferData());
+            } else {
+                fillUpsampledOverzoomCell(buf.data(), Wp, N, bpp, col, row, ownData, ownW);
+            }
+        }
+    }
+
+    // Unlike stitchElevationMosaic()'s 3Wp x 3Wp neighbor-ring mosaic, this composite is a
+    // direct higher-resolution replacement for `own` at the SAME [0,1] UV footprint (it is not
+    // read via elevationMosaicUV()'s center-third remap), so it keeps `own`'s plain texture
+    // options (e.g. "nearest" filtering per elevation.yaml) rather than forcing mipmapped
+    // linear filtering -- there is no neighbor-mosaic-style multi-scale shader sampling of this
+    // texture to support.
+    //
+    // disposeBuffer left at its default (true): unlike stitchElevationMosaic()'s neighbor-ring
+    // mosaic, nothing ever patches this composite's cells in place after creation (no analog of
+    // patchNeighborMosaics() for this registry yet -- see the "future upgrade path" note on
+    // RasterSource::buildOverzoomElevationMosaic), so there's no need to keep its CPU buffer
+    // resident past the GPU upload.
+    auto tex = std::make_shared<Texture>(options);
+    tex->setPixelData(compositeW, compositeW, bpp, buf.data(), buf.size());
 
     return tex;
 }
@@ -277,6 +381,45 @@ public:
         // visible as a flat, pale, wrongly-shaded patch over any tile still shown as a proxy
         // (reported by user as "little white patches"; worse the slower tiles load, since proxies
         // then persist longer -- see docs/tile-pipeline-perf-plan.md).
+
+        // Opportunistic overzoom-compensation composite (docs/terrain-illumination-plan.md,
+        // "raster-zoom mismatch" section): m_tileId carries both this raster subtask's own data
+        // zoom (z, what it was actually fetched at) and the primary tile's display zoom (s). When
+        // s > z and this elevation source can serve finer data than z, RasterSource::addRasterTask
+        // (above) has attached this raster at the coarse z -- meaning draped polygon geometry
+        // would otherwise sample genuinely coarser elevation than the co-located terrain-ground
+        // mesh (which always fetches its own tiles at native resolution), a real vertical
+        // mismatch between the two surfaces that grazing-angle parallax amplifies into visible
+        // pale "white patch" gaps. Opportunistically upgrade the raster to a composite of
+        // whatever finer descendant tiles are already cached (see
+        // RasterSource::buildOverzoomElevationMosaic -- cache-only lookup, never a new fetch).
+        // No-op (returns nullptr immediately) when m_tileId isn't actually overzoomed, so this
+        // costs nothing for the ordinary (non-overzoomed) case, e.g. terrain-ground's own tiles.
+        //
+        // MUST be skipped whenever m_buildElevationMosaic (texture shading) is set: the
+        // ELEVATION_MOSAIC shader path (elevation.yaml) is a scene-global compile-time define --
+        // once on, EVERY texture bound to the elevation raster slot is read through
+        // elevationMosaicUV(), which unconditionally remaps tile-local UV into the center NINTH
+        // of whatever texture is bound, assuming the Frozen-Interface-Contract 3Wp x 3Wp
+        // neighbor-ring layout. This composite is a direct same-footprint replacement (see
+        // stitchElevationOverzoomMosaic's doc comment) -- NOT that layout -- so if it were bound
+        // while ELEVATION_MOSAIC is compiled in, the shader would sample a essentially-arbitrary
+        // sub-region of it instead of the correct footprint, corrupting the vertex-shader
+        // elevation read for every draped vertex (observed: land-cover polygons vanish
+        // entirely, presumably displaced far outside the frustum -- confirmed by A/B testing
+        // this exact scenario). Composing the two mechanisms is deferred to the "future upgrade
+        // path" noted on buildOverzoomElevationMosaic(); for this pass, texture shading (already
+        // shipped, already covers same-zoom neighbor blending) simply wins when both would
+        // otherwise apply, and this composite only ever engages with texture shading off.
+        if (!source->m_buildElevationMosaic) {
+            auto overzoomTex = isProxy() ? source->getExistingOverzoomMosaic(m_tileId)
+                                          : source->buildOverzoomElevationMosaic(m_tileId, raster->texture);
+            if (overzoomTex) {
+                _tile.rasters().emplace_back(raster->tileID, overzoomTex);
+                return;
+            }
+        }
+
         if (source->m_buildElevationMosaic) {
             auto mosaicTex = isProxy() ? source->getExistingMosaic(m_tileId)
                                         : source->buildElevationMosaic(m_tileId, raster->texture);
@@ -514,6 +657,85 @@ std::shared_ptr<Texture> RasterSource::buildElevationMosaic(TileID _tile, const 
              _tile.toString().c_str(), mosaic->width(), mosaic->height(),
              _ownTexture ? _ownTexture->width() : 0, _ownTexture ? _ownTexture->height() : 0,
              int(m_mosaics.size()));
+    }
+
+    return mosaic;
+}
+
+std::shared_ptr<Texture> RasterSource::getExistingOverzoomMosaic(TileID _primary) {
+    auto it = m_overzoomMosaics.find(_primary);
+    if (it == m_overzoomMosaics.end()) { return nullptr; }
+    return it->second.lock();
+}
+
+std::shared_ptr<Texture> RasterSource::buildOverzoomElevationMosaic(TileID _primary, const std::shared_ptr<Texture>& _ownTexture) {
+    // Bounds how many zoom levels of overzoom this opportunistic composite will try to make up
+    // for in one go (N x N descendants, N = 2^levels), so cost stays bounded regardless of how
+    // overzoomed the primary tile's display zoom (s) is -- e.g. a deeply overzoomed z14 tile
+    // displayed at z20 should still only try a 4x4 = 16-tile composite from z16 (this source's
+    // own cap), not a 64x64 = 4096-tile one. 2 covers the common case exactly (elevation.yaml
+    // caps at z16, the `osm` vector source at z14: a 2-level, 4x4 = 16-tile gap).
+    static const int kMaxOverzoomLevels = 2;
+
+    if (!_ownTexture || !_ownTexture->bufferData() || !m_keepTextureData) { return nullptr; }
+
+    // Not actually overzoomed relative to this source's own reach: nothing to compensate for.
+    // Covers both the ordinary non-overzoomed case (s == z, e.g. terrain-ground's own tiles at
+    // typical zooms) and the case where this source's own maxZoom is already exhausted too
+    // (_primary.z == maxZoom, e.g. deep overzoom past z16 even for terrain-ground itself) --
+    // there is no finer same-source data to pull in either way.
+    int zt = std::min<int>(m_zoomOptions.maxZoom, _primary.s);
+    zt = std::min<int>(zt, _primary.z + kMaxOverzoomLevels);
+    if (zt <= _primary.z) { return nullptr; }
+
+    if (auto existing = getExistingOverzoomMosaic(_primary)) { return existing; }
+
+    int levels = zt - _primary.z;
+    int N = 1 << levels;
+
+    // Enumerate the N x N descendant TileIDs covering _primary's footprint at zt and look each
+    // up in the existing (weak-ref) texture cache -- deliberately cache-only for this first pass
+    // (see the doc comment on this method / stitchElevationOverzoomMosaic): no new fetch is
+    // triggered here even when a cell is missing. `children` is laid out row-major in the same
+    // (col: west->east, row: north->south) order stitchElevationOverzoomMosaic expects.
+    std::vector<std::shared_ptr<Texture>> children(size_t(N) * size_t(N));
+    int32_t baseX = _primary.x << levels;
+    int32_t baseY = _primary.y << levels;
+    int present = 0;
+    for (int row = 0; row < N; row++) {
+        for (int col = 0; col < N; col++) {
+            auto tex = getTexture(TileID(baseX + col, baseY + row, zt));
+            if (tex && tex->bufferData()) { present++; }
+            children[size_t(row) * size_t(N) + size_t(col)] = tex;
+        }
+    }
+
+    // "Enough" cells resident to be worth building a composite: in practice this is almost
+    // always a PARTIAL grid, not all-or-nothing -- under a grazing/tilted camera, a single
+    // coarse `osm` tile's footprint spans a wide range of on-screen distances, and
+    // terrain-ground (whose own requests are what populates this cache in the common case,
+    // see the doc comment on this method) only fetches the true native zoom for the near part
+    // of that footprint that actually needs it on screen; the far part may genuinely only ever
+    // need coarser data. So requiring a majority of the N x N grid would mean this almost never
+    // fires for exactly the case that matters most (the near, high-relief, parallax-amplified
+    // part of an overzoomed tile). Since every fallback-filled cell reproduces exactly what
+    // today's plain-coarse-texture behavior already shows for that cell (see
+    // fillUpsampledOverzoomCell's doc comment), a partial composite is never WORSE than today,
+    // only sometimes better -- so the only real bar is "at least one real cell", i.e. "if NONE
+    // of the finer tiles are cached yet, just fall back to today's existing behavior".
+    if (present == 0) { return nullptr; }
+
+    auto mosaic = stitchElevationOverzoomMosaic(_ownTexture, children, N);
+
+    if (mosaic) {
+        // Register for reuse; prune dead entries while we're here (composites die when their
+        // last referencing Tile does), same housekeeping pattern as buildElevationMosaic() above.
+        for (auto it = m_overzoomMosaics.begin(); it != m_overzoomMosaics.end();) {
+            it = it->second.expired() ? m_overzoomMosaics.erase(it) : std::next(it);
+        }
+        m_overzoomMosaics[_primary] = mosaic;
+        LOGD("Overzoom elevation composite for tile %s: %dx%d from %d/%d cached z%d descendants",
+             _primary.toString().c_str(), mosaic->width(), mosaic->height(), present, N * N, zt);
     }
 
     return mosaic;
