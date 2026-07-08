@@ -360,8 +360,10 @@ void TileManager::updateTileSet(TileSet& _tileSet, const ViewState& _view) {
             }
 
             // A tile completed on an earlier frame while prefetch-only/proxy still holds the
-            // plain (mip-less) elevation texture; swap in the shared mosaic (no-op otherwise).
-            if (entry.tile) { upgradeElevationMosaic(_tileSet, *entry.tile); }
+            // plain (mip-less) elevation texture; swap in the shared mosaic. Also covers a
+            // draped vector tile (e.g. `osm`) whose attached elevation raster was baked in at
+            // build time before finer descendant tiles were cached -- see definition.
+            if (entry.tile) { upgradeAttachedRasters(_tileSet, *entry.tile); }
 
             if (entry.needsLoading()) {
                 // Not yet available - enqueue for loading
@@ -680,16 +682,107 @@ void TileManager::loadTiles() {
 // RasterSource texture cache identifies a plain texture (a raster holding the plain texture
 // keeps exactly that cache entry alive); a tile already holding a mosaic fails the pointer
 // test and is left unchanged, so this is cheap to call per update.
-void TileManager::upgradeElevationMosaic(TileSet& _tileSet, Tile& _tile) {
-    if (!_tileSet.source->isRaster()) { return; }
-    auto* rs = static_cast<RasterSource*>(_tileSet.source.get());
-    if (!rs->m_buildElevationMosaic || _tile.rasters().empty()) { return; }
-    auto& raster = _tile.rasters().front();
-    // 3-arg TileID (s = z) to match the texture cache's normalized keys
-    TileID texId(raster.tileID.x, raster.tileID.y, raster.tileID.z);
-    if (raster.texture && raster.texture == rs->getTexture(texId)) {
-        if (auto mosaic = rs->buildElevationMosaic(raster.tileID, raster.texture)) {
-            raster.texture = mosaic;
+//
+// Second, distinct case (docs/terrain-illumination-plan.md "attachment lifecycle" finding):
+// a draped VECTOR tile (e.g. `osm` polygons, not a RasterSource's own tile) gets its elevation
+// raster(s) attached exactly ONCE, as a side effect of RasterTileTask::addRaster() running as a
+// subtask of the vector TileTask's own build -- whatever raster (plain / partial-or-complete
+// overzoom composite) happens to be cache-available AT THAT INSTANT is baked into
+// Tile::rasters() and never revisited afterward, even as the elevation source keeps fetching
+// finer descendant tiles in the background. This is why the "white patches" correlate strongly
+// with PANNING rather than static load time: a polygon tile that enters view (and gets built)
+// races its own elevation prefetch, and whichever races ahead wins PERMANENTLY for that tile's
+// lifetime -- a tile built early with a coarse/absent composite stays coarse even seconds later
+// once every descendant it needed is sitting in cache. Fix: also revisit each attached raster
+// (Tile::rasters()[i] <-> the owning TileSource's rasterSources()[i], same index order as
+// TileSource::addRasterTasks/addRasterTask populate them) the same way, per raster source's own
+// contract (texture-shading mosaic vs. opportunistic overzoom composite).
+void TileManager::upgradeAttachedRasters(TileSet& _tileSet, Tile& _tile) {
+    if (_tileSet.source->isRaster()) {
+        // Case 1 (pre-existing): _tileSet.source IS the elevation RasterSource, and this tile
+        // is its own raster tile (terrain-ground/hillshade) -- single self-referencing entry.
+        auto* rs = static_cast<RasterSource*>(_tileSet.source.get());
+        if (!rs->m_buildElevationMosaic || _tile.rasters().empty()) { return; }
+        auto& raster = _tile.rasters().front();
+        // 3-arg TileID (s = z) to match the texture cache's normalized keys
+        TileID texId(raster.tileID.x, raster.tileID.y, raster.tileID.z);
+        if (raster.texture && raster.texture == rs->getTexture(texId)) {
+            if (auto mosaic = rs->buildElevationMosaic(raster.tileID, raster.texture)) {
+                raster.texture = mosaic;
+            }
+        }
+        return;
+    }
+
+    // Case 2 (new): _tileSet.source is a vector (or other non-raster) source with one or more
+    // raster attachments (global.elevation_sources etc.) -- e.g. `osm` polygons draped with
+    // elevation. Zip Tile::rasters() with the owning source's rasterSources(): the LAST
+    // srcs.size() entries of rasters() correspond index-for-index to rasterSources() (both
+    // populated in the same iteration order by TileSource::addRasterTasks ->
+    // RasterSource::addRasterTask, completed in that order by TileTask::complete()'s m_subTasks
+    // loop; the offset skips any leading own-raster entries -- same convention as the
+    // missing-raster proxy pass in updateTileSet() above).
+    auto& sources = _tileSet.source->rasterSources();
+    auto& rasters = _tile.rasters();
+    if (sources.empty() || rasters.size() < sources.size()) { return; }
+    size_t offset = rasters.size() - sources.size();
+
+    for (size_t i = 0; i < sources.size(); i++) {
+        RasterSource* rs = sources[i];
+        Raster& raster = rasters[i + offset];
+        if (!rs || !raster.texture) { continue; }
+
+        // 3-arg TileID (s = z) to match the texture cache's normalized keys. raster.tileID may
+        // be a lower-zoom PARENT of the tile's own id (the missing-raster proxy pass in
+        // updateTileSet() substitutes one when the exact fetch failed) -- everything below
+        // handles that transparently, since all lookups key off raster.tileID itself.
+        TileID texId(raster.tileID.x, raster.tileID.y, raster.tileID.z);
+        auto plainTex = rs->getTexture(texId);
+
+        if (rs->m_buildElevationMosaic) {
+            // Retry whenever the attached raster is not yet FINAL. Two non-final states:
+            //  (a) the plain per-tile texture (mosaic never built, e.g. built while proxy);
+            //  (b) a neighbor-ring mosaic whose center is still the plain texture
+            //      (ElevationMosaicInfo::ownIsOverzoomComposite == false) while the tile is
+            //      overzoomed -- a complete overzoom composite may have become available since,
+            //      and buildElevationMosaic() knows how to rebuild around it (see its doc
+            //      comment). Without (b), any tile that got its mosaic built before all finer
+            //      descendants were cached would keep coarse z14-level lattice values FOREVER
+            //      (mosaics are never revisited elsewhere) -- observed live as white patches
+            //      that never resolve no matter how long the descendants sit in cache, while
+            //      other patches (whose tiles happened to rebuild at a lucky instant) healed.
+            // Textures with no userData that also aren't the plain texture (empty texture,
+            // parent-proxy fill-ins whose own entry expired) are left alone.
+            bool holdsPlain = plainTex && raster.texture == plainTex;
+            std::shared_ptr<Texture> center = plainTex;
+            bool retry = holdsPlain;
+            if (!retry && raster.texture->userData) {
+                auto* info = static_cast<ElevationMosaicInfo*>(raster.texture->userData.get());
+                if (!info->ownIsOverzoomComposite) {
+                    retry = true;
+                    // the mosaic's retained center texture IS this tile's plain texture --
+                    // use it even if the weak cache entry has been dropped
+                    if (!center) { center = info->ownTexture; }
+                }
+            }
+            if (retry && center) {
+                auto mosaic = rs->buildElevationMosaic(raster.tileID, center);
+                if (mosaic && mosaic != raster.texture) {
+                    raster.texture = mosaic;
+                }
+            }
+        } else {
+            // Texture shading off: the final state is the overzoom composite itself (or the
+            // plain texture where no overzoom applies -- buildOverzoomElevationMosaic no-ops
+            // then). Gate on still holding the plain texture: once upgraded, the raster no
+            // longer equals the cache entry and this is skipped, and with the ALL-N*N-cells
+            // requirement a registered composite is final anyway (no partial composites are
+            // ever registered that would need later improvement).
+            if (plainTex && raster.texture == plainTex) {
+                if (auto composite = rs->buildOverzoomElevationMosaic(raster.tileID, plainTex)) {
+                    raster.texture = composite;
+                }
+            }
         }
     }
 }
@@ -703,7 +796,7 @@ bool TileManager::addTile(TileSet& _tileSet, const TileID& _tileID) {
             // Reset tile on potential internal dynamic data set
             tile->resetState();
 
-            upgradeElevationMosaic(_tileSet, *tile);
+            upgradeAttachedRasters(_tileSet, *tile);
         } else {
             // Clear stale tile data
             tile.reset();

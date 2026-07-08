@@ -378,7 +378,8 @@ TEST_CASE("Overzoom mosaic - a child with mismatched dimensions is treated as mi
     }
 }
 
-TEST_CASE("Overzoom mosaic - node-registered (odd W) own texture crops cells to Wp = W - 1", "[RasterMosaic]") {
+TEST_CASE("Overzoom mosaic - node-registered (odd W) own texture: interior cells crop to Wp = W - 1, "
+          "composite keeps the far (north/east) edge line", "[RasterMosaic]") {
     const int W = 5;
     const int N = 2;
     auto own = makeConstTexture(W, 7);
@@ -387,9 +388,68 @@ TEST_CASE("Overzoom mosaic - node-registered (odd W) own texture crops cells to 
     auto composite = stitchElevationOverzoomMosaic(own, children, N);
     REQUIRE(composite != nullptr);
 
+    // Composite width is (N-1)*Wp + W, NOT N*Wp: unlike stitchElevationMosaic()'s neighbor-ring
+    // mosaic (where every cell borders another real cell on all sides), this composite's own
+    // outer boundary has no further cell beyond it, so its north-most/east-most band keeps the
+    // full W (not cropped to Wp) to preserve the true world-1.0 edge sample -- see
+    // stitchElevationOverzoomMosaic's doc comment ("missing far-edge line" fix).
     const int Wp = W - 1;
-    REQUIRE(composite->width() == N * Wp);
-    REQUIRE(composite->height() == N * Wp);
+    REQUIRE(composite->width() == (N - 1) * Wp + W);
+    REQUIRE(composite->height() == (N - 1) * Wp + W);
+}
+
+TEST_CASE("Overzoom mosaic - real children: the composite's far (north/east) edge is the true "
+          "child edge sample, not one texel short of it", "[RasterMosaic]") {
+    // Node-registered (odd W) children with distinguishable per-tile ramps, so the true edge
+    // texel (child-local column/row W-1) is distinct from the next-to-edge one (W-2) -- proves
+    // the composite's outer boundary is the REAL edge sample, not a cropped/dropped one.
+    const int W = 5;
+    const int N = 2;
+    auto own = makeConstTexture(W, 200);  // must never show through: every cell is a real child
+
+    auto makeChild = [&](uint8_t base) {
+        auto tex = std::make_shared<Texture>(testOptions());
+        std::vector<GLubyte> data(size_t(W) * size_t(W));
+        for (int r = 0; r < W; r++) {
+            for (int c = 0; c < W; c++) {
+                data[size_t(r) * W + c] = uint8_t(base + r * 10 + c);
+            }
+        }
+        tex->setPixelData(W, W, 1, data.data(), data.size());
+        return tex;
+    };
+
+    std::vector<std::shared_ptr<Texture>> children(N * N);
+    children[0 * N + 0] = makeChild(1);    // NW (row=0, col=0)
+    children[0 * N + 1] = makeChild(101);  // NE (row=0, col=N-1) -- north-most AND east-most
+    children[1 * N + 0] = makeChild(51);   // SW (row=1, col=0)
+    children[1 * N + 1] = makeChild(151);  // SE (row=1, col=N-1) -- east-most
+
+    auto composite = stitchElevationOverzoomMosaic(own, children, N);
+    REQUIRE(composite != nullptr);
+
+    const int Wp = W - 1;
+    const int compositeW = (N - 1) * Wp + W;
+    REQUIRE(composite->width() == compositeW);
+
+    // NE cell (row=0, col=N-1) occupies the composite's absolute top-right corner. Its own
+    // top-right texel (child-local row=W-1, col=W-1) is the true world corner (north AND east
+    // edge at once) and must land at the composite's own top-right corner, unmodified.
+    uint8_t expectedCorner = uint8_t(101 + (W - 1) * 10 + (W - 1));
+    REQUIRE(compositePixel(*composite, compositeW - 1, compositeW - 1) == expectedCorner);
+
+    // SE cell (row=1, col=N-1): east-most but NOT north-most -- its far EAST column (child-local
+    // col=W-1) must be present at the composite's east edge, at composite row Wp - 1 (SE cell's
+    // band is rows [0, Wp), cropped in height since row=1 isn't the north-most band; local row
+    // Wp-1 is its highest kept row).
+    uint8_t expectedE = uint8_t(151 + (Wp - 1) * 10 + (W - 1));
+    REQUIRE(compositePixel(*composite, Wp - 1, compositeW - 1) == expectedE);
+
+    // NW cell (row=0, col=0): north-most but NOT east-most -- its far NORTH row (child-local
+    // row=W-1) must be present at the composite's north edge, at composite col Wp - 1 (NW cell's
+    // band is cols [0, Wp), cropped in width since col=0 isn't the east-most band).
+    uint8_t expectedN = uint8_t(1 + (W - 1) * 10 + (Wp - 1));
+    REQUIRE(compositePixel(*composite, compositeW - 1, Wp - 1) == expectedN);
 }
 
 TEST_CASE("Overzoom mosaic - refuses invalid input", "[RasterMosaic]") {

@@ -76,11 +76,26 @@ std::shared_ptr<Texture> stitchElevationMosaic(const std::shared_ptr<Texture>& o
 // see Style::setupTileShaderUniforms's tileID.z vs raster.tileID.z crop logic (style.cpp) -- with
 // no shader or crop-math changes needed.
 //
+// Node-registration crop (Wp = W - overlap, see copyMosaicCell/copyOverzoomGridCell in
+// rasterSource.cpp) applies per-cell same as stitchElevationMosaic(), EXCEPT the composite's own
+// outer boundary (row == 0, the north-most band; col == N-1, the east-most band) is NOT cropped
+// in that dimension, since no further cell exists beyond it to supply the shared edge that
+// cropping would otherwise drop -- fixing a real, shipped bug (docs/terrain-illumination-plan.md
+// "missing far-edge line") where the composite came out one texel short of the tile's true
+// north/east edge, so the terrain lattice's UV=1 row/column (getTerrainMeshElevation,
+// elevation.yaml) sampled the wrong sample there, streaking along the north/east tile border
+// even given a fully-populated N x N grid. The composite is therefore
+// (N - 1) * Wp + own->width() texels wide/tall, not simply N * Wp.
+//
 // Deliberately takes "whatever textures are available" (nulls allowed) as input rather than an
 // active-fetch guarantee, so it can be reused unchanged by a future fuller fix that actively
 // fetches the N children via subtasks instead of only opportunistically finding them already
 // cached -- see RasterSource::buildOverzoomElevationMosaic's cache-only lookup for the current,
-// deliberately scoped-down, first pass.
+// deliberately scoped-down, first pass (that caller additionally requires ALL N*N children to be
+// real, non-fallback data before ever using a composite it builds here -- see its doc comment --
+// but this free function itself still accepts and fills partial input, since it is also
+// exercised directly with partial input by unit tests, and staying maximally permissive here
+// keeps it reusable for the active-fetch fuller fix too).
 //
 // Returns nullptr if `own` has no CPU-side buffer data, isn't square, `children.size()` !=
 // N * N, or N <= 1.
@@ -91,14 +106,24 @@ std::shared_ptr<Texture> stitchElevationOverzoomMosaic(const std::shared_ptr<Tex
 // Attached to every elevation mosaic texture via Texture::userData (see
 // RasterSource::buildElevationMosaic).
 struct ElevationMosaicInfo {
-    // keeps the original per-tile texture alive for as long as the mosaic lives: m_textures
-    // only holds weak refs and Tiles reference the mosaic instead of the original, so without
-    // this the original expires immediately and neighbors stitched later would permanently
-    // fall back to mirror-extrapolation for this tile's cell (-> texture shading tile seams)
+    // keeps the center-cell texture actually used (see ownIsOverzoomComposite below) alive for
+    // as long as the mosaic lives: m_textures only holds weak refs and Tiles reference the
+    // mosaic instead of the original, so without this the original expires immediately and
+    // neighbors stitched later would permanently fall back to mirror-extrapolation for this
+    // tile's cell (-> texture shading tile seams). When ownIsOverzoomComposite is true this is
+    // redundant with m_overzoomMosaics' own strong ref (rasterSource.h), but harmless to keep.
     std::shared_ptr<Texture> ownTexture;
     // dimensionless RMS-slope statistic of the tile at a mid-pyramid-band scale, input for
     // texture shading auto-contrast (see RasterSource::aggregateRugosity)
     float rugosity = 0.f;
+    // True if this mosaic's center cell is the opportunistic overzoom-compensation composite
+    // (RasterSource::buildOverzoomElevationMosaic) rather than the tile's plain per-tile
+    // texture -- i.e. this mosaic is already final/best-possible and buildElevationMosaic()'s
+    // upgrade-retry path (see its doc comment, and TileManager::upgradeAttachedRasters) can
+    // stop re-checking it. Only ever true for a tile that was genuinely overzoomed AND had all
+    // N*N finer descendants cached (buildOverzoomElevationMosaic requires ALL of them, not a
+    // partial composite, before ever registering one -- see its doc comment).
+    bool ownIsOverzoomComposite = false;
 };
 
 class RasterSource : public TileSource {
@@ -119,13 +144,38 @@ class RasterSource : public TileSource {
 
     // Live registry for the opportunistic overzoom-compensation composite (see
     // stitchElevationOverzoomMosaic() above and buildOverzoomElevationMosaic() below): one
-    // shared composite per full TileID (x,y,z,s -- s matters here, since the target zoom the
-    // composite compensates up to depends on s), kept alive by the Tile(s) whose rasters()
-    // reference it. Deliberately separate from m_mosaics: that registry's entries are
-    // 3Wp x 3Wp neighbor-ring mosaics for the unrelated texture-shading feature and are patched
-    // in place by patchNeighborMosaics() under a different layout contract -- mixing the two
-    // would corrupt both. Main-thread only, same rule as m_textures/m_mosaics.
-    std::map<TileID, std::weak_ptr<Texture>> m_overzoomMosaics;
+    // shared composite per (x, y, z, overzoomTargetZoom()) -- see overzoomTargetZoom()'s doc
+    // comment for why the key is NOT the raw request TileID. Deliberately separate from
+    // m_mosaics: that registry's entries are 3Wp x 3Wp neighbor-ring mosaics for the unrelated
+    // texture-shading feature and are patched in place by patchNeighborMosaics() under a
+    // different layout contract -- mixing the two would corrupt both.
+    //
+    // Holds STRONG references (unlike m_mosaics/m_textures's weak-ref pattern), deliberately:
+    // the primary vector tile a composite is attached to gets rebuilt routinely during ordinary
+    // panning (TileManager treats a TileID with a different `s` -- recomputed every frame from
+    // live on-screen area -- as a structurally different visible-tile entry, so `s` churn alone
+    // spawns a fresh TileTask even though the underlying tile is physically the same). Each
+    // rebuild drops the old Tile's raster reference and, with it, a weakly-held composite --
+    // so a weak-ref cache here would rebuild from scratch (against whatever fraction of
+    // descendants happens to be cached at that exact instant) on essentially every rebuild,
+    // which is worse than merely the documented "opportunistic/partial" limitation: it produces
+    // visible tile-sized flicker as completeness randomly differs between rebuilds of what is,
+    // physically, the same tile (confirmed via live debug logs showing the identical cache key
+    // rebuilt seconds apart with a different descendant count each time). A strong cache means
+    // once a tile's composite is resolved (buildOverzoomElevationMosaic requires ALL N*N
+    // descendants cached before ever registering one here -- see its doc comment), it stays
+    // resolved and stable for the rest of the session, independent of how many times the primary
+    // tile itself gets rebuilt. Bounded by kMaxOverzoomMosaicEntries (rasterSource.cpp) to avoid
+    // unbounded growth over a long panning session -- see pruneOverzoomMosaicsIfNeeded().
+    std::map<TileID, std::shared_ptr<Texture>> m_overzoomMosaics;
+
+    // Simple bound for m_overzoomMosaics: if adding a new entry would exceed
+    // kMaxOverzoomMosaicEntries (rasterSource.cpp), clear the whole registry first. A full clear
+    // (rather than proper LRU eviction) is a deliberate simplification -- this only fires after
+    // a long session has visited many distinct overzoomed tiles, is rare compared to the
+    // per-pan-step churn this cache exists to eliminate, and self-heals immediately (any tile
+    // still on screen just rebuilds its composite on next rebuild, same as first-ever visit).
+    void pruneOverzoomMosaicsIfNeeded();
 
     TextureOptions m_texOptions;
 
@@ -186,14 +236,42 @@ public:
     // triggers a new network fetch, so callers must keep falling back to `_ownTexture` when this
     // returns nullptr (e.g. no descendant is cached yet). Requires m_keepTextureData (the CPU
     // buffer of `_ownTexture` is used to fill any composite cell for which no descendant is
-    // cached). Registered in m_overzoomMosaics for reuse across repeated calls for the same
-    // TileID. Main thread only, like all other m_textures/m_mosaics access.
+    // cached). Registered in m_overzoomMosaics -- keyed by (x, y, z, overzoomTargetZoom(_primary)),
+    // NOT by the raw `_primary` TileID, see overzoomTargetZoom()'s doc comment -- for reuse
+    // across repeated calls for what is physically the same tile. Main thread only, like all
+    // other m_textures/m_mosaics access.
     std::shared_ptr<Texture> buildOverzoomElevationMosaic(TileID _primary, const std::shared_ptr<Texture>& _ownTexture);
 
     // Cheap reuse-only lookup (single map find + weak_ptr lock, no stitching) for
     // m_overzoomMosaics, mirroring getExistingMosaic() above -- safe for proxy/prefetch-only
     // tasks, which must never trigger the (mildly) more expensive full build above.
     std::shared_ptr<Texture> getExistingOverzoomMosaic(TileID _primary);
+
+protected:
+    // Target zoom buildOverzoomElevationMosaic() would stitch `_primary` up to, or `_primary.z`
+    // itself if `_primary` isn't overzoomed enough to be worth compensating for (callers must
+    // treat that as "not applicable"). Capped at kOverzoomCompositeMaxLevels zoom levels above
+    // `_primary.z` to bound composite size regardless of how overzoomed the display is.
+    //
+    // Deliberately depends only on `_primary.z`/`_primary.s` and this source's own
+    // zoomOptions.maxZoom -- both m_overzoomMosaics' cache key and every lookup MUST go through
+    // this (never key on the raw `_primary` TileID directly): `_primary.s` is not a stable
+    // per-tile property, it's continuously recomputed by TileManager from live on-screen tile
+    // area (`updateTileSets()`'s `visId.s = tileId.z + ceil(log2(area/maxArea)/2)`) and ticks up
+    // and down by small amounts on essentially every pan/zoom step, even when the actual target
+    // resolution this composite would stitch to (`zt`, which saturates once
+    // kOverzoomCompositeMaxLevels is hit -- e.g. s=16 and s=17 both cap to the same zt=16 for a
+    // z=14 primary) hasn't changed at all. Keying on raw `_primary` was a real, shipped bug:
+    // confirmed via live debug logs showing the exact same physical tile rebuilt multiple times
+    // in quick succession during ordinary panning, each time from whatever fraction of
+    // descendants happened to be cached at that instant (present counts differing between
+    // rebuilds of the "same" tile) -- producing visible, tile-sized flicker of the composite's
+    // completeness as the user panned, distinct from (and in addition to) the underlying
+    // opportunistic/partial-coverage limitation. Keying by (x, y, z, zt) instead makes the cache
+    // entry -- and thus whether a given on-screen tile shows a stitched composite or the plain
+    // fallback -- depend only on the physical tile and its actual target resolution, stable
+    // across the `s` churn of ordinary panning.
+    int overzoomTargetZoom(TileID _primary) const;
 
 protected:
 

@@ -105,9 +105,12 @@ protected:
     // add new visible tile to TileSet
     bool addTile(TileSet& _tileSet, const TileID& _tileID);
 
-    // swap a plain per-tile elevation texture for the shared 3Wx3W mosaic on a tile becoming
-    // visible after being built as prefetch-only/proxy (see definition for details)
-    void upgradeElevationMosaic(TileSet& _tileSet, Tile& _tile);
+    // Revisit a tile's raster attachment(s) and swap in a better-resolution texture if one has
+    // become available since the tile was built (see definition for details): the shared 3Wx3W
+    // texture-shading mosaic for a tile built as prefetch-only/proxy, or the opportunistic
+    // overzoom elevation composite for a draped vector tile (e.g. `osm` polygons) whose attached
+    // elevation raster was baked in at build time before its finer descendant tiles were cached.
+    void upgradeAttachedRasters(TileSet& _tileSet, Tile& _tile);
 
     // check cache for proxy for new tile
     void updateProxyTiles(TileSet& _tileSet, const TileID& _tileID, TileEntry& _tile);
