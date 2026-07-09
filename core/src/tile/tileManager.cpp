@@ -739,49 +739,49 @@ void TileManager::upgradeAttachedRasters(TileSet& _tileSet, Tile& _tile) {
         TileID texId(raster.tileID.x, raster.tileID.y, raster.tileID.z);
         auto plainTex = rs->getTexture(texId);
 
+        // The attached raster is FINAL only while the zoom of the elevation data it carries
+        // EQUALS the tile's live target zoom (see ElevationMosaicInfo::compositeZoom's doc
+        // comment: equality, not >=, in BOTH directions -- a meter-scale pan flips a near
+        // tile's styling zoom 15<->16, and the zoom the terrain renders underneath flips with
+        // it, so a frozen once-"best" attachment starts disagreeing with the terrain by the
+        // z15-vs-z16 DEM delta: observed live as white patches born from tiny pans that never
+        // healed). ElevationMosaicInfo (present on mosaics AND composites) carries that zoom;
+        // the plain texture carries none (its data zoom is trivially raster.tileID.z).
+        ElevationMosaicInfo* info = raster.texture->userData
+                ? static_cast<ElevationMosaicInfo*>(raster.texture->userData.get()) : nullptr;
+        bool holdsPlain = plainTex && raster.texture == plainTex;
+        // Textures that are neither the plain texture nor carry mosaic/composite info (the
+        // empty texture, parent-proxy fill-ins whose own cache entry expired) are left alone.
+        if (!holdsPlain && !info) { continue; }
+
+        int attachedZoom = info ? info->compositeZoom : int(raster.tileID.z);
+        int desired = std::max<int>(rs->overzoomTargetZoom(raster.tileID), int(raster.tileID.z));
+        if (attachedZoom == desired) { continue; }  // steady state: one map lookup per source
+
+        // The plain texture is the required base for (re)building composites at any level
+        // (stitch dimension reference + fallback-fill source); reach it through the attached
+        // info's plainTexture when the weak cache entry has already expired.
+        std::shared_ptr<Texture> plainBase = plainTex;
+        if (!plainBase && info) { plainBase = info->plainTexture; }
+        if (!plainBase) { continue; }
+
         if (rs->m_buildElevationMosaic) {
-            // Retry whenever the attached raster is not yet FINAL. Two non-final states:
-            //  (a) the plain per-tile texture (mosaic never built, e.g. built while proxy);
-            //  (b) a neighbor-ring mosaic whose center is still the plain texture
-            //      (ElevationMosaicInfo::ownIsOverzoomComposite == false) while the tile is
-            //      overzoomed -- a complete overzoom composite may have become available since,
-            //      and buildElevationMosaic() knows how to rebuild around it (see its doc
-            //      comment). Without (b), any tile that got its mosaic built before all finer
-            //      descendants were cached would keep coarse z14-level lattice values FOREVER
-            //      (mosaics are never revisited elsewhere) -- observed live as white patches
-            //      that never resolve no matter how long the descendants sit in cache, while
-            //      other patches (whose tiles happened to rebuild at a lucky instant) healed.
-            // Textures with no userData that also aren't the plain texture (empty texture,
-            // parent-proxy fill-ins whose own entry expired) are left alone.
-            bool holdsPlain = plainTex && raster.texture == plainTex;
-            std::shared_ptr<Texture> center = plainTex;
-            bool retry = holdsPlain;
-            if (!retry && raster.texture->userData) {
-                auto* info = static_cast<ElevationMosaicInfo*>(raster.texture->userData.get());
-                if (!info->ownIsOverzoomComposite) {
-                    retry = true;
-                    // the mosaic's retained center texture IS this tile's plain texture --
-                    // use it even if the weak cache entry has been dropped
-                    if (!center) { center = info->ownTexture; }
-                }
-            }
-            if (retry && center) {
-                auto mosaic = rs->buildElevationMosaic(raster.tileID, center);
-                if (mosaic && mosaic != raster.texture) {
-                    raster.texture = mosaic;
-                }
+            // buildElevationMosaic() self-decides up/downgrades by the same equality criterion
+            // and returns the existing shared mosaic unchanged when the achievable zoom hasn't
+            // actually moved -- cheap to call every update until the attachment is final.
+            auto mosaic = rs->buildElevationMosaic(raster.tileID, plainBase);
+            if (mosaic && mosaic != raster.texture) {
+                raster.texture = mosaic;
             }
         } else {
-            // Texture shading off: the final state is the overzoom composite itself (or the
-            // plain texture where no overzoom applies -- buildOverzoomElevationMosaic no-ops
-            // then). Gate on still holding the plain texture: once upgraded, the raster no
-            // longer equals the cache entry and this is skipped, and with the ALL-N*N-cells
-            // requirement a registered composite is final anyway (no partial composites are
-            // ever registered that would need later improvement).
-            if (plainTex && raster.texture == plainTex) {
-                if (auto composite = rs->buildOverzoomElevationMosaic(raster.tileID, plainTex)) {
-                    raster.texture = composite;
-                }
+            // Texture shading off: the composite is attached directly. Exact-target-first with
+            // one-level fallback (see buildOverzoomElevationMosaic); swap whenever that yields
+            // a different texture than currently attached -- covering plain -> composite plus
+            // composite level upgrades AND downgrades (s flips in either direction). When
+            // nothing is achievable yet (null), keep what we have.
+            auto composite = rs->buildOverzoomElevationMosaic(raster.tileID, plainBase);
+            if (composite && composite != raster.texture) {
+                raster.texture = composite;
             }
         }
     }
