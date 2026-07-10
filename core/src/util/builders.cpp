@@ -123,7 +123,12 @@ static void buildPolygonGrid(const Polygon& _polygon, float _height, glm::vec2 _
     //  points on shared edges are computed bit-identically on both sides (see clipConvexAxis),
     //  so this also merges cell corners and grid-line crossings (no cracks, no duplicates)
     std::unordered_map<uint64_t, uint16_t> vertMap;
-    bool truncated = false;
+    // NOT necessarily 0: buildPolygonExtrusion (polygonStyle.cpp addPolygon) may already have
+    //  pushed wall indices into _ctx.indices for this same feature before grid tessellation
+    //  runs (extrude + terrain_grid on the same style) - chunk index counts must exclude those.
+    //  No current style combines both, so this is currently always indices.size()==0, but the
+    //  first flush's chunk.first would otherwise silently include the extrusion's index count.
+    size_t chunkIndexStart = _ctx.indices.size();
     auto emitVertex = [&](glm::vec2 p) -> uint16_t {
         uint32_t xbits, ybits;
         std::memcpy(&xbits, &p.x, sizeof(xbits));
@@ -147,6 +152,18 @@ static void buildPolygonGrid(const Polygon& _polygon, float _height, glm::vec2 _
         _ctx.indices.push_back(emitVertex(b));
         _ctx.indices.push_back(emitVertex(c));
     };
+    // Flush the current sub-range whenever it's close to the uint16 ceiling (headroom for the
+    //  handful of vertices one grid cell or fallback triangle can add) and start a fresh 0-based
+    //  block; see PolygonBuilder::chunkOffsets. Checked once per grid CELL (not once per earcut
+    //  triangle) because a single large earcut triangle can by itself span enough cells to
+    //  overflow the budget before finishing.
+    auto flushChunkIfNeeded = [&]() {
+        if (_ctx.numVertices <= 65000) { return; }
+        _ctx.chunkOffsets.emplace_back(_ctx.indices.size() - chunkIndexStart, _ctx.numVertices);
+        chunkIndexStart = _ctx.indices.size();
+        _ctx.numVertices = 0;
+        vertMap.clear();
+    };
 
     Line tri(3), colPiece, piece, tmp;
     for (size_t t = 0; t + 2 < _ctx.earcut.indices.size(); t += 3) {
@@ -158,17 +175,7 @@ static void buildPolygonGrid(const Polygon& _polygon, float _height, glm::vec2 _
         int tx0 = int(std::floor(lo.x * res)), tx1 = int(std::ceil(hi.x * res));
         int ty0 = int(std::floor(lo.y * res)), ty1 = int(std::ceil(hi.y * res));
         if (tx1 - tx0 <= 1 && ty1 - ty0 <= 1) {  // triangle already fits in a single cell
-            emitTriangle(A, B, C);
-            continue;
-        }
-        // uint16 index headroom: checked once per earcut triangle (not per emitted grid
-        //  triangle) so that once the budget is close, we fail safe by emitting the REST of
-        //  the earcut triangles whole (undraped, just like the plain earcut path) rather than
-        //  silently dropping them - a coarser drape on the excess portion of a pathological
-        //  polygon is much better than a hole in the mesh (which shows the bare terrain/earth
-        //  background through, i.e. a visible "missing data" patch).
-        if (_ctx.numVertices > 64000) {
-            truncated = true;
+            flushChunkIfNeeded();
             emitTriangle(A, B, C);
             continue;
         }
@@ -185,6 +192,7 @@ static void buildPolygonGrid(const Polygon& _polygon, float _height, glm::vec2 _
             int cy0 = std::max(ty0, int(std::floor(ymin * res)));
             int cy1 = std::min(ty1, int(std::ceil(ymax * res)));
             for (int gy = cy0; gy < cy1; gy++) {
+                flushChunkIfNeeded();
                 float y0f = gy / res, y1f = (gy + 1) / res;
                 clipConvexAxis(colPiece, tmp, 1, y0f, false);
                 clipConvexAxis(tmp, piece, 1, y1f, true);
@@ -223,7 +231,6 @@ static void buildPolygonGrid(const Polygon& _polygon, float _height, glm::vec2 _
             }
         }
     }
-    if (truncated) { LOGW("buildPolygonGrid: vertex budget reached, remaining triangles drawn undraped (no hole)"); }
 }
 
 void Builders::buildPolygon(const Polygon& _polygon, float _height, PolygonBuilder& _ctx) {

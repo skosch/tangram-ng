@@ -110,7 +110,13 @@ protected:
     // texture-shading mosaic for a tile built as prefetch-only/proxy, or the opportunistic
     // overzoom elevation composite for a draped vector tile (e.g. `osm` polygons) whose attached
     // elevation raster was baked in at build time before its finer descendant tiles were cached.
-    void upgradeAttachedRasters(TileSet& _tileSet, Tile& _tile);
+    // `_liveId` is the tile's CURRENT visible TileID -- its `s` is the LIVE styling zoom, which
+    // must drive the composite target zoom. The s frozen into raster.tileID at build time must
+    // NOT be used for that: a tile built (or cache-restored) at a different view zoom would
+    // keep targeting the OLD zoom forever (observed live as stable pairs of cached tile
+    // variants flipping with pan, each keeping its own stale-zoom drape and its own set of
+    // "white patch" artifacts).
+    void upgradeAttachedRasters(TileSet& _tileSet, Tile& _tile, const TileID& _liveId);
 
     // check cache for proxy for new tile
     void updateProxyTiles(TileSet& _tileSet, const TileID& _tileID, TileEntry& _tile);

@@ -363,7 +363,8 @@ void TileManager::updateTileSet(TileSet& _tileSet, const ViewState& _view) {
             // plain (mip-less) elevation texture; swap in the shared mosaic. Also covers a
             // draped vector tile (e.g. `osm`) whose attached elevation raster was baked in at
             // build time before finer descendant tiles were cached -- see definition.
-            if (entry.tile) { upgradeAttachedRasters(_tileSet, *entry.tile); }
+            // visTileId carries the LIVE styling zoom (see the _liveId doc in tileManager.h).
+            if (entry.tile) { upgradeAttachedRasters(_tileSet, *entry.tile, visTileId); }
 
             if (entry.needsLoading()) {
                 // Not yet available - enqueue for loading
@@ -496,19 +497,46 @@ void TileManager::updateTileSet(TileSet& _tileSet, const ViewState& _view) {
                     size_t offset = rasters.size() - srcs.size();
                     entry.numMissingRasters = 0;
                     for (size_t ii = 0; ii < srcs.size(); ++ii) {
-                        if (rasters[ii+offset].texture != srcs[ii]->emptyTexture()) { continue; }
+                        Raster& raster = rasters[ii+offset];
+                        // The zoom this raster SHOULD be attached at -- same arithmetic
+                        // RasterSource::addRasterTask (rasterSource.cpp) uses for the subtask ID.
+                        int32_t zoomDiff = srcs[ii]->zoomBias() - _tileSet.source->zoomBias();
+                        TileID intended = (zoomDiff > 0)
+                                ? tileId.zoomBiasAdjusted(zoomDiff).withMaxSourceZoom(srcs[ii]->maxZoom())
+                                : tileId.withMaxSourceZoom(srcs[ii]->maxZoom());
+                        bool missing = raster.texture == srcs[ii]->emptyTexture();
+                        // A raster left at a coarser PARENT by an earlier pass of this loop must
+                        // keep being treated as missing so it HEALS once the intended texture
+                        // lands in the source's shared cache (typically fetched meanwhile by the
+                        // raster source's own tileset, e.g. terrain-ground, or by a neighbor).
+                        // Before, pinning a parent zeroed numMissingRasters and this block never
+                        // ran again: the drape then permanently sampled coarser elevation than
+                        // the terrain rendered beneath it (upgradeAttachedRasters can only
+                        // rebuild composites AT the pinned parent's own footprint, capped at
+                        // parent z + kOverzoomCompositeMaxLevels, which for deep fallbacks never
+                        // reaches the terrain's real zoom) -- observed as persistent unshaded
+                        // "white patch" triangles born while panning that never went away.
+                        if (!missing && raster.tileID.z >= intended.z) { continue; }
+                        if (auto exact = srcs[ii]->getTexture(TileID(intended.x, intended.y, intended.z))) {
+                            raster.tileID = TileID(intended.x, intended.y, intended.z, tileId.s);
+                            raster.texture = exact;
+                            LOGD("Healed '%s' subtask raster '%s' %s with exact texture", _tileSet.source->name().c_str(),
+                                 srcs[ii]->name().c_str(), tileId.toString().c_str());
+                            continue;  // healed: intended-zoom texture attached
+                        }
+                        // still awaiting the intended texture: keep this entry revisited
                         ++entry.numMissingRasters;
-                        TileID id(tileId.x, tileId.y, tileId.z);
+                        if (!missing) { continue; }  // already showing a parent; keep it until healed
+                        TileID id(intended.x, intended.y, intended.z);
                         do {
                             id = id.getParent();
                             auto proxy = srcs[ii]->getTexture(id);
                             if (proxy) {
-                                rasters[ii+offset].tileID = TileID(id.x, id.y, id.z, tileId.s);
-                                rasters[ii+offset].texture = proxy;
+                                raster.tileID = TileID(id.x, id.y, id.z, tileId.s);
+                                raster.texture = proxy;
                                 LOGD("Found proxy %s for missing '%s' subtask raster '%s' %s", id.toString().c_str(),
                                      _tileSet.source->name().c_str(), srcs[ii]->name().c_str(), tileId.toString().c_str());
-                                --entry.numMissingRasters;
-                                break;
+                                break;  // numMissingRasters stays counted: still awaiting exact
                             }
                         } while (id.z > 13 || (id.z > 0 && id.z + 2 >= tileId.z));
                     }
@@ -590,8 +618,18 @@ void TileManager::enqueueNeighborPrefetch(TileSet& _tileSet, const ViewState& _v
             if (visibleTiles.count(neighborId)) { continue; }  // already being fetched as a real visible tile
             if (tiles.count(neighborId)) { continue; }  // already tracked (in-flight prefetch or stale entry)
             if (rasterSource->getTexture(neighborId)) {
-                LOGD("Neighbor prefetch: %s already cached (neighbor of visible %s, source '%s')",
-                     neighborId.toString().c_str(), visId.toString().c_str(), rasterSource->name().c_str());
+                // Already cached -- nothing to fetch. NOT logged (was LOGD before): a TileEntry
+                // can't be planted here to remember this and skip the recheck next time, because
+                // any entry that isn't visible/proxying/in-progress gets erased by this same
+                // update's tile-cleanup pass below before the frame even ends (confirmed by
+                // reading that pass's keep condition) -- so this exact check necessarily re-runs
+                // every call to this function, which is EVERY FRAME (updateTileSets() is called
+                // unconditionally each frame, confirmed live via this line's log spam persisting
+                // long after the camera stopped moving -- see is_animating in map.cpp, driven by
+                // label/marker animation state, not just camera easing/fling). The recheck itself
+                // is cheap (one weak-ref texture-cache lookup) and therefore harmless to repeat;
+                // the LOGD call was the actual cost (unbounded log volume), so drop it rather than
+                // engineer memoization the cleanup pass would just undo.
                 continue;
             }
 
@@ -697,7 +735,7 @@ void TileManager::loadTiles() {
 // (Tile::rasters()[i] <-> the owning TileSource's rasterSources()[i], same index order as
 // TileSource::addRasterTasks/addRasterTask populate them) the same way, per raster source's own
 // contract (texture-shading mosaic vs. opportunistic overzoom composite).
-void TileManager::upgradeAttachedRasters(TileSet& _tileSet, Tile& _tile) {
+void TileManager::upgradeAttachedRasters(TileSet& _tileSet, Tile& _tile, const TileID& _liveId) {
     if (_tileSet.source->isRaster()) {
         // Case 1 (pre-existing): _tileSet.source IS the elevation RasterSource, and this tile
         // is its own raster tile (terrain-ground/hillshade) -- single self-referencing entry.
@@ -722,15 +760,87 @@ void TileManager::upgradeAttachedRasters(TileSet& _tileSet, Tile& _tile) {
     // RasterSource::addRasterTask, completed in that order by TileTask::complete()'s m_subTasks
     // loop; the offset skips any leading own-raster entries -- same convention as the
     // missing-raster proxy pass in updateTileSet() above).
+    //
+    // Skip tiles currently serving as proxies: they are on their way out (or their replacement
+    // is on its way in), so re-stitching THEIR composites is wasted work that piles onto
+    // exactly the frames that are already busiest (pan/zoom churn). They get upgraded the
+    // moment they are visible again.
+    if (_tile.isProxy()) { return; }
     auto& sources = _tileSet.source->rasterSources();
     auto& rasters = _tile.rasters();
     if (sources.empty() || rasters.size() < sources.size()) { return; }
     size_t offset = rasters.size() - sources.size();
 
+    // Each vector tile's OWN styling zoom `s` is computed independently from ITS OWN on-screen
+    // area (updateTileSets(), the `visId.s` formula) -- nothing constrains it to agree with its
+    // neighbors', so two geographically-adjacent tiles routinely land on different `s` (e.g. one
+    // just inside the z15 threshold, its neighbor just inside z16 -- observed live via the
+    // diagnostic zoom-stripe overlay: green tiles directly bordering blue ones). Each tile's
+    // composite/lattice is sized to its OWN target zoom only, so two neighbors with different `s`
+    // have DIFFERENT NODE COUNTS along their shared edge (e.g. 128 vs 256) -- a classic
+    // non-conforming-mesh "T-junction crack": the coarser side draws a straight line between its
+    // sparser edge nodes exactly where the finer side follows real terrain detail, worst in
+    // narrow high-curvature features (a cliff's vertical grooves) and, being purely a geometric
+    // lattice-density mismatch rather than a data-freshness issue, NOT something that heals with
+    // time (observed live: persists well after the tile system settles idle).
+    // Fix: use the FINEST `s` among this tile and its 8 same-zoom neighbors (if visible) as the
+    // effective target for EVERYTHING below, so a tile bordering a finer neighbor gets its own
+    // lattice bumped to match (node-aligning the shared edge exactly). This is safe precisely
+    // because of the existing per-cell fallback machinery: cells in the tile's OWN interior that
+    // don't actually have finer real data available yet simply triangle-PL-upsample from
+    // whatever coarser real ancestor is cached (see fillLatticeUpsampledCell/buildOverzoomElevat
+    // ionMosaic), exactly reproducing that coarser surface there -- so "borrowing" resolution
+    // near a finer neighbor never fabricates fake detail, it only ensures the BORDER itself lines
+    // up. A single neighbor-max pass (not iterated to a fixed point) is sufficient given zt only
+    // spans 3 levels here (z14-z16): it directly resolves the reported z15/z16 boundary case,
+    // and any residual z14/z15 mismatch is far smaller in absolute terms (a 2x, not 4x, density
+    // gap) and anyway subject to the same fallback safety net.
+    int32_t effectiveS = _liveId.s;
+    {
+        static const int nbDx[8] = { -1,  0,  1, -1, 1, -1, 0, 1 };
+        static const int nbDy[8] = { -1, -1, -1,  0, 0,  1, 1, 1 };
+        int32_t maxCoord = 1 << _liveId.z;
+        int32_t nbx[8], nby[8];
+        int nbCount = 0;
+        for (int ii = 0; ii < 8; ii++) {
+            int32_t ny = _liveId.y + nbDy[ii];
+            if (ny < 0 || ny >= maxCoord) { continue; }  // no tile past the poles
+            nbx[nbCount] = ((_liveId.x + nbDx[ii]) % maxCoord + maxCoord) % maxCoord;  // wrap x
+            nby[nbCount] = ny;
+            nbCount++;
+        }
+        // TileID::operator< sorts primarily by s (descending) -- see tileID.h -- so a same-(x,y,z)
+        // entry at a DIFFERENT s than _liveId.s can't be located via set::find/lower_bound (which
+        // need an exact s to match operator==/ordering too); a linear scan is the simplest correct
+        // way to find "this neighbor coordinate, whatever its s". visibleTiles is bounded by the
+        // current viewport's tile count (tens, not thousands) and this runs once per visible
+        // primary tile per update, not per frame independent of tile count.
+        for (const TileID& t : _tileSet.visibleTiles) {
+            if (t.z != _liveId.z) { continue; }
+            for (int k = 0; k < nbCount; k++) {
+                if (t.x == nbx[k] && t.y == nby[k]) { effectiveS = std::max(effectiveS, int32_t(t.s)); break; }
+            }
+        }
+    }
+
     for (size_t i = 0; i < sources.size(); i++) {
         RasterSource* rs = sources[i];
         Raster& raster = rasters[i + offset];
         if (!rs || !raster.texture) { continue; }
+
+        // Target everything below at the LIVE, NEIGHBOR-AWARE styling zoom (effectiveS above),
+        // not the s frozen into raster.tileID when the attachment was first built: the composite
+        // target zoom must track the CURRENT view (both finer AND coarser than at build time), or
+        // a cached tile re-entering view keeps draping at its build-time zoom forever -- see the
+        // doc comment on this function in tileManager.h. raster.tileID's x/y/z are kept as-is
+        // (they name the attachment's actual footprint, including the parent-fallback case).
+        TileID livePrimary(raster.tileID.x, raster.tileID.y, raster.tileID.z,
+                           std::max<int32_t>(effectiveS, raster.tileID.z));
+
+        // Not overzoomed enough for a composite to apply at all (the ordinary, non-draped-vector
+        // case) -- nothing for this function to do. Cheap: skips straight past the common case
+        // without ever touching m_textures.
+        if (rs->overzoomTargetZoom(livePrimary) <= int(livePrimary.z)) { continue; }
 
         // 3-arg TileID (s = z) to match the texture cache's normalized keys. raster.tileID may
         // be a lower-zoom PARENT of the tile's own id (the missing-raster proxy pass in
@@ -739,14 +849,6 @@ void TileManager::upgradeAttachedRasters(TileSet& _tileSet, Tile& _tile) {
         TileID texId(raster.tileID.x, raster.tileID.y, raster.tileID.z);
         auto plainTex = rs->getTexture(texId);
 
-        // The attached raster is FINAL only while the zoom of the elevation data it carries
-        // EQUALS the tile's live target zoom (see ElevationMosaicInfo::compositeZoom's doc
-        // comment: equality, not >=, in BOTH directions -- a meter-scale pan flips a near
-        // tile's styling zoom 15<->16, and the zoom the terrain renders underneath flips with
-        // it, so a frozen once-"best" attachment starts disagreeing with the terrain by the
-        // z15-vs-z16 DEM delta: observed live as white patches born from tiny pans that never
-        // healed). ElevationMosaicInfo (present on mosaics AND composites) carries that zoom;
-        // the plain texture carries none (its data zoom is trivially raster.tileID.z).
         ElevationMosaicInfo* info = raster.texture->userData
                 ? static_cast<ElevationMosaicInfo*>(raster.texture->userData.get()) : nullptr;
         bool holdsPlain = plainTex && raster.texture == plainTex;
@@ -754,32 +856,149 @@ void TileManager::upgradeAttachedRasters(TileSet& _tileSet, Tile& _tile) {
         // empty texture, parent-proxy fill-ins whose own cache entry expired) are left alone.
         if (!holdsPlain && !info) { continue; }
 
-        int attachedZoom = info ? info->compositeZoom : int(raster.tileID.z);
-        int desired = std::max<int>(rs->overzoomTargetZoom(raster.tileID), int(raster.tileID.z));
-        if (attachedZoom == desired) { continue; }  // steady state: one map lookup per source
-
-        // The plain texture is the required base for (re)building composites at any level
-        // (stitch dimension reference + fallback-fill source); reach it through the attached
-        // info's plainTexture when the weak cache entry has already expired.
+        // The plain texture is the required base for (re)building composites (stitch dimension
+        // reference + ultimate per-cell fallback); reach it through the attached info's
+        // plainTexture when the weak cache entry has already expired.
         std::shared_ptr<Texture> plainBase = plainTex;
         if (!plainBase && info) { plainBase = info->plainTexture; }
         if (!plainBase) { continue; }
 
+        // Per-cell displayed-terrain zoom caps (see buildOverzoomElevationMosaic's doc comment
+        // in rasterSource.h): the composite must reproduce the surface the elevation tileset
+        // is RENDERING under this tile right now, not the finest data that happens to be
+        // cached -- panning fills the cache with fine tiles while the terrain's screen-area
+        // LOD keeps displaying coarser ones over the far parts of a footprint, and a
+        // "finest cached" composite then disagrees with the rendered terrain by the full
+        // inter-zoom DEM delta, permanently (2026-07 live diagnosis: the persistent unshaded
+        // "white patch" land-cover mode occurred exclusively on composite-attached tiles).
+        // Cap each composite cell at the zoom of the traversal-target tile covering it; cells
+        // not covered by any target tile (offscreen parts of the footprint) stay uncapped.
+        int zt = rs->overzoomTargetZoom(livePrimary);
+        int levels = zt - int(livePrimary.z);
+        int N = 1 << levels;
+        std::vector<uint8_t> cellCaps;
+        TileSet* elevSet = nullptr;
+        for (auto& ts : m_tileSets) {
+            if (ts.source.get() == static_cast<TileSource*>(rs)) { elevSet = &ts; break; }
+        }
+        if (!elevSet) {
+            for (auto& ts : m_auxTileSets) {
+                if (ts.source.get() == static_cast<TileSource*>(rs)) { elevSet = &ts; break; }
+            }
+        }
+        if (!elevSet) {
+            // Caps CANNOT be computed -- the composite would silently fall back to
+            // "finest cached" and disagree with the rendered terrain (the persistent
+            // white-patch mechanism). This is not expected to ever happen (the raster source
+            // is shared by name with its own displayed tileset); scream once if it does.
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                LOGW("upgradeAttachedRasters: no tileset found for raster source '%s' -- "
+                     "displayed-zoom caps disabled, drape may mismatch terrain!", rs->name().c_str());
+            }
+        }
+        if (elevSet) {
+            // Cap against the tileset's CURRENT TRAVERSAL RESULT (visibleTiles) -- the
+            // steady-state display target -- NOT the per-frame rendered set (visible entries
+            // plus whatever proxies happen to be up this instant): folding ALL live proxies
+            // in caused per-frame re-stitch churn from proxy-*selection* noise ("everything
+            // is suddenly slow" regression). visibleTiles changes only when the view
+            // actually changes.
+            //
+            // BUT the target's own data readiness still needs checking (2026-07 live
+            // diagnosis: patches on tiles whose diagnostic stripe color -- the drape's own
+            // lattice zoom -- never changed, yet appeared/disappeared while panning back and
+            // forth over already-visited terrain): a target tile whose GPU texture was
+            // evicted under memory pressure and is being re-fetched from the local mbtiles
+            // cache is NOT actually what's on screen while that reload is in flight -- the
+            // renderer falls back to drawing whatever coarser ANCESTOR is still resident, the
+            // same fallback search updateTileSet() itself performs above. Capping against the
+            // not-yet-ready target instead of that actually-displayed ancestor reproduces the
+            // exact mismatch this whole mechanism exists to prevent. Unlike whole-scale live
+            // proxy selection, checking one specific tile's readiness is a monotonic fact
+            // (changes only on load/evict events, not every frame), so this doesn't
+            // reintroduce the churn regression.
+            // BOTH sets below are normalized (x,y,z) triples, deliberately dropping `s`: TileSet::
+            // tiles (and visibleTiles) are keyed by the RAW traversal TileID, whose `s` climbs
+            // above `z` exactly when THAT tile itself is displayed overzoomed (same formula as
+            // everywhere else) -- at extreme view zoom this now applies to the ELEVATION
+            // tileset's OWN z16 tiles too (previously only the draped VECTOR tile was ever
+            // overzoomed enough for this to matter). A readiness lookup keyed with a
+            // freshly-constructed 3-arg TileID(x,y,z) (s forced = z) therefore silently misses
+            // any entry actually stored under s > z -- confirmed live: mottled, contour-scale,
+            // contiguous salmon patches at close/grazing zoom on already-at-cap (z16) tiles,
+            // NOT healed by settling, because the lookup was deterministically wrong, not stale.
+            // Building explicit normalized sets up front (one pass over visibleTiles/tiles) lets
+            // every subsequent lookup below compare like-for-like instead of needing to guess a
+            // real `s` for each candidate (x,y,z).
+            std::set<TileID> rendered;  // normalized traversal-target ids
+            for (const TileID& vid : elevSet->visibleTiles) {
+                rendered.insert(TileID(vid.x, vid.y, vid.z));
+            }
+            std::set<TileID> ready;  // normalized ids of entries with a built (ready) Tile
+            for (auto& kv : elevSet->tiles) {
+                if (kv.second.tile) { ready.insert(TileID(kv.first.x, kv.first.y, kv.first.z)); }
+            }
+            if (!rendered.empty()) {
+                cellCaps.assign(size_t(N) * size_t(N), uint8_t(zt));
+                int32_t baseX = int32_t(livePrimary.x) << levels;
+                int32_t baseY = int32_t(livePrimary.y) << levels;
+                for (int row = 0; row < N; row++) {
+                    for (int col = 0; col < N; col++) {
+                        int32_t cx = baseX + col, cy = baseY + row;
+                        int zTarget = -1;
+                        for (int za = zt; za >= 0; za--) {
+                            int dl = zt - za;
+                            if (rendered.count(TileID(cx >> dl, cy >> dl, za))) {
+                                zTarget = za;
+                                break;
+                            }
+                        }
+                        if (zTarget < 0) { continue; }  // no target covers this cell; leave at zt
+                        int dl = zt - zTarget;
+                        int32_t txAtTarget = cx >> dl, tyAtTarget = cy >> dl;
+                        bool isReady = ready.count(TileID(txAtTarget, tyAtTarget, zTarget)) != 0;
+                        int chosen = zTarget;
+                        if (!isReady) {
+                            // Target not loaded (yet) -- walk to the nearest ready ANCESTOR,
+                            // mirroring what the renderer is actually showing as a proxy right
+                            // now. If nothing is ready even down to the vector tile's own
+                            // zoom, fall back to that zoom (equivalent to the pre-composite
+                            // plain-texture baseline for this cell).
+                            chosen = int(livePrimary.z);
+                            for (int za2 = zTarget - 1; za2 >= int(livePrimary.z); za2--) {
+                                int dl2 = zTarget - za2;
+                                if (ready.count(TileID(txAtTarget >> dl2, tyAtTarget >> dl2, za2))) {
+                                    chosen = za2;
+                                    break;
+                                }
+                            }
+                        }
+                        cellCaps[size_t(row) * size_t(N) + size_t(col)] =
+                                uint8_t(std::max(chosen, int(livePrimary.z)));
+                    }
+                }
+            }
+        }
+        const uint8_t* caps = cellCaps.empty() ? nullptr : cellCaps.data();
+
+        // Always call through with livePrimary (LIVE s -> live target zoom):
+        // buildElevationMosaic()/buildOverzoomElevationMosaic() each do their own cheap
+        // signature check internally and return the existing object unchanged (no re-stitch)
+        // when nothing has actually changed -- see their doc comments. Only swap the attachment
+        // when that yields a genuinely different object, which covers plain -> composite,
+        // composite coverage upgrades as finer descendant tiles keep streaming in, LIVE
+        // target-zoom changes (s flips in either direction, including cache-restored tiles
+        // built at another zoom), AND displayed-terrain zoom changes under the footprint, all
+        // uniformly.
         if (rs->m_buildElevationMosaic) {
-            // buildElevationMosaic() self-decides up/downgrades by the same equality criterion
-            // and returns the existing shared mosaic unchanged when the achievable zoom hasn't
-            // actually moved -- cheap to call every update until the attachment is final.
-            auto mosaic = rs->buildElevationMosaic(raster.tileID, plainBase);
+            auto mosaic = rs->buildElevationMosaic(livePrimary, plainBase, caps);
             if (mosaic && mosaic != raster.texture) {
                 raster.texture = mosaic;
             }
         } else {
-            // Texture shading off: the composite is attached directly. Exact-target-first with
-            // one-level fallback (see buildOverzoomElevationMosaic); swap whenever that yields
-            // a different texture than currently attached -- covering plain -> composite plus
-            // composite level upgrades AND downgrades (s flips in either direction). When
-            // nothing is achievable yet (null), keep what we have.
-            auto composite = rs->buildOverzoomElevationMosaic(raster.tileID, plainBase);
+            auto composite = rs->buildOverzoomElevationMosaic(livePrimary, plainBase, caps);
             if (composite && composite != raster.texture) {
                 raster.texture = composite;
             }
@@ -796,7 +1015,9 @@ bool TileManager::addTile(TileSet& _tileSet, const TileID& _tileID) {
             // Reset tile on potential internal dynamic data set
             tile->resetState();
 
-            upgradeAttachedRasters(_tileSet, *tile);
+            // _tileID is the CURRENT visible id -- its live s may differ from the s this cached
+            // tile was built at (see the _liveId doc in tileManager.h).
+            upgradeAttachedRasters(_tileSet, *tile, _tileID);
         } else {
             // Clear stale tile data
             tile.reset();

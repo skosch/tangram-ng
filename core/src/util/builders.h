@@ -48,10 +48,23 @@ struct PolygonBuilder {
     // if > 0, tessellate polygons on a gridRes x gridRes grid over tile-local [0,1]^2 so that, with 3D
     //  terrain, per-vertex elevation makes the polygon follow the terrain surface instead of spanning
     //  it with a few huge earcut triangles (which lets terrain poke through the polygon interior, or the
-    //  polygon bleed through ridges in front of it). Must match the RasterStyle terrain mesh resolution
-    //  (64, see rasterStyle.cpp) so grid cells - and thus the piecewise-linear elevation surface - line
-    //  up exactly with the terrain mesh on fully-covered cells. See Builders::buildPolygon().
+    //  polygon bleed through ridges in front of it). Vertices are placed on the terrain mesh's own
+    //  piecewise-linear surface (getTerrainMeshElevation, elevation.yaml), so the grid's only job is
+    //  ensuring no triangle spans more than one terrain-lattice cell: use a power-of-two multiple of
+    //  the RasterStyle mesh resolution (64) covering the worst-case overzoom of the vector source
+    //  relative to the elevation source - see terrain_grid on unlit-polygons in stylus-osm.yaml.
+    //  See Builders::buildPolygon().
     int gridRes = 0;
+
+    // A single feature's grid tessellation can need more vertices than a uint16 index can address
+    //  (large/complex polygon at high gridRes); buildPolygonGrid (builders.cpp) then flushes what
+    //  it has as its own indexed sub-range and keeps going with a fresh 0-based vertex block,
+    //  recording each flushed sub-range's (indexCount, vertexCount) here in append order. The
+    //  final (usually only) chunk is NOT included - PolygonStyleBuilder::addPolygon appends it the
+    //  same way it always has, so single-chunk features (the overwhelming majority) are unaffected.
+    //  Mirrors the multi-batch mechanism MeshBase::compileIndices (mesh.cpp) already uses across
+    //  separate features of one tile - just applied within a single feature.
+    std::vector<std::pair<size_t, size_t>> chunkOffsets;
 
     mapbox::detail::Earcut<uint16_t> earcut;
 
@@ -62,6 +75,7 @@ struct PolygonBuilder {
     void clear() {
         numVertices = 0;
         indices.clear();
+        chunkOffsets.clear();
     }
 };
 

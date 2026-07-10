@@ -209,7 +209,17 @@ bool PolygonStyleBuilder<V>::addPolygon(const Polygon& _polygon, const Propertie
                               m_builder.indices.begin(),
                               m_builder.indices.end());
 
-    m_meshData.offsets.emplace_back(m_builder.indices.size(),
+    // terrain-grid tessellation (see PolygonBuilder::chunkOffsets) may have flushed this
+    //  feature into multiple indexed sub-ranges when it needed more vertices than a uint16
+    //  index can address; push each flushed chunk first, then the final (usually only) one -
+    //  m_builder.indices holds all of them concatenated, so the last chunk's index count is
+    //  whatever remains after the already-flushed ones.
+    size_t chunkedIndices = 0;
+    for (auto& chunk : m_builder.chunkOffsets) {
+        m_meshData.offsets.push_back(chunk);
+        chunkedIndices += chunk.first;
+    }
+    m_meshData.offsets.emplace_back(m_builder.indices.size() - chunkedIndices,
                                     m_builder.numVertices);
     m_builder.clear();
 
