@@ -159,7 +159,23 @@ struct ElevationMosaicInfo {
     // freshly-built composite is always registered once, so "never built" is simply "not in the
     // registry" rather than a sentinel value here.
     uint64_t coverageSignature = 0;
+    // Mosaics only: bit ((dy+1)*3+(dx+1)) set means that neighbor cell holds REAL (not
+    // mirror-extrapolated) data as of the last stitch/patch; bit 4 (dx=dy=0, "self") is unused.
+    // All 8 neighbor bits set == kAllRealNeighborsMask means the ring is complete. Drives the
+    // R2 patch-upload debounce below (tile-pipeline-perf-plan.md).
+    uint16_t neighborMask = 0;
+    // Mosaics only: steady_clock seconds this mosaic was first marked dirty by
+    // RasterSource::patchNeighborMosaics() since its last GPU-upload flush; 0 means "not
+    // currently dirty". A patched mosaic's `resize()` (full re-upload + mip regen on next
+    // bind) is deferred until RasterSource::flushDirtyMosaics() decides the ring is complete
+    // or this has gone stale too long, so several neighbor arrivals in quick succession
+    // collapse into one re-upload instead of one each (tile-pipeline-perf-plan.md R2).
+    double firstDirtyTime = 0.0;
 };
+
+// All 8 neighbor bits set (see ElevationMosaicInfo::neighborMask), i.e. every neighbor cell
+// holds real data and none is still mirror-extrapolated.
+constexpr uint16_t kAllRealNeighborsMask = 0x1EF;
 
 class RasterSource : public TileSource {
 
@@ -225,6 +241,23 @@ class RasterSource : public TileSource {
 
     std::shared_ptr<Texture> m_emptyTexture;
 
+    // R4 (tile-pipeline-perf-plan.md): remaining number of real mosaic/composite stitches
+    // RasterTileTask::addRaster() may perform this update cycle before falling back to the
+    // plain per-tile texture (same fallback proxy tiles already use). Reset once per
+    // TileManager::updateTileSets() via resetStitchBudget() below, so a burst of tile
+    // completions in one frame can't stack up an unbounded amount of main-thread stitch work;
+    // TileManager::upgradeAttachedRasters (which already re-checks every update) picks up the
+    // deferred stitch on a later, less busy frame.
+    int m_stitchBudget = 0;
+
+    // Consume one unit of this update cycle's stitch budget; false means the caller should
+    // skip stitching for now and reuse whatever's already registered instead.
+    bool tryConsumeStitchBudget() {
+        if (m_stitchBudget <= 0) { return false; }
+        --m_stitchBudget;
+        return true;
+    }
+
     friend class RasterTileTask;
     friend class TileSource;
     friend class FrameInfo;
@@ -255,6 +288,19 @@ public:
     // MapsApp::mapUpdate). Returns -1 when no mosaics are live. Main thread only, like all
     // other m_mosaics access.
     float aggregateRugosity();
+
+    // Flush pending patch-driven re-uploads (see ElevationMosaicInfo::firstDirtyTime): call
+    // Texture::resize() on every live mosaic whose neighbor ring is complete or whose oldest
+    // unflushed patch is older than the debounce window, then clear its dirty state. Meant to
+    // be called once per TileManager update cycle (not per patch, not per frame necessarily),
+    // so several neighbor arrivals in quick succession cost one GPU re-upload instead of one
+    // each (tile-pipeline-perf-plan.md R2). Main thread only, like all other m_mosaics access.
+    void flushDirtyMosaics();
+
+    // R4 (tile-pipeline-perf-plan.md): called once per TileManager::updateTileSets() to grant
+    // this source a fresh main-thread stitch budget for the update cycle about to run (see
+    // m_stitchBudget above).
+    void resetStitchBudget(int n) { m_stitchBudget = n; }
 
     // Get-or-build the shared 3W x 3W mosaic texture for `_tile`: an already-registered live
     // mosaic is returned as-is (its cells are kept current by patchNeighborMosaics());

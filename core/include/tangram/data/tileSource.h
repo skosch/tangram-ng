@@ -42,6 +42,15 @@ public:
         // 0: 256 pixel tiles
         // 1: 512 pixel tiles
         int32_t zoomBias = 0;
+        // How eagerly TileManager::updateTileSets() gives up resolution for this source as the
+        // view zooms out (and, symmetrically, reaches for finer resolution zooming in): 1.0 is
+        // today's behavior; >1.0 keeps the finest already-cached tile data on screen longer
+        // when zooming out, at the cost of building/keeping around one zoom level's worth more
+        // data. Unlike zoomBias above (a fixed per-tile-size offset baked in at scene load),
+        // this is meant to be live-adjustable per source (see TileSource::setLodAreaBias) -
+        // e.g. a GUI slider trading resolution retention against CPU/memory/network cost
+        // separately for land cover vs. hillshading/texture shading.
+        float lodAreaBias = 1.0f;
     };
 
     /* Calculate the zoom level bias to be applied given tileSize in pixel units.
@@ -131,6 +140,10 @@ public:
     int32_t maxDisplayZoom() const { return m_zoomOptions.maxDisplayZoom; }
     int32_t maxZoom() const { return m_zoomOptions.maxZoom; }
     int32_t zoomBias() const { return m_zoomOptions.zoomBias; }
+    float lodAreaBias() const { return m_zoomOptions.lodAreaBias; }
+    // Live setter (unlike the other ZoomOptions fields, meant to be adjustable after scene
+    // load, e.g. from a GUI slider) - see ZoomOptions::lodAreaBias.
+    void setLodAreaBias(float _bias) { m_zoomOptions.lodAreaBias = _bias; }
 
     bool isActiveForZoom(const float _zoom) const {
         return _zoom >= m_zoomOptions.minDisplayZoom &&

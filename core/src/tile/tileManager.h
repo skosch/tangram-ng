@@ -83,6 +83,22 @@ protected:
 
         int64_t sourceGeneration = 0;
 
+        // R5 (tile-pipeline-perf-plan.md): count and steady_clock time (seconds) of the most
+        // recent failure for a neighbor-prefetch TileID that was canceled/errored before
+        // completing (see the erase branch in updateTileSet()) - checked by
+        // enqueueNeighborPrefetch() to avoid re-enqueueing a permanently-failing neighbor
+        // (e.g. a 404 at the data edge, or offline) every single frame forever.
+        std::map<TileID, std::pair<int, double>> prefetchFailures;
+
+        // R5: last observed view center/zoom and when it last differed from the previous
+        // update's - used to gate ring prefetches on the view having actually settled (they
+        // only matter once the center tiles are up anyway), so a fast pan doesn't spend fetch
+        // slots on ring tiles the user is about to leave behind. Per-TileSet (not shared)
+        // since each TileSet's updateTileSet() call is independent and any could be first.
+        double lastViewCenterX = 0.0, lastViewCenterY = 0.0;
+        float lastViewZoom = -1.f;
+        double viewSettledSince = 0.0;
+
         TileSet(const TileSet&) = delete;
         TileSet(TileSet&&) = default;
         TileSet& operator=(const TileSet&) = delete;

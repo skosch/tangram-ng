@@ -5,6 +5,7 @@
 #include "glm/gtx/rotate_vector.hpp"
 #include "glm/gtx/norm.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <unordered_map>
 
@@ -152,6 +153,32 @@ static void buildPolygonGrid(const Polygon& _polygon, float _height, glm::vec2 _
         _ctx.indices.push_back(emitVertex(b));
         _ctx.indices.push_back(emitVertex(c));
     };
+
+    // Fast path for interior lattice-corner vertices (tile-pipeline-perf-plan.md R1.1): the
+    //  full-cell case below emits the SAME 4 grid corners for every cell, each shared by up to
+    //  4 neighboring cells, so routing every corner reference through vertMap's hash costs 3
+    //  redundant lookups per corner. Cache corners by direct (gx, gy) index instead, over just
+    //  this polygon's own cell-index bounding box (not the whole tile grid) so the array stays
+    //  small for the common small-polygon case. Falls through to emitVertex (still the sole
+    //  vertex-creation authority, so the exact-bit-pattern sharing guarantee is unaffected) on
+    //  first touch of each corner; only repeat touches skip the hash.
+    int gxMin = int(std::floor(_min.x * res)), gxMax = int(std::ceil(_max.x * res));
+    int gyMin = int(std::floor(_min.y * res)), gyMax = int(std::ceil(_max.y * res));
+    int gridW = std::max(1, gxMax - gxMin + 1), gridH = std::max(1, gyMax - gyMin + 1);
+    std::vector<uint16_t> latticeIndex(size_t(gridW) * size_t(gridH), 0xFFFFu);
+    auto emitLatticeVertex = [&](int _gx, int _gy) -> uint16_t {
+        size_t li = size_t(_gy - gyMin) * size_t(gridW) + size_t(_gx - gxMin);
+        uint16_t idx = latticeIndex[li];
+        if (idx != 0xFFFFu) { return idx; }
+        idx = emitVertex(glm::vec2(float(_gx) / res, float(_gy) / res));
+        latticeIndex[li] = idx;
+        return idx;
+    };
+    auto emitLatticeTriangle = [&](int ax, int ay, int bx, int by, int cx, int cy) {
+        _ctx.indices.push_back(emitLatticeVertex(ax, ay));
+        _ctx.indices.push_back(emitLatticeVertex(bx, by));
+        _ctx.indices.push_back(emitLatticeVertex(cx, cy));
+    };
     // Flush the current sub-range whenever it's close to the uint16 ceiling (headroom for the
     //  handful of vertices one grid cell or fallback triangle can add) and start a fresh 0-based
     //  block; see PolygonBuilder::chunkOffsets. Checked once per grid CELL (not once per earcut
@@ -163,6 +190,9 @@ static void buildPolygonGrid(const Polygon& _polygon, float _height, glm::vec2 _
         chunkIndexStart = _ctx.indices.size();
         _ctx.numVertices = 0;
         vertMap.clear();
+        // Cached indices refer to the chunk just flushed - stale (and wrongly reused) against
+        //  the fresh 0-based block that follows, same reason vertMap is cleared above.
+        std::fill(latticeIndex.begin(), latticeIndex.end(), uint16_t(0xFFFFu));
     };
 
     Line tri(3), colPiece, piece, tmp;
@@ -215,12 +245,16 @@ static void buildPolygonGrid(const Polygon& _polygon, float _height, glm::vec2 _
                     else { fullCell = false; }
                 }
                 if (fullCell && c00 && c10 && c01 && c11) {
+                    // (gx, gy)/(gx+1, gy)/(gx, gy+1)/(gx+1, gy+1) are exactly x0f/y0f/x1f/y1f's
+                    //  lattice indices - route through the direct-index cache (R1.1) instead of
+                    //  emitTriangle's hash lookup, since every interior corner here is shared by
+                    //  up to 4 cells.
                     if (ccw) {
-                        emitTriangle({x0f, y0f}, {x1f, y0f}, {x0f, y1f});
-                        emitTriangle({x1f, y0f}, {x1f, y1f}, {x0f, y1f});
+                        emitLatticeTriangle(gx, gy, gx + 1, gy, gx, gy + 1);
+                        emitLatticeTriangle(gx + 1, gy, gx + 1, gy + 1, gx, gy + 1);
                     } else {
-                        emitTriangle({x0f, y0f}, {x0f, y1f}, {x1f, y0f});
-                        emitTriangle({x1f, y0f}, {x0f, y1f}, {x1f, y1f});
+                        emitLatticeTriangle(gx, gy, gx, gy + 1, gx + 1, gy);
+                        emitLatticeTriangle(gx + 1, gy, gx, gy + 1, gx + 1, gy + 1);
                     }
                     continue;
                 }

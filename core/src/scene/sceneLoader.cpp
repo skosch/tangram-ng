@@ -694,6 +694,12 @@ std::shared_ptr<TileSource> SceneLoader::loadSource(const Node& _source, const s
             zoomOptions.zoomBias = TileSource::zoomBiasFromTileSize(tileSize);
         }
     }
+    // Initial value for TileSource::lodAreaBias() (see its doc comment) - 1.0 (default) is
+    // today's exact zoom-out behavior; a scene can set a different starting point, and a live
+    // GUI control (MapsApp) can adjust it afterward via TileSource::setLodAreaBias().
+    if (const auto& lodAreaBiasNode = _source["zoom_retention"]) {
+        YamlUtil::getFloat(lodAreaBiasNode, zoomOptions.lodAreaBias);
+    }
 
     // support zoomBias < 0 for high-dpi
     zoomOptions.zoomBias += zoomOffset;  //if (zoomOffset >= 0) {

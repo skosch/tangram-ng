@@ -13,10 +13,26 @@
 
 #include <algorithm>
 #include <bitset>
+#include <chrono>
 
 namespace Tangram {
 
 #define MAX_TILE_SETS 64
+
+namespace {
+double nowSeconds() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+// R5 (tile-pipeline-perf-plan.md): a neighbor whose prefetch has failed this many times within
+// kPrefetchFailureBackoffSeconds is skipped rather than re-enqueued every single frame forever
+// (e.g. a 404 at the data edge, or offline) - see TileSet::prefetchFailures.
+const int kPrefetchFailureBackoffCount = 2;
+const double kPrefetchFailureBackoffSeconds = 60.0;
+// R5: don't bother enqueueing ring prefetches while the view is still actively moving - they
+// only matter once the center tiles are up anyway, and a fast pan would otherwise spend fetch
+// slots on ring tiles the user is about to leave behind.
+const double kPrefetchSettleDelaySeconds = 0.2;
+}
 
 struct TileManager::TileEntry {
 
@@ -236,17 +252,29 @@ bool TileManager::updateTileSets(const View& _view) {
                 if (!active[ii]) { continue; }
                 auto& tileSet = m_tileSets[ii];
                 int zoomBias = tileSet.source->zoomBias();
+                // Per-source resolution-retention bias (see TileSource::lodAreaBias's doc
+                // comment): >1.0 shrinks this source's own effective area threshold, so the
+                // quadtree keeps subdividing to a finer zoom over a wider range of on-screen
+                // area than the shared `maxArea` alone would - i.e. it keeps the finest already-
+                // cached tile data on screen longer while zooming out (and, symmetrically,
+                // reaches finer resolution slightly sooner while zooming in). 1.0 (default)
+                // reproduces today's exact behavior. Applied here (not baked into the shared
+                // maxArea above) because it must vary per source - e.g. landcover (`osm`) and
+                // hillshading/texture-shading (`elevation`) are tuned independently via GUI
+                // sliders (MapsApp).
+                float lodAreaBias = tileSet.source->lodAreaBias();
+                float effMaxArea = maxArea / (lodAreaBias * lodAreaBias);
                 // substantial redesign needed for something like this to work:
                 //for (auto& rs : tileSet.source->rasterSources()) { maxZoom = std::max(maxZoom, rs->maxZoom()); }
                 int maxZoom = std::min(tileSet.source->maxZoom(), _view.getIntegerZoom() - zoomBias);
-                if (tileId.z >= maxZoom || area < maxArea*std::exp2(2*float(zoomBias))) {
+                if (tileId.z >= maxZoom || area < effMaxArea*std::exp2(2*float(zoomBias))) {
                     TileID visId = tileId;
                     // Ensure that s = z + bias (larger s OK if overzoomed) so that proxy tiles can be found
                     // - otherwise, we get frames where tiles disappear due to no proxy for new tile
                     if (visId.z < tileSet.source->maxZoom()) {
                         visId.s = visId.z + zoomBias;
                     } else {
-                        int s = tileId.z + std::max(0, int(std::ceil(std::log2(area/maxArea)/2)));
+                        int s = tileId.z + std::max(0, int(std::ceil(std::log2(area/effMaxArea)/2)));
                         visId.s = std::max(std::min(s, _view.getIntegerZoom()), visId.z + zoomBias);
                     }
                     tileSet.visibleTiles.insert(visId);
@@ -269,10 +297,29 @@ bool TileManager::updateTileSets(const View& _view) {
         getVisibleTiles(getVisibleTiles, TileID(0,0,0), allActive);
     }
 
+    // R4 (tile-pipeline-perf-plan.md): grant every raster source a fresh main-thread stitch
+    // budget for this update cycle BEFORE any tileSet is processed below - a draped vector
+    // tileSet (e.g. `osm`) can trigger stitches on the elevation RasterSource just as much as
+    // the elevation tileSet's own completions do, and both must see this cycle's reset rather
+    // than whichever tileSet happens to iterate first getting a stale/zero budget.
+    const int kStitchBudgetPerUpdate = 2;
+    for (auto& tileSet : m_tileSets) {
+        if (tileSet.source->isRaster()) {
+            static_cast<RasterSource*>(tileSet.source.get())->resetStitchBudget(kStitchBudgetPerUpdate);
+        }
+    }
+
     for (auto& tileSet : m_tileSets) {
         // check if tile set is active for zoom (zoom might be below min_zoom)
         if (tileSet.source->isActiveForZoom(_view.getZoom()) && tileSet.source->isVisible()) {
             updateTileSet(tileSet, _view.state());
+        }
+        // R2 (tile-pipeline-perf-plan.md): flush any patch-driven re-uploads deferred by
+        // RasterSource::patchNeighborMosaics() once per update cycle rather than immediately,
+        // regardless of this source's own active/visible state above (a mosaic can still be
+        // live and rendered via other tiles' attachments even if this pass skipped it).
+        if (tileSet.source->isRaster()) {
+            static_cast<RasterSource*>(tileSet.source.get())->flushDirtyMosaics();
         }
     }
 
@@ -563,6 +610,15 @@ void TileManager::updateTileSet(TileSet& _tileSet, const ViewState& _view) {
                          tileId.toString().c_str(), _tileSet.source->name().c_str());
                 }
                 m_tileCache->put(_tileSet.source->id(), entry.tile);
+            } else if (entry.m_prefetchOnly) {
+                // R5 (tile-pipeline-perf-plan.md): reached here without a tile means the
+                // prefetch-only fetch was canceled/errored (isInProgress() went false while
+                // entry.tile never got set - the mutually-exclusive relationship noted above)
+                // rather than completed successfully. Record it so enqueueNeighborPrefetch()
+                // can back off instead of re-enqueueing this neighbor every frame forever.
+                auto& fail = _tileSet.prefetchFailures[tileId];
+                fail.first++;
+                fail.second = nowSeconds();
             }
             // Remove tile from set - this will call clearTask() and thus cancelLoadingTile() as appropriate
             curTilesIt = tiles.erase(curTilesIt);
@@ -588,15 +644,29 @@ void TileManager::updateTileSet(TileSet& _tileSet, const ViewState& _view) {
 // RasterSource::m_textures. Once loaded they are cached via TileManager's normal
 // TileCache so the texture stays resident like any other recently-used tile.
 //
-// Known limitation: if a neighbor fetch permanently fails (e.g. 404 at a data edge), its
-// entry is dropped and will be retried again next frame for as long as the tile it is a
-// neighbor of stays visible. This is bounded (at most 8 extra requests per visible tile
-// per frame) and considered acceptable for this low-volume background prefetch; revisit
-// if it proves noisy in practice.
+// R5 (tile-pipeline-perf-plan.md): a neighbor fetch that keeps failing (e.g. 404 at a data
+// edge, or offline) is backed off via TileSet::prefetchFailures instead of being retried every
+// single frame forever, and the ring is only prefetched once the view has settled (it only
+// matters once the center tiles are up anyway, so a fast pan doesn't burn fetch slots on ring
+// tiles about to be left behind) - see kPrefetchFailureBackoff{Count,Seconds} and
+// kPrefetchSettleDelaySeconds above.
 void TileManager::enqueueNeighborPrefetch(TileSet& _tileSet, const ViewState& _view) {
 
     auto* rasterSource = dynamic_cast<RasterSource*>(_tileSet.source.get());
     if (!rasterSource || !rasterSource->m_prefetchNeighbors) { return; }
+
+    double now = nowSeconds();
+    bool viewMoved = _view.center.x != _tileSet.lastViewCenterX ||
+                      _view.center.y != _tileSet.lastViewCenterY ||
+                      _view.zoom != _tileSet.lastViewZoom;
+    if (viewMoved) {
+        _tileSet.lastViewCenterX = _view.center.x;
+        _tileSet.lastViewCenterY = _view.center.y;
+        _tileSet.lastViewZoom = _view.zoom;
+        _tileSet.viewSettledSince = now;
+        return;  // still moving - ring prefetch can wait until the view settles
+    }
+    if (now - _tileSet.viewSettledSince < kPrefetchSettleDelaySeconds) { return; }
 
     static const int neighborDx[8] = { -1,  0,  1, -1, 1, -1, 0, 1 };
     static const int neighborDy[8] = { -1, -1, -1,  0, 0,  1, 1, 1 };
@@ -631,6 +701,14 @@ void TileManager::enqueueNeighborPrefetch(TileSet& _tileSet, const ViewState& _v
                 // the LOGD call was the actual cost (unbounded log volume), so drop it rather than
                 // engineer memoization the cleanup pass would just undo.
                 continue;
+            }
+            auto failIt = _tileSet.prefetchFailures.find(neighborId);
+            if (failIt != _tileSet.prefetchFailures.end()) {
+                if (failIt->second.first >= kPrefetchFailureBackoffCount &&
+                    now - failIt->second.second < kPrefetchFailureBackoffSeconds) {
+                    continue;  // recently failed repeatedly - back off rather than retry every frame
+                }
+                _tileSet.prefetchFailures.erase(failIt);  // backoff window passed - allow a fresh try
             }
 
             std::shared_ptr<Tile> noTile;

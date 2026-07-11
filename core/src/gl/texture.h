@@ -105,6 +105,17 @@ public:
     // Resize the texture
     void resize(int width, int height);
 
+    // True while a resize()/setPixelData() call is still awaiting its next bind()'s upload.
+    bool shouldResize() const { return m_shouldResize; }
+
+    // R6 (tile-pipeline-perf-plan.md): explicitly free the CPU-side buffer. Normally freed
+    // automatically after the first upload when m_disposeBuffer is set (the common case); some
+    // callers (e.g. texture-shading elevation mosaics) construct with disposeBuffer=false so
+    // later callers can keep reading/patching the buffer in place, and call this once they know
+    // nothing will do so again. Callers must first confirm shouldResize() is false (any pending
+    // upload has completed) - freeing while a resize is still pending loses that update.
+    void releaseBuffer() { m_buffer.reset(); }
+
     // optional user data (currently used to store min,max for elevation tiles)
     std::shared_ptr<void> userData;
 

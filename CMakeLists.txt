@@ -32,12 +32,20 @@ if(NOT EXISTS "${PROJECT_SOURCE_DIR}/core/deps/isect2d/README.md")
   return()
 endif()
 
+# LOG_LEVEL defaults to the build type's usual level but can be set independently, e.g.
+# `-DCMAKE_BUILD_TYPE=Debug -DLOG_LEVEL=2` for a debuggable build without the LOGD spam
+# in hot paths (tile fetch/build/mosaic-stitch) that makes panning feel slow.
 if(CMAKE_BUILD_TYPE MATCHES Debug)
   add_definitions(-DDEBUG)
-  add_definitions(-DLOG_LEVEL=3)
+  if(NOT DEFINED LOG_LEVEL)
+    set(LOG_LEVEL 3)
+  endif()
 else()
-  add_definitions(-DLOG_LEVEL=2)
+  if(NOT DEFINED LOG_LEVEL)
+    set(LOG_LEVEL 2)
+  endif()
 endif()
+add_definitions(-DLOG_LEVEL=${LOG_LEVEL})
 
 include(cmake/utils.cmake)
 

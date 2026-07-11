@@ -8,6 +8,7 @@
 #include "log.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <vector>
 
@@ -282,6 +283,15 @@ void copyOverzoomGridCell(GLubyte* composite, int compositeW, int Wp, int W, int
 // cap), not a 64x64 = 4096-tile one. 2 covers the common case exactly (elevation.yaml caps at
 // z16, the `osm` vector source at z14: a 2-level, 4x4 = 16-tile gap).
 const int kOverzoomCompositeMaxLevels = 2;
+
+// R2 (tile-pipeline-perf-plan.md): how long a patched mosaic may sit dirty (unflushed) before
+// RasterSource::flushDirtyMosaics() forces a re-upload regardless of ring completeness -- bounds
+// staleness for mosaics whose ring never completes (e.g. a permanently missing edge tile).
+const double kMosaicFlushDebounceSeconds = 0.2;
+
+double nowSeconds() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 } // namespace
 
@@ -575,9 +585,22 @@ public:
         // reaches for this same composite as ITS OWN "own"/neighbor cell input -- see its doc
         // comment -- so the two mechanisms compose into one texture rather than being mutually
         // exclusive; only bind the composite directly when texture shading is off.
+        // R4 (tile-pipeline-perf-plan.md): a real stitch (buildOverzoomElevationMosaic/
+        // buildElevationMosaic) is the expensive main-thread operation measured bursting
+        // several ms at a time in clusters as tiles complete; bound how many of those this
+        // task may perform per update cycle (tryConsumeStitchBudget()) and otherwise reuse
+        // whatever composite/mosaic is already registered (cheap - a map lookup, same as the
+        // isProxy() path already does) rather than forcing a fresh one. Falls all the way
+        // through to the plain per-tile texture below if nothing is registered yet either;
+        // TileManager::upgradeAttachedRasters re-checks every update and performs the real
+        // stitch once the budget resets on a later, less busy frame.
         if (!source->m_buildElevationMosaic) {
-            auto overzoomTex = isProxy() ? source->getExistingOverzoomMosaic(m_tileId)
-                                          : source->buildOverzoomElevationMosaic(m_tileId, raster->texture);
+            std::shared_ptr<Texture> overzoomTex;
+            if (isProxy() || !source->tryConsumeStitchBudget()) {
+                overzoomTex = source->getExistingOverzoomMosaic(m_tileId);
+            } else {
+                overzoomTex = source->buildOverzoomElevationMosaic(m_tileId, raster->texture);
+            }
             if (overzoomTex) {
                 _tile.rasters().emplace_back(raster->tileID, overzoomTex);
                 return;
@@ -585,8 +608,12 @@ public:
         }
 
         if (source->m_buildElevationMosaic) {
-            auto mosaicTex = isProxy() ? source->getExistingMosaic(m_tileId)
-                                        : source->buildElevationMosaic(m_tileId, raster->texture);
+            std::shared_ptr<Texture> mosaicTex;
+            if (isProxy() || !source->tryConsumeStitchBudget()) {
+                mosaicTex = source->getExistingMosaic(m_tileId);
+            } else {
+                mosaicTex = source->buildElevationMosaic(m_tileId, raster->texture);
+            }
             if (mosaicTex) {
                 _tile.rasters().emplace_back(raster->tileID, mosaicTex);
                 return;
@@ -880,6 +907,23 @@ std::shared_ptr<Texture> RasterSource::buildElevationMosaic(TileID _tile, const 
         }
         info->rugosity = computeRugosity(*ownForMosaic, id);
         info->compositeZoom = achievedZoom;
+        // Initial neighborMask: which cells stitchElevationMosaic() above actually found real
+        // data for (same dimension/bpp check it applies internally) vs. mirror-extrapolated --
+        // drives the R2 patch-upload debounce (see ElevationMosaicInfo::neighborMask).
+        {
+            int W = ownForMosaic->width();
+            int bpp = ownForMosaic->getOptions().bytesPerPixel();
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    if (dx == 0 && dy == 0) { continue; }
+                    auto& nb = neighbors[size_t(dy + 1) * 3 + size_t(dx + 1)];
+                    if (nb && nb->bufferData() && nb->width() == W && nb->height() == W &&
+                        nb->getOptions().bytesPerPixel() == bpp) {
+                        info->neighborMask |= uint16_t(1u << (size_t(dy + 1) * 3 + size_t(dx + 1)));
+                    }
+                }
+            }
+        }
         mosaic->userData = std::move(info);
         // Register for reuse and for in-place patching by later-arriving neighbors (prune dead
         // entries while we're here -- mosaics die when their last referencing Tile does); this
@@ -1080,15 +1124,57 @@ void RasterSource::patchNeighborMosaics(const TileID& _tileId, const std::shared
                 mosaic->getOptions().bytesPerPixel() != bpp) { continue; }
 
             // The new tile sits at grid offset (-dx, -dy) relative to the neighboring tile
-            // whose mosaic we're patching. resize() with unchanged dimensions just flags the
-            // texture for re-upload (and thus mipmap regeneration) on next bind - the Tiles
-            // rendering this mosaic share the same Texture object, so they pick up the
-            // patched data without any further bookkeeping.
+            // whose mosaic we're patching. The CPU-side cell copy happens immediately (data
+            // must stay correct), but the GPU resize()/re-upload is deferred to
+            // flushDirtyMosaics() (R2, tile-pipeline-perf-plan.md): several neighbor arrivals
+            // patching the same mosaic in quick succession (up to 8 per newly-cached tile, and
+            // several tiles can complete per frame) would otherwise each force their own full
+            // re-upload + mip regen on next bind.
             copyMosaicCell(mosaic->bufferData(), Wp, W, bpp, -dx, -dy, _texture->bufferData());
-            mosaic->resize(mosaic->width(), mosaic->height());
+            if (mosaic->userData) {
+                auto* info = static_cast<ElevationMosaicInfo*>(mosaic->userData.get());
+                info->neighborMask |= uint16_t(1u << (size_t(-dy + 1) * 3 + size_t(-dx + 1)));
+                if (info->firstDirtyTime == 0.0) { info->firstDirtyTime = nowSeconds(); }
+            } else {
+                // No info to track dirty state against (shouldn't happen - every registered
+                // mosaic gets one in buildElevationMosaic) - fall back to an immediate resize
+                // so the patch isn't silently lost.
+                mosaic->resize(mosaic->width(), mosaic->height());
+            }
 
             LOGD("Patched mosaic %s cell (%d,%d) with real data from tile %s",
                  mosaicIt->first.toString().c_str(), -dx, -dy, _tileId.toString().c_str());
+        }
+    }
+}
+
+void RasterSource::flushDirtyMosaics() {
+    double now = nowSeconds();
+    for (auto it = m_mosaics.begin(); it != m_mosaics.end();) {
+        auto mosaic = it->second.lock();
+        if (!mosaic) { it = m_mosaics.erase(it); continue; }
+        ++it;
+
+        if (!mosaic->userData) { continue; }
+        auto* info = static_cast<ElevationMosaicInfo*>(mosaic->userData.get());
+        bool ringComplete = (info->neighborMask & kAllRealNeighborsMask) == kAllRealNeighborsMask;
+
+        if (info->firstDirtyTime != 0.0) {  // dirty: decide whether to flush this cycle
+            bool staleTooLong = (now - info->firstDirtyTime) >= kMosaicFlushDebounceSeconds;
+            if (ringComplete || staleTooLong) {
+                mosaic->resize(mosaic->width(), mosaic->height());
+                info->firstDirtyTime = 0.0;
+            }
+            continue;  // just (re)dirtied or just flushed - either way, not yet safe to free
+        }
+
+        // R6 (tile-pipeline-perf-plan.md): not dirty, so any resize() from a previous cycle
+        // has had at least one full update cycle to be picked up by a bind() -- once the ring
+        // is complete too (no more real neighbor data will ever patch this mosaic), free its
+        // CPU buffer. shouldResize() re-check guards the (expected rare) case where it was
+        // JUST bound this same frame with a pending upload not yet consumed.
+        if (ringComplete && mosaic->bufferData() && !mosaic->shouldResize()) {
+            mosaic->releaseBuffer();
         }
     }
 }
