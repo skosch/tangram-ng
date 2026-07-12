@@ -60,6 +60,7 @@ const std::map<std::string, StyleParamKey> s_StyleParamMap = {
     {"placement_min_length_ratio", StyleParamKey::placement_min_length_ratio},
     {"placement_spacing", StyleParamKey::placement_spacing},
     {"priority", StyleParamKey::priority},
+    {"priority_texture_shading", StyleParamKey::priority_texture_shading},
     {"repeat_distance", StyleParamKey::repeat_distance},
     {"repeat_group", StyleParamKey::repeat_group},
     {"size", StyleParamKey::size},
@@ -275,6 +276,7 @@ StyleParam::Value StyleParam::parseNode(StyleParamKey key, const YAML::Node& nod
     case StyleParamKey::outline_visible:
     case StyleParamKey::collide:
     case StyleParamKey::text_optional:
+    case StyleParamKey::priority_texture_shading:
     case StyleParamKey::text_collide: {
         bool result = false;
         if (YamlUtil::getBool(node, result)) {
@@ -471,6 +473,7 @@ std::string StyleParam::toString() const {
     case StyleParamKey::outline_visible:
     case StyleParamKey::collide:
     case StyleParamKey::text_optional:
+    case StyleParamKey::priority_texture_shading:
     case StyleParamKey::text_collide:
         if (!value.is<bool>()) break;
         return k + std::to_string(value.get<bool>());

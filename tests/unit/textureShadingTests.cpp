@@ -1,0 +1,186 @@
+#include "catch.hpp"
+
+#include "data/rasterSource.h"
+#include "gl/hardware.h"
+#include "gl/texture.h"
+#include "tile/tile.h"
+#include "util/mapProjection.h"
+#include "util/textureShading.h"
+
+#include <cmath>
+#include <cstring>
+#include <vector>
+
+using namespace Tangram;
+
+namespace {
+
+// See rasterMosaicTests.cpp's identical helper for why this is needed outside a real GL context.
+struct ForceNPOTSupport {
+    ForceNPOTSupport() { Hardware::supportsTextureNPOT = true; }
+} forceNPOTSupport;
+
+TextureOptions floatOptions() {
+    TextureOptions options;
+    options.pixelFormat = PixelFormat::FLOAT;
+    return options;
+}
+
+// A `size` x `size` FLOAT mosaic buffer built directly from a per-pixel value function --
+// bypasses stitchElevationMosaic() entirely so the "known ridge pattern" is exact and doesn't
+// depend on neighbor-mirroring behavior (already covered by rasterMosaicTests.cpp).
+template <typename Fn>
+std::shared_ptr<Texture> makeMosaic(int size, Fn valueAt) {
+    auto tex = std::make_shared<Texture>(floatOptions(), false);
+    std::vector<float> data(size_t(size) * size_t(size));
+    for (int y = 0; y < size; y++) {
+        for (int x = 0; x < size; x++) {
+            data[size_t(y) * size_t(size) + size_t(x)] = valueAt(x, y);
+        }
+    }
+    tex->setPixelData(size, size, sizeof(float), reinterpret_cast<const GLubyte*>(data.data()),
+                       data.size() * sizeof(float));
+    return tex;
+}
+
+// worldPos for tile-local (u, v) in [0,1]^2 within `tileId`'s own footprint -- same convention
+// ElevationManager::elevationLerp(tex, tileId, meters) and sampleTextureShadingAtMosaic() use
+// (v = 0 at the tile's south edge).
+ProjectedMeters worldPosAt(TileID tileId, double u, double v) {
+    double scale = MapProjection::metersPerTileAtZoom(tileId.z);
+    ProjectedMeters origin = MapProjection::tileSouthWestCorner(tileId);
+    return origin + ProjectedMeters(u * scale, v * scale);
+}
+
+} // namespace
+
+TEST_CASE("Texture shading sampler - perfectly flat terrain is exactly neutral (0.5)", "[TextureShading]") {
+    // A constant field box-filters to itself at every pyramid level, so every band differences
+    // to exactly zero regardless of alpha/contrast -- shade = 0/(2*sqrt(1+0)) + 0.5 = 0.5
+    // exactly. This is a genuine hand-computed expected value, not just a ballpark check.
+    const int Wp = 16;
+    const int mosaicW = 3 * Wp;
+    auto mosaic = makeMosaic(mosaicW, [](int, int) { return 1000.0f; });
+
+    TileID tileId(1, 1, 3);
+    float shade = sampleTextureShadingAtMosaic(*mosaic, tileId, worldPosAt(tileId, 0.5, 0.5));
+    REQUIRE(shade == Approx(0.5f).margin(1e-5f));
+}
+
+TEST_CASE("Texture shading sampler - a ridge stands out at its own crest more than nearby flat ground",
+          "[TextureShading]") {
+    // A north-south ridge running the length of the WHOLE mosaic (own cell + both mirrored/real
+    // neighbor cells, avoiding any cell-boundary discontinuity) along mosaic column Wp*1.5 (the
+    // tile's own vertical centerline) -- a "known ridge pattern" per docs/label-placement-plan.md
+    // Phase 2's acceptance criteria. `ridgeHalfWidth` texels on either side of the crest are
+    // raised by `ridgeAmt` meters above the flat `base` elevation everywhere else. Wp is chosen
+    // large enough (128) that a point near the tile's own edge is far outside the ~16-texel
+    // reach of the kMaxLevels=4 pyramid's coarsest band (textureShading.cpp) -- with a smaller
+    // Wp, this high-pass filter's real "negative side lobe" just downhill of a ridge (the
+    // coarser, more-blurred level is HIGHER there than the finer level, since it partially
+    // averages in the nearby ridge -- exactly the Mexican-hat-like response a Laplacian pyramid
+    // is expected to have) would still reach every point in a small tile, making "away from the
+    // ridge" not actually flat/neutral within this buffer.
+    const int Wp = 128;
+    const int mosaicW = 3 * Wp;
+    const double base = 1000.0;
+    const double ridgeAmt = 400.0;
+    const int crestX = mosaicW / 2;
+    const int ridgeHalfWidth = 2;
+
+    auto mosaic = makeMosaic(mosaicW, [&](int x, int) {
+        return float(base + (std::abs(x - crestX) <= ridgeHalfWidth ? ridgeAmt : 0.0));
+    });
+
+    // z=14 (a realistic elevation-tile zoom, per docs/texture-shading-plan.md's confirmed real
+    // 257px-tile serving zoom) keeps texelMeters in the tens-of-meters range, so a 400m ridge
+    // registers as a large signal relative to it -- at a very coarse zoom (e.g. z=3, a
+    // ~5000km-wide tile) texelMeters is enormous and even a very tall ridge normalizes away to
+    // nearly nothing, which isn't a representative "known ridge pattern" for what this sampler
+    // actually evaluates in production (peak label positions, always well inside a source's max
+    // zoom -- see RasterSource::getRaster()'s zoom walk).
+    TileID tileId(8192, 8192, 14);
+    // u=0.5 is the tile's own vertical centerline, i.e. mosaic column Wp + Wp/2 = mosaicW/2 --
+    // exactly the ridge crest.
+    float shadeOnCrest = sampleTextureShadingAtMosaic(*mosaic, tileId, worldPosAt(tileId, 0.5, 0.5));
+    // u=0.02 sits well inside the tile's own cell (u in [0,1]) but ~61 texels from the crest --
+    // locally flat ground genuinely out of reach of the ridge's influence at any pyramid level.
+    float shadeAwayFromRidge = sampleTextureShadingAtMosaic(*mosaic, tileId, worldPosAt(tileId, 0.02, 0.5));
+
+    INFO("shadeOnCrest=" << shadeOnCrest << " shadeAwayFromRidge=" << shadeAwayFromRidge);
+
+    // Brown's contrast curve is monotonic in the band-weighted sum z, and a positive local bump
+    // (finer levels see more of the ridge than coarser, more-blurred levels do) makes z > 0 at
+    // the crest -- so the crest should read as MORE prominent (shade > 0.5) than flat ground
+    // elsewhere (shade ~= 0.5), i.e. the sampler correctly ranks "on a ridge" above "not on a
+    // ridge", the entire point of using this as a peak-priority signal (Phase 2 design step 2).
+    REQUIRE(shadeOnCrest > 0.5f + 0.1f);
+    REQUIRE(shadeOnCrest > shadeAwayFromRidge);
+    REQUIRE(shadeAwayFromRidge == Approx(0.5f).margin(0.05f));
+}
+
+TEST_CASE("Texture shading sampler - invalid/unpopulated mosaic returns neutral", "[TextureShading]") {
+    TileID tileId(1, 1, 3);
+
+    SECTION("non-square texture") {
+        auto tex = std::make_shared<Texture>(floatOptions(), false);
+        std::vector<float> data(32 * 16, 1000.0f);
+        tex->setPixelData(32, 16, sizeof(float), reinterpret_cast<const GLubyte*>(data.data()),
+                           data.size() * sizeof(float));
+        REQUIRE(sampleTextureShadingAtMosaic(*tex, tileId, worldPosAt(tileId, 0.5, 0.5)) == 0.5f);
+    }
+
+    SECTION("width not a multiple of 3 (not a valid Wp*3 mosaic)") {
+        auto tex = std::make_shared<Texture>(floatOptions(), false);
+        std::vector<float> data(10 * 10, 1000.0f);
+        tex->setPixelData(10, 10, sizeof(float), reinterpret_cast<const GLubyte*>(data.data()),
+                           data.size() * sizeof(float));
+        REQUIRE(sampleTextureShadingAtMosaic(*tex, tileId, worldPosAt(tileId, 0.5, 0.5)) == 0.5f);
+    }
+
+    SECTION("position outside the tile's own footprint") {
+        auto mosaic = makeMosaic(48, [](int, int) { return 1000.0f; });
+        ProjectedMeters farAway(1e9, 1e9);
+        REQUIRE(sampleTextureShadingAtMosaic(*mosaic, tileId, farAway) == 0.5f);
+    }
+}
+
+TEST_CASE("Texture shading sampler - RasterSource wrapper reports unavailable when no mosaic is resident",
+          "[TextureShading]") {
+    // A freshly-constructed RasterSource has never cached any tile texture, so
+    // RasterSource::getRaster() (which sampleTextureShading() relies on to find the tile
+    // covering worldPos) can't find anything -- ok must come back false, matching the "flat/
+    // non-terrain map style, or tile not yet cached" fallback case documented in textureShading.h.
+    RasterSource src("test-elevation", nullptr, floatOptions());
+    TileID tileId(1, 1, 3);
+
+    bool ok = true;
+    float shade = sampleTextureShading(src, worldPosAt(tileId, 0.5, 0.5), ok);
+    REQUIRE_FALSE(ok);
+    REQUIRE(shade == 0.5f);
+}
+
+TEST_CASE("Texture shading sampler - integrates with RasterSource::buildElevationMosaic",
+          "[TextureShading]") {
+    // Exercises the actual production wiring one level down from sampleTextureShading(): build
+    // a real mosaic via RasterSource::buildElevationMosaic() (same call RasterTileTask::addRaster()
+    // makes -- see rasterSource.cpp), then evaluate the sampler against exactly that mosaic, the
+    // same way sampleTextureShading() would once it has looked one up via getExistingMosaic().
+    const int W = 32;
+    TileID tileId(5, 5, 4);
+
+    auto own = std::make_shared<Texture>(floatOptions());
+    std::vector<float> data(size_t(W) * size_t(W), 1000.0f);
+    own->setPixelData(W, W, sizeof(float), reinterpret_cast<const GLubyte*>(data.data()),
+                       data.size() * sizeof(float));
+
+    RasterSource src("test-elevation", nullptr, floatOptions());
+    auto mosaic = src.buildElevationMosaic(tileId, own);
+    REQUIRE(mosaic != nullptr);
+    REQUIRE(src.getExistingMosaic(tileId) == mosaic);
+
+    float shade = sampleTextureShadingAtMosaic(*mosaic, tileId, worldPosAt(tileId, 0.5, 0.5));
+    // Flat input (no neighbors present, so mirror-extrapolated cells are flat copies too) ->
+    // still exactly neutral.
+    REQUIRE(shade == Approx(0.5f).margin(1e-5f));
+}

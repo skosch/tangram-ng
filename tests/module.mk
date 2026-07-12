@@ -30,6 +30,7 @@ MODULE_SOURCES = \
   unit/styleParamTests.cpp \
   unit/styleSortingTests.cpp \
   unit/styleUniformsTests.cpp \
+  unit/textureShadingTests.cpp \
   unit/textureTests.cpp \
   unit/tileIDTests.cpp \
   unit/tileManagerTests.cpp \

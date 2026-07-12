@@ -70,6 +70,14 @@ public:
         bool flat = false;
         float angle = 0.f;
         uint32_t featureId = 0;
+        // docs/label-placement-plan.md Phase 2: true for a label (currently only peak icons,
+        // via the `priority_texture_shading` style param) whose `priority` above was computed
+        // from a provisional fallback (pure-elevation weighting) at tile-build time because the
+        // CPU texture-shading sampler can't safely run on the TileWorker thread
+        // PointStyleBuilder::addFeature() executes on (see textureShading.h's threading note).
+        // LabelManager refines such a label's priority once, on the main thread, the first time
+        // the elevation mosaic is available at its position -- see Label::refinePriority().
+        bool refinePriorityWithTextureShading = false;
     };
 
     static const float activation_distance_threshold;
@@ -102,6 +110,25 @@ public:
                                        const AABB* _bounds, ScreenTransform& _transform) = 0;
 
     virtual bool setElevation(ElevationManager& elevMgr, glm::dvec2 origin, double scale) = 0;
+
+    // docs/label-placement-plan.md Phase 2: attempt to refine this label's `priority` using the
+    // CPU texture-shading sampler (sampleTextureShading(), util/textureShading.h), main-thread
+    // only. No-op (returns true, i.e. "nothing left to do") unless
+    // m_options.refinePriorityWithTextureShading is set. Returns whether a usable value was
+    // found (mirrors setElevation()'s ok-return idiom): callers should keep retrying every
+    // frame (like m_elevationSet/setElevation already do) until this returns true, then stop --
+    // see LabelManager::processLabelUpdate(). worldPos = origin + modelCenter() * scale, same
+    // convention as SpriteLabel::setElevation().
+    bool refinePriority(ElevationManager& elevMgr, glm::dvec2 origin, double scale);
+
+    // If this label tracks a relative's priority (see setRelative()'s _definePriority), copy
+    // the relative's current priority again. setRelative() only does this copy once, at
+    // construction time; a peak's text label therefore needs this called every frame so it
+    // stays in sync with its icon's priority as refinePriority() above updates it on the main
+    // thread (label construction itself happens once, at tile-build time, on a worker thread).
+    // No-op for a label that isn't tracking a relative, or wasn't set up with
+    // _definePriority=true. See LabelManager::processLabelUpdate().
+    void syncRelativePriority();
 
     // Current screen position of the label anchor
     glm::vec2 screenCenter() const { return glm::vec2(m_screenCenter); }
@@ -161,6 +188,10 @@ public:
     void setAlpha(float _alpha);
 
     bool m_elevationSet = false;
+    // docs/label-placement-plan.md Phase 2: set once refinePriority() has found a usable
+    // texture-shading value (or immediately, if refinePriorityWithTextureShading isn't set at
+    // all) -- mirrors m_elevationSet's "retry every frame until success, then stop" pattern.
+    bool m_prominenceRefined = false;
 #ifdef DEBUG
     std::string debugTag;
 #endif
@@ -175,6 +206,10 @@ protected:
     Options m_options;
 
     Label* m_relative;
+    // docs/label-placement-plan.md Phase 2: whether this label's priority should be kept in
+    // sync with m_relative's every frame -- set from setRelative()'s _definePriority; see
+    // syncRelativePriority().
+    bool m_trackRelativePriority = false;
 
     State m_state;
     FadeEffect m_fade;
@@ -200,6 +235,7 @@ namespace std {
             hash_combine(seed, o.offset.y);
             hash_combine(seed, o.priority);
             hash_combine(seed, o.collide);
+            hash_combine(seed, o.refinePriorityWithTextureShading);
             hash_combine(seed, o.repeatDistance);
             hash_combine(seed, o.repeatGroup);
             hash_combine(seed, (int)o.selectTransition.ease);
