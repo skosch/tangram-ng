@@ -3,6 +3,7 @@
 #include "gl/mesh.h"
 #include "gl/shaderProgram.h"
 #include "map.h"
+#include "scene/scene.h"
 #include "marker/marker.h"
 #include "material.h"
 #include "platform.h"
@@ -15,6 +16,7 @@
 #include "glm/vec2.hpp"
 #include "glm/vec3.hpp"
 #include "glm/gtc/type_precision.hpp"
+#include <algorithm>
 #include <cmath>
 
 #include "polygon_fs.h"
@@ -77,6 +79,13 @@ void PolygonStyle::constructVertexLayout() {
 
 }
 
+void PolygonStyle::build(const Scene& _scene) {
+    Style::build(_scene);
+    // grid tessellation is only useful when polygons are draped over 3D terrain; without an
+    //  ElevationManager plain earcut output is used regardless of the terrain_grid style param
+    m_activeTerrainGrid = _scene.elevationManager() ? m_terrainGrid : 0;
+}
+
 void PolygonStyle::constructShaderProgram() {
 
     m_shaderSource->setSourceStrings(polygon_fs, polygon_vs);
@@ -102,14 +111,29 @@ public:
 
     void setup(const Tile& _tile) override {
         m_tileUnitsPerMeter = _tile.getInverseScale();
-        m_zoom = _tile.getID().z;
+        auto id = _tile.getID();
+        m_zoom = id.z;
         m_meshData.clear();
+        // activeTerrainGrid() is sized for the worst-case overzoom (style's data source vs. the
+        //  elevation source's max_zoom), but most tiles aren't overzoomed at all - id.s > id.z only
+        //  when this tile is being displayed finer than its own data zoom. Scale the grid down to
+        //  match how overzoomed THIS tile actually is, so the common (non-overzoomed) case ends up
+        //  exactly at kTerrainMeshGridRes, matching the terrain mesh's own native grid density
+        //  (rasterStyle.cpp) instead of needlessly tessellating finer than the ground it sits on.
+        //  Never exceeds the configured ceiling, so the worst-case tiles are unaffected.
+        int overzoomLevels = std::max(0, int(id.s) - int(id.z));
+        m_builder.gridRes = m_style.activeTerrainGrid() > 0
+            ? std::min(m_style.activeTerrainGrid(), kTerrainMeshGridRes << overzoomLevels)
+            : 0;
     }
 
     void setup(const Marker& _marker, int zoom) override {
         m_zoom = zoom;
         m_tileUnitsPerMeter = 1.f / _marker.extent();
         m_meshData.clear();
+        // markers use their own local coordinate extent, not tile-local [0,1]^2, so the terrain
+        //  grid (which must align with the tile grid) does not apply
+        m_builder.gridRes = 0;
     }
 
     bool addPolygon(const Polygon& _polygon, const Properties& _props, const DrawRule& _rule) override;
@@ -197,7 +221,17 @@ bool PolygonStyleBuilder<V>::addPolygon(const Polygon& _polygon, const Propertie
                               m_builder.indices.begin(),
                               m_builder.indices.end());
 
-    m_meshData.offsets.emplace_back(m_builder.indices.size(),
+    // terrain-grid tessellation (see PolygonBuilder::chunkOffsets) may have flushed this
+    //  feature into multiple indexed sub-ranges when it needed more vertices than a uint16
+    //  index can address; push each flushed chunk first, then the final (usually only) one -
+    //  m_builder.indices holds all of them concatenated, so the last chunk's index count is
+    //  whatever remains after the already-flushed ones.
+    size_t chunkedIndices = 0;
+    for (auto& chunk : m_builder.chunkOffsets) {
+        m_meshData.offsets.push_back(chunk);
+        chunkedIndices += chunk.first;
+    }
+    m_meshData.offsets.emplace_back(m_builder.indices.size() - chunkedIndices,
                                     m_builder.numVertices);
     m_builder.clear();
 

@@ -1,5 +1,6 @@
 #include "util/elevationManager.h"
 
+#include "debug/profiler.h"
 #include "scene/scene.h"
 #include "util/asyncWorker.h"
 #include "data/rasterSource.h"
@@ -236,6 +237,9 @@ void ElevationManager::renderTerrainDepth(RenderState& _rs, const View& _view,
   std::unique_lock<std::mutex> mainLock(drawMutex);
 
   offscreenWorker->enqueue([&](){
+    // CPU-only zone: this runs on the offscreen elevation worker thread, so PROFILE_GPU (main
+    // GL context only) must not be used here even though this does issue GL calls.
+    PROFILE_SCOPE("ElevationOffscreenDraw");
     std::unique_lock<std::mutex> workerLock(drawMutex);
     std::swap(m_depthData[0], m_depthData[1]);
 

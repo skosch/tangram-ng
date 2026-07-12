@@ -1,5 +1,6 @@
 #include "data/mbtilesDataSource.h"
 
+#include "debug/profiler.h"
 #include "util/asyncWorker.h"
 #include "util/zlibHelper.h"
 #include "log.h"
@@ -164,7 +165,10 @@ bool MBTilesDataSource::loadTileData(std::shared_ptr<TileTask> _task, TileTaskCb
             // RasterTileTask::hasData() doesn't check if rawTileData is empty - it probably should, but
             //  let's not set rawTileData to empty vector, to match NetworkDataSource behavior
             int64_t createdAt = 0;
-            getTileData(tileId, *tileData, createdAt, task.offlineId);
+            {
+                PROFILE_SCOPE(Profiler::intern("mbtiles:" + m_name));
+                getTileData(tileId, *tileData, createdAt, task.offlineId);
+            }
             LOGTO("<<< DB query for %s %s%s", _task->source() ? _task->source()->name().c_str() : "?",
                   tileId.toString().c_str(), tileData->empty() ? " (not found)" : "");
 

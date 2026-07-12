@@ -12,12 +12,15 @@
 #include <mutex>
 #include <tuple>
 #include <set>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace Tangram {
 
 class Platform;
 class TileSource;
+class RasterSource;
 class TileCache;
 class View;
 struct ViewState;
@@ -83,6 +86,22 @@ protected:
 
         int64_t sourceGeneration = 0;
 
+        // R5 (tile-pipeline-perf-plan.md): count and steady_clock time (seconds) of the most
+        // recent failure for a neighbor-prefetch TileID that was canceled/errored before
+        // completing (see the erase branch in updateTileSet()) - checked by
+        // enqueueNeighborPrefetch() to avoid re-enqueueing a permanently-failing neighbor
+        // (e.g. a 404 at the data edge, or offline) every single frame forever.
+        std::map<TileID, std::pair<int, double>> prefetchFailures;
+
+        // R5: last observed view center/zoom and when it last differed from the previous
+        // update's - used to gate ring prefetches on the view having actually settled (they
+        // only matter once the center tiles are up anyway), so a fast pan doesn't spend fetch
+        // slots on ring tiles the user is about to leave behind. Per-TileSet (not shared)
+        // since each TileSet's updateTileSet() call is independent and any could be first.
+        double lastViewCenterX = 0.0, lastViewCenterY = 0.0;
+        float lastViewZoom = -1.f;
+        double viewSettledSince = 0.0;
+
         TileSet(const TileSet&) = delete;
         TileSet(TileSet&&) = default;
         TileSet& operator=(const TileSet&) = delete;
@@ -93,10 +112,30 @@ protected:
 
     void enqueueTask(TileSet& _tileSet, const TileID& _tileID, const ViewState& _view);
 
+    // Phase 1 (docs/texture-shading-plan.md): for TileSets whose source has
+    // RasterSource::m_prefetchNeighbors set, proactively enqueue low-priority
+    // background fetches of each visible tile's 8 same-zoom neighbor tiles. No-op for
+    // any other source. See TileEntry::m_prefetchOnly for how these are kept from
+    // affecting rendering/proxy logic for real (visible) tiles.
+    void enqueueNeighborPrefetch(TileSet& _tileSet, const ViewState& _view);
+
     void loadTiles();
 
     // add new visible tile to TileSet
     bool addTile(TileSet& _tileSet, const TileID& _tileID);
+
+    // Revisit a tile's raster attachment(s) and swap in a better-resolution texture if one has
+    // become available since the tile was built (see definition for details): the shared 3Wx3W
+    // texture-shading mosaic for a tile built as prefetch-only/proxy, or the opportunistic
+    // overzoom elevation composite for a draped vector tile (e.g. `osm` polygons) whose attached
+    // elevation raster was baked in at build time before its finer descendant tiles were cached.
+    // `_liveId` is the tile's CURRENT visible TileID -- its `s` is the LIVE styling zoom, which
+    // must drive the composite target zoom. The s frozen into raster.tileID at build time must
+    // NOT be used for that: a tile built (or cache-restored) at a different view zoom would
+    // keep targeting the OLD zoom forever (observed live as stable pairs of cached tile
+    // variants flipping with pan, each keeping its own stale-zoom drape and its own set of
+    // "white patch" artifacts).
+    void upgradeAttachedRasters(TileSet& _tileSet, Tile& _tile, const TileID& _liveId);
 
     // check cache for proxy for new tile
     void updateProxyTiles(TileSet& _tileSet, const TileID& _tileID, TileEntry& _tile);
@@ -128,6 +167,32 @@ protected:
     /* Temporary list of tiles that need to be loaded */
     struct TileLoadTask { double dist; TileSet* tileSet; TileID tileID; };
     std::vector<TileLoadTask> m_loadTasks;
+
+    // Perf (2026-07 profiling): upgradeAttachedRasters() (Case 2, draped vector tiles) looks up
+    // the elevation RasterSource's own TileSet and builds normalized `rendered`/`ready` id sets
+    // from its ENTIRE visibleTiles/tiles to compute per-cell displayed-zoom caps - see that
+    // function's doc comment for why these sets must exist at all. Both the elevSet lookup and
+    // the sets built from it are identical for every raster attachment on every tile processed
+    // within one updateTileSets() pass (elevSet's own visibleTiles/tiles don't change again once
+    // that pass has reached this tileSet), yet the un-cached code was redoing this full rebuild
+    // once per (visible tile x raster attachment) - up to ~140 times per update for the same
+    // handful of RasterSources. Cache keyed by RasterSource*, populated lazily on first use each
+    // pass and cleared at the top of updateTileSets() below.
+    std::unordered_map<RasterSource*, std::pair<std::set<TileID>, std::set<TileID>>> m_upgradeRasterCache;
+
+    // UX diagnosis (2026-07-11): a user report of non-monotonic detail (fine -> smoother ->
+    // fine again on a single mountainside while panning) can't be explained by the `s`-staircase
+    // alone (area strictly shrinking with distance would only ever produce a monotonic falloff).
+    // On sloped terrain, true on-screen tile AREA also depends on the local surface's orientation
+    // relative to the view ray (foreshortening), so a genuinely non-monotonic area curve while
+    // panning along a slope is possible without being a bug - but View::getTileScreenArea() has
+    // enough conditional branches (elevation-aware culling, near/far corner projection) that a
+    // real computational anomaly can't be ruled out from reading the code alone either. Track one
+    // fixed world-space reference tile (picked from the camera's look-at target the moment a
+    // capture starts) and log its ACTUAL continuous area every frame while capturing, so the next
+    // trace shows the real area-vs-time curve instead of just the discretized z/s result.
+    bool m_areaDiagCapturing = false;
+    TileID m_areaDiagRefTile = NOT_A_TILE;
 
 };
 

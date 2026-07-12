@@ -6,6 +6,7 @@ MODULE_BASE = $(MAKE_BASE)
 
 # unit tests
 MODULE_SOURCES = \
+  unit/buildersTests.cpp \
   unit/curlTests.cpp \
   unit/drawRuleTests.cpp \
   unit/dukTests.cpp \
@@ -19,6 +20,8 @@ MODULE_SOURCES = \
   unit/mapProjectionTests.cpp \
   unit/meshTests.cpp \
   unit/networkDataSourceTests.cpp \
+  unit/profilerTests.cpp \
+  unit/rasterMosaicTests.cpp \
   unit/sceneImportTests.cpp \
   unit/sceneLoaderTests.cpp \
   unit/sceneUpdateTests.cpp \

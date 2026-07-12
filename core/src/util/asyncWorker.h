@@ -1,13 +1,15 @@
 #pragma once
 
+#include "debug/profiler.h"
+
 #include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <thread>
 #include <functional>
 #include <atomic>
-#ifdef DEBUG
 #include <string>
+#ifdef DEBUG
 #include <cassert>
 #endif
 
@@ -15,14 +17,14 @@ namespace Tangram {
 
 class AsyncWorker {
 public:
-#ifdef DEBUG
-        std::string m_tag;
-#endif
+    // Kept unconditionally (not just DEBUG): run() interns this on the worker thread to give
+    // the profiler a stable, thread-safe name -- _tag may be a temporary's c_str() (e.g.
+    // MBTilesDataSource's "worker: " + name), so it must be copied here, not stored as a pointer.
+    std::string m_tag;
 
-    AsyncWorker(const char* _tag) {
+    AsyncWorker(const char* _tag) : m_tag(_tag ? _tag : "") {
 #ifdef DEBUG
         assert(_tag && _tag[0] && "AsyncWorker requires identifying tag!");
-        m_tag = _tag;
 #endif
         thread = std::thread(&AsyncWorker::run, this);
     }
@@ -52,6 +54,7 @@ public:
 private:
 
     void run() {
+        if (!m_tag.empty()) { Profiler::threadName(Profiler::intern(m_tag)); }
         while (true) {
             std::function<void()> task;
             {

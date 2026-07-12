@@ -1,5 +1,6 @@
 #include "tile/tileWorker.h"
 
+#include "debug/profiler.h"
 #include "data/tileSource.h"
 #include "log.h"
 #include "map.h"
@@ -20,7 +21,7 @@ TileWorker::TileWorker(Platform& _platform, int _numWorker) : m_platform(_platfo
 
     for (int i = 0; i < _numWorker; i++) {
         auto worker = std::make_unique<Worker>();
-        worker->thread = std::thread(&TileWorker::run, this, worker.get());
+        worker->thread = std::thread(&TileWorker::run, this, worker.get(), i);
         m_workers.push_back(std::move(worker));
     }
 }
@@ -31,9 +32,10 @@ TileWorker::~TileWorker(){
     }
 }
 
-void TileWorker::run(Worker* instance) {
+void TileWorker::run(Worker* instance, int index) {
 
     setCurrentThreadPriority(WORKER_NICENESS);
+    Profiler::threadName(Profiler::intern("TileWorker#" + std::to_string(index)));
 
     std::unique_ptr<TileBuilder> builder;
 
@@ -93,7 +95,10 @@ void TileWorker::run(Worker* instance) {
         if (task->isCanceled()) { continue; }
 
         LOGTInit(">>> process %s %s", task->source()->name().c_str(), task->tileId().toString().c_str());
-        task->process(*builder);
+        {
+            PROFILE_SCOPE(Profiler::intern("build:" + task->source()->name()));
+            task->process(*builder);
+        }
         LOGT("<<< process %s %s", task->source()->name().c_str(), task->tileId().toString().c_str());
 
         m_platform.requestRender();

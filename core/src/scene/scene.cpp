@@ -2,6 +2,7 @@
 
 #include "data/tileSource.h"
 #include "data/rasterSource.h"
+#include "debug/profiler.h"
 #include "gl/framebuffer.h"
 #include "gl/shaderProgram.h"
 #include "labels/labelManager.h"
@@ -286,9 +287,26 @@ bool Scene::load() {
             LOGE("Unable to find elevation source or raster style needed for 3D terrain!");
         }
     }
-    // need to keep elevation data if 3D terrain or contour labels enabled
-    if (m_elevationManager || (terrainSrc && terrainSrc->TileSource::generateGeometry())) {
+    // Live texture shading (docs/texture-shading-plan.md): gated on the same scene global
+    // that compiles the ELEVATION_MOSAIC shader code in (see elevation.yaml), so the mosaic
+    // machinery costs nothing when texture shading is toggled off, and works in both 2D and
+    // 3D-terrain modes. The app flips this global via SceneUpdate on scene (re)load.
+    bool elevMosaic = terrainSrc &&
+        YamlUtil::getBoolOrDefault(m_config["global"]["elevation_mosaic"], false);
+    // need to keep elevation data if 3D terrain, contour labels or mosaics enabled
+    if (m_elevationManager || elevMosaic || (terrainSrc && terrainSrc->TileSource::generateGeometry())) {
         terrainSrc->m_keepTextureData = true;
+    }
+    // Only the elevation source gets neighbor prefetching (Phase 1) and CPU-side
+    // neighbor-mosaic stitching (Phase 2) -- must not affect any other raster source. This
+    // must be set before any elevation tiles are requested (m_tileManager->setTileSources()
+    // above only registers sources; tiles are requested later from the render/update loop)
+    // and it applies to every texture this RasterSource creates from here on, including
+    // neighbor tiles, since RasterTileTask reads m_buildElevationMosaic (and
+    // m_keepTextureData, which this depends on) fresh each time.
+    if (elevMosaic) {
+        terrainSrc->m_prefetchNeighbors = true;
+        terrainSrc->m_buildElevationMosaic = true;
     }
     LOGTO("<<< elevationManager");
 
@@ -696,13 +714,25 @@ bool Scene::render(RenderState& _rs, View& _view) {
     bool drawnAnimatedStyle = false;
 
     // draw the sky (if horizon if visible)
-    m_skyManager->draw(_rs, _view);
+    {
+        PROFILE_GPU("Sky");
+        m_skyManager->draw(_rs, _view);
+    }
 
     for (const auto& style : m_styles) {
 
-        bool styleDrawn = style->draw(_rs, _view,
+        bool styleDrawn;
+        {
+            // Safe to nest inside the caller's PROFILE_GPU("Render") zone (map.cpp): each
+            // GpuZone allocates its own pair of GL timer-query objects, so nested/concurrent
+            // zones don't collide. Only safe here because Scene::render always runs on the
+            // main GL thread/context (see the CPU-only style:<name> zone in style.cpp for the
+            // same hazard when Style::draw is called from the offscreen elevation thread).
+            PROFILE_GPU(Profiler::intern("style-gpu:" + style->getName()));
+            styleDrawn = style->draw(_rs, _view,
                                       m_tileManager->getVisibleTiles(),
                                       m_markerManager->markers());
+        }
 
         drawnAnimatedStyle |= (styleDrawn && style->isAnimated());
     }
@@ -718,11 +748,16 @@ void Scene::renderSelection(RenderState& _rs, View& _view, FrameBuffer& _selecti
         GL::bindVertexArray(selectionVAO);
     }
 
-    for (const auto& style : m_styles) {
+    {
+        // Called only from Map::render's PROFILE_SCOPE("RenderSelectionPass") block on the
+        // main GL thread, so a GPU zone is safe here too (see Scene::render above).
+        PROFILE_GPU("Selection");
+        for (const auto& style : m_styles) {
 
-        style->drawSelectionFrame(_rs, _view,
-                                  m_tileManager->getVisibleTiles(),
-                                  m_markerManager->markers());
+            style->drawSelectionFrame(_rs, _view,
+                                      m_tileManager->getVisibleTiles(),
+                                      m_markerManager->markers());
+        }
     }
 
     if(selectionVAO) { GL::deleteVertexArrays(1, &selectionVAO); }

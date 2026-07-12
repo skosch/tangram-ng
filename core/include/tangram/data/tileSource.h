@@ -42,6 +42,26 @@ public:
         // 0: 256 pixel tiles
         // 1: 512 pixel tiles
         int32_t zoomBias = 0;
+        // How eagerly TileManager::updateTileSets() gives up resolution for this source as the
+        // view zooms out (and, symmetrically, reaches for finer resolution zooming in): 1.0 is
+        // today's behavior; >1.0 keeps the finest already-cached tile data on screen longer
+        // when zooming out, at the cost of building/keeping around one zoom level's worth more
+        // data. Unlike zoomBias above (a fixed per-tile-size offset baked in at scene load),
+        // this is meant to be live-adjustable per source (see TileSource::setLodAreaBias) -
+        // e.g. a GUI slider trading resolution retention against CPU/memory/network cost
+        // separately for land cover vs. hillshading/texture shading.
+        float lodAreaBias = 1.0f;
+        // Granularity of the OVERZOOM step (TileManager::updateTileSets()'s `s` escalation
+        // formula: s = z + ceil(log2(area/effMaxArea) / overzoomStepExponent)), i.e. how many
+        // doublings of on-screen area must pass before a tile's styling/overzoom zoom - and so
+        // e.g. RasterSource::overzoomTargetZoom()'s composite resolution - steps up by one whole
+        // level. 2.0 (today's behavior) requires a 4x area change per step; raising this makes
+        // each same-size resolution jump require more distance/shrinkage before it fires, so an
+        // already-fine-resolution tile stays at that resolution over a wider range of on-screen
+        // size as it's panned/zoomed - unlike lodAreaBias above, which only shifts WHEN the
+        // staircase starts, this changes the staircase's own step spacing. Live-adjustable per
+        // source, same rationale/mechanism as lodAreaBias (see TileSource::setOverzoomStepExponent).
+        float overzoomStepExponent = 2.0f;
     };
 
     /* Calculate the zoom level bias to be applied given tileSize in pixel units.
@@ -131,6 +151,14 @@ public:
     int32_t maxDisplayZoom() const { return m_zoomOptions.maxDisplayZoom; }
     int32_t maxZoom() const { return m_zoomOptions.maxZoom; }
     int32_t zoomBias() const { return m_zoomOptions.zoomBias; }
+    float lodAreaBias() const { return m_zoomOptions.lodAreaBias; }
+    // Live setter (unlike the other ZoomOptions fields, meant to be adjustable after scene
+    // load, e.g. from a GUI slider) - see ZoomOptions::lodAreaBias.
+    void setLodAreaBias(float _bias) { m_zoomOptions.lodAreaBias = _bias; }
+
+    float overzoomStepExponent() const { return m_zoomOptions.overzoomStepExponent; }
+    // Live setter, same rationale as setLodAreaBias above - see ZoomOptions::overzoomStepExponent.
+    void setOverzoomStepExponent(float _exp) { m_zoomOptions.overzoomStepExponent = _exp; }
 
     bool isActiveForZoom(const float _zoom) const {
         return _zoom >= m_zoomOptions.minDisplayZoom &&

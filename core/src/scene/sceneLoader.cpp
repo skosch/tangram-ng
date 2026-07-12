@@ -694,6 +694,12 @@ std::shared_ptr<TileSource> SceneLoader::loadSource(const Node& _source, const s
             zoomOptions.zoomBias = TileSource::zoomBiasFromTileSize(tileSize);
         }
     }
+    // Initial value for TileSource::lodAreaBias() (see its doc comment) - 1.0 (default) is
+    // today's exact zoom-out behavior; a scene can set a different starting point, and a live
+    // GUI control (MapsApp) can adjust it afterward via TileSource::setLodAreaBias().
+    if (const auto& lodAreaBiasNode = _source["zoom_retention"]) {
+        YamlUtil::getFloat(lodAreaBiasNode, zoomOptions.lodAreaBias);
+    }
 
     // support zoomBias < 0 for high-dpi
     zoomOptions.zoomBias += zoomOffset;  //if (zoomOffset >= 0) {
@@ -988,6 +994,22 @@ void SceneLoader::loadStyleProps(const Node& _styleNode, Style& _style, SceneTex
         bool boolValue;
         if (YamlUtil::getBool(texcoordsNode, boolValue)) {
             _style.setTexCoordsGeneration(boolValue);
+        }
+    }
+
+    if (const Node& terrainGridNode = _styleNode["terrain_grid"]) {
+        if (auto polygonStyle = dynamic_cast<PolygonStyle*>(&_style)) {
+            // tessellate polygons on a grid for accurate draping over 3D terrain; 'true' selects the
+            //  RasterStyle terrain mesh resolution (64), which grid cells must line up with
+            int intValue;
+            bool boolValue;
+            if (YamlUtil::getInt(terrainGridNode, intValue)) {
+                polygonStyle->setTerrainGrid(intValue);
+            } else if (YamlUtil::getBool(terrainGridNode, boolValue)) {
+                polygonStyle->setTerrainGrid(boolValue ? 64 : 0);
+            }
+        } else {
+            LOGW("terrain_grid style parameter is only supported for polygon styles");
         }
     }
 

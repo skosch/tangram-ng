@@ -1,5 +1,6 @@
 #include "style/style.h"
 
+#include "debug/profiler.h"
 #include "data/tileSource.h"
 #include "gl/renderState.h"
 #include "gl/shaderProgram.h"
@@ -423,6 +424,10 @@ bool Style::draw(RenderState& rs, const View& _view,
         return false;
     }
 
+    // Note: this function also runs on the offscreen elevation worker thread (ElevationManager's
+    // TerrainStyle draw), so only a CPU zone is safe here -- PROFILE_GPU must stay main-GL-thread-only.
+    PROFILE_SCOPE(Profiler::intern("style:" + m_name));
+
     onBeginDrawFrame(rs, _view);
 
     if (m_blend == Blending::translucent) {
@@ -470,6 +475,7 @@ bool Style::draw(RenderState& rs, const Tile& _tile) {
     int prevTexUnit = rs.currentTextureUnit();
     setupTileShaderUniforms(rs, _tile, *m_shaderProgram, m_mainUniforms);
 
+    Profiler::counterAdd("drawCalls", 1);
     if (!styleMesh->draw(rs, *m_shaderProgram)) {
         LOGN("Mesh built by style %s cannot be drawn", m_name.c_str());
         styleMeshDrawn = false;
@@ -494,6 +500,7 @@ bool Style::draw(RenderState& rs, const Marker& marker) {
                                  marker.origin().x, marker.origin().y,
                                  marker.builtZoomLevel(), marker.builtZoomLevel());
 
+    Profiler::counterAdd("drawCalls", 1);
     if (!mesh->draw(rs, *m_shaderProgram)) {
         LOGN("Mesh built by style %s cannot be drawn", m_name.c_str());
         styleMeshDrawn = false;

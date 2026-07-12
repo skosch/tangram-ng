@@ -1,5 +1,6 @@
 #include "tile/tileTask.h"
 
+#include "debug/profiler.h"
 #include "data/tileSource.h"
 #include "scene/scene.h"
 #include "tile/tile.h"
@@ -32,7 +33,11 @@ void TileTask::setTile(std::unique_ptr<Tile>&& _tile) {
 
 void TileTask::process(TileBuilder& _tileBuilder) {
 
-    auto tileData = m_source->parse(*this);
+    std::shared_ptr<TileData> tileData;
+    {
+        PROFILE_SCOPE(Profiler::intern("parse:" + m_source->name()));
+        tileData = m_source->parse(*this);
+    }
 
     if (tileData) {
         m_tile = std::make_unique<Tile>(m_tileId, m_source->id(), m_source->generation());

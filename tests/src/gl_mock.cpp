@@ -225,4 +225,28 @@ GLenum GL::checkFramebufferStatus(GLenum target) {
     return 0;
 }
 
+// timer queries unavailable in mock GL: Profiler::GpuZone is a silent no-op
+bool GL::timerQueriesSupported() {
+    return false;
+}
+void GL::genQueries(GLsizei n, GLuint *ids) {
+    for (GLsizei i = 0; i < n; i++) { ids[i] = 0; }
+}
+void GL::deleteQueries(GLsizei n, const GLuint *ids) {
+}
+void GL::queryCounter(GLuint id) {
+}
+bool GL::queryResultAvailable(GLuint id) {
+    return false;
+}
+unsigned long long GL::queryResult64(GLuint id) {
+    return 0;
+}
+long long GL::gpuTimestampNs() {
+    return 0;
+}
+bool GL::gpuDisjointOccurred() {
+    return false;
+}
+
 }

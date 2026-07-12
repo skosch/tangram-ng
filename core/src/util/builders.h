@@ -26,6 +26,12 @@ enum class JoinTypes {
 
 JoinTypes JoinTypeFromString(const std::string& str);
 
+// Native grid resolution of the RasterStyle terrain mesh (rasterStyle.cpp) that 3D-terrain-draped
+//  polygons must tessellate on to match the ground exactly when they are NOT overzoomed relative
+//  to their data source (see PolygonBuilder::gridRes and PolygonStyleBuilder::setup, polygonStyle.cpp).
+//  Shared by both files so their grid densities can never drift apart.
+constexpr int kTerrainMeshGridRes = 64;
+
 /* Callback function for PolygonBuilder:
  *
  * @coord  tesselated output coordinate
@@ -45,6 +51,27 @@ struct PolygonBuilder {
     size_t numVertices = 0;
     bool keepTileEdges;
     bool useTexCoords;
+    // if > 0, tessellate polygons on a gridRes x gridRes grid over tile-local [0,1]^2 so that, with 3D
+    //  terrain, per-vertex elevation makes the polygon follow the terrain surface instead of spanning
+    //  it with a few huge earcut triangles (which lets terrain poke through the polygon interior, or the
+    //  polygon bleed through ridges in front of it). Vertices are placed on the terrain mesh's own
+    //  piecewise-linear surface (getTerrainMeshElevation, elevation.yaml), so the grid's only job is
+    //  ensuring no triangle spans more than one terrain-lattice cell: use a power-of-two multiple of
+    //  kTerrainMeshGridRes (the RasterStyle mesh resolution), scaled up per-tile for however overzoomed
+    //  that tile actually is relative to its data source, capped at the style's configured worst-case
+    //  ceiling - see terrain_grid on unlit-polygons in stylus-osm.yaml and PolygonStyleBuilder::setup.
+    //  See Builders::buildPolygon().
+    int gridRes = 0;
+
+    // A single feature's grid tessellation can need more vertices than a uint16 index can address
+    //  (large/complex polygon at high gridRes); buildPolygonGrid (builders.cpp) then flushes what
+    //  it has as its own indexed sub-range and keeps going with a fresh 0-based vertex block,
+    //  recording each flushed sub-range's (indexCount, vertexCount) here in append order. The
+    //  final (usually only) chunk is NOT included - PolygonStyleBuilder::addPolygon appends it the
+    //  same way it always has, so single-chunk features (the overwhelming majority) are unaffected.
+    //  Mirrors the multi-batch mechanism MeshBase::compileIndices (mesh.cpp) already uses across
+    //  separate features of one tile - just applied within a single feature.
+    std::vector<std::pair<size_t, size_t>> chunkOffsets;
 
     mapbox::detail::Earcut<uint16_t> earcut;
 
@@ -55,6 +82,7 @@ struct PolygonBuilder {
     void clear() {
         numVertices = 0;
         indices.clear();
+        chunkOffsets.clear();
     }
 };
 

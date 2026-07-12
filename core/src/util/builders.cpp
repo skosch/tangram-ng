@@ -5,6 +5,10 @@
 #include "glm/gtx/rotate_vector.hpp"
 #include "glm/gtx/norm.hpp"
 
+#include <algorithm>
+#include <cstring>
+#include <unordered_map>
+
 namespace mapbox { namespace util {
 template <>
 struct nth<0, Tangram::Point> {
@@ -43,6 +47,35 @@ bool isOutsideTile(const glm::vec2& p) {
     return ((p.x < tile_min) || (p.x > tile_max) ||
             (p.y < tile_min) || (p.y > tile_max));
 }
+
+// --- grid tessellation for terrain-draped polygons (see PolygonBuilder::gridRes) ---
+
+// Sutherland-Hodgman clip of a convex loop against an axis-aligned half-plane. Only valid for
+//  CONVEX input (on non-convex rings SH generates degenerate "bridge" geometry along the clip
+//  edge, which mis-triangulates downstream) - the grid tessellation below therefore only ever
+//  clips earcut output triangles and their (convex) clipped pieces.
+// Clip-generated points get exactly p[axis] == bound and are computed from the same original
+//  segment on both sides of a shared cell edge, so shared vertices come out bit-identical across
+//  cells (no cracks after the i16 position quantization in the styles).
+void clipConvexAxis(const Tangram::Line& _in, Tangram::Line& _out, int _axis, float _bound, bool _keepBelow) {
+    _out.clear();
+    size_t n = _in.size();
+    for (size_t i = 0; i < n; i++) {
+        glm::vec2 a = _in[i];
+        glm::vec2 b = _in[(i + 1) % n];
+        float fa = a[_axis] - _bound, fb = b[_axis] - _bound;
+        bool ina = _keepBelow ? fa <= 0.f : fa >= 0.f;
+        bool inb = _keepBelow ? fb <= 0.f : fb >= 0.f;
+        if (ina) { _out.push_back(a); }
+        if (ina != inb) {
+            float t = fa / (fa - fb);
+            glm::vec2 p = a + t * (b - a);
+            p[_axis] = _bound;
+            _out.push_back(p);
+        }
+    }
+    if (_out.size() < 3) { _out.clear(); }
+}
 }
 
 namespace Tangram {
@@ -59,12 +92,189 @@ JoinTypes JoinTypeFromString(const std::string& str) {
     return JoinTypes::miter;
 }
 
+// Tessellate a polygon on the _ctx.gridRes grid over tile-local [0,1]^2 (extending beyond for
+//  the tile buffer): earcut the whole polygon exactly as the normal path does, then split each
+//  output triangle along the grid lines. Each triangle (and every clipped piece of it) is convex,
+//  so Sutherland-Hodgman clipping is exact and each piece fan-triangulates trivially with the
+//  original winding preserved. (Clipping the polygon RINGS per cell instead does not work: SH on
+//  non-convex rings emits degenerate "bridge" geometry along clip edges, which earcut then
+//  triangulates with overlapping/reversed triangles - interiors get culled away.)
+// With 3D terrain, per-vertex elevation then makes the polygon surface follow the terrain mesh
+//  surface closely (exactly, on interior cells emitted with the terrain mesh's own diagonal), so
+//  the small draw-order depth offset suffices to keep the polygon visible on the terrain at any
+//  distance - big earcut triangles spanning ridges/valleys would otherwise let terrain poke
+//  through them (or paint over ridges in front of them).
+static void buildPolygonGrid(const Polygon& _polygon, float _height, glm::vec2 _min, glm::vec2 _max,
+                             PolygonBuilder& _ctx) {
+
+    float res = float(_ctx.gridRes);
+
+    // Run earcut on the whole polygon, triangles are stored in _ctx.earcut.indices
+    _ctx.earcut(_polygon);
+    if (_ctx.earcut.indices.empty()) {
+        if (_polygon[0].size() > 3) { LOGD("earcut failed for polygon!"); }
+        return;
+    }
+
+    // earcut indices refer to the polygon points in linear order across all rings
+    std::vector<glm::vec2> pts;
+    for (auto& ring : _polygon) { pts.insert(pts.end(), ring.begin(), ring.end()); }
+
+    // share vertices between pieces/cells/triangles via their exact float bit pattern - clip
+    //  points on shared edges are computed bit-identically on both sides (see clipConvexAxis),
+    //  so this also merges cell corners and grid-line crossings (no cracks, no duplicates)
+    std::unordered_map<uint64_t, uint16_t> vertMap;
+    // NOT necessarily 0: buildPolygonExtrusion (polygonStyle.cpp addPolygon) may already have
+    //  pushed wall indices into _ctx.indices for this same feature before grid tessellation
+    //  runs (extrude + terrain_grid on the same style) - chunk index counts must exclude those.
+    //  No current style combines both, so this is currently always indices.size()==0, but the
+    //  first flush's chunk.first would otherwise silently include the extrusion's index count.
+    size_t chunkIndexStart = _ctx.indices.size();
+    auto emitVertex = [&](glm::vec2 p) -> uint16_t {
+        uint32_t xbits, ybits;
+        std::memcpy(&xbits, &p.x, sizeof(xbits));
+        std::memcpy(&ybits, &p.y, sizeof(ybits));
+        uint64_t key = (uint64_t(xbits) << 32) | ybits;
+        auto it = vertMap.find(key);
+        if (it != vertMap.end()) { return it->second; }
+        glm::vec3 coord(p.x, p.y, _height);
+        if (_ctx.useTexCoords) {
+            glm::vec2 uv(mapRange01(p.x, _min.x, _max.x), mapRange01(p.y, _max.y, _min.y));
+            _ctx.addVertex(coord, glm::vec3(0.f, 0.f, 1.f), uv);
+        } else {
+            _ctx.addVertex(coord, glm::vec3(0.f, 0.f, 1.f), glm::vec2(0));
+        }
+        uint16_t idx = uint16_t(_ctx.numVertices++);
+        vertMap.emplace(key, idx);
+        return idx;
+    };
+    auto emitTriangle = [&](glm::vec2 a, glm::vec2 b, glm::vec2 c) {
+        _ctx.indices.push_back(emitVertex(a));
+        _ctx.indices.push_back(emitVertex(b));
+        _ctx.indices.push_back(emitVertex(c));
+    };
+
+    // Fast path for interior lattice-corner vertices (tile-pipeline-perf-plan.md R1.1): the
+    //  full-cell case below emits the SAME 4 grid corners for every cell, each shared by up to
+    //  4 neighboring cells, so routing every corner reference through vertMap's hash costs 3
+    //  redundant lookups per corner. Cache corners by direct (gx, gy) index instead, over just
+    //  this polygon's own cell-index bounding box (not the whole tile grid) so the array stays
+    //  small for the common small-polygon case. Falls through to emitVertex (still the sole
+    //  vertex-creation authority, so the exact-bit-pattern sharing guarantee is unaffected) on
+    //  first touch of each corner; only repeat touches skip the hash.
+    int gxMin = int(std::floor(_min.x * res)), gxMax = int(std::ceil(_max.x * res));
+    int gyMin = int(std::floor(_min.y * res)), gyMax = int(std::ceil(_max.y * res));
+    int gridW = std::max(1, gxMax - gxMin + 1), gridH = std::max(1, gyMax - gyMin + 1);
+    std::vector<uint16_t> latticeIndex(size_t(gridW) * size_t(gridH), 0xFFFFu);
+    auto emitLatticeVertex = [&](int _gx, int _gy) -> uint16_t {
+        size_t li = size_t(_gy - gyMin) * size_t(gridW) + size_t(_gx - gxMin);
+        uint16_t idx = latticeIndex[li];
+        if (idx != 0xFFFFu) { return idx; }
+        idx = emitVertex(glm::vec2(float(_gx) / res, float(_gy) / res));
+        latticeIndex[li] = idx;
+        return idx;
+    };
+    auto emitLatticeTriangle = [&](int ax, int ay, int bx, int by, int cx, int cy) {
+        _ctx.indices.push_back(emitLatticeVertex(ax, ay));
+        _ctx.indices.push_back(emitLatticeVertex(bx, by));
+        _ctx.indices.push_back(emitLatticeVertex(cx, cy));
+    };
+    // Flush the current sub-range whenever it's close to the uint16 ceiling (headroom for the
+    //  handful of vertices one grid cell or fallback triangle can add) and start a fresh 0-based
+    //  block; see PolygonBuilder::chunkOffsets. Checked once per grid CELL (not once per earcut
+    //  triangle) because a single large earcut triangle can by itself span enough cells to
+    //  overflow the budget before finishing.
+    auto flushChunkIfNeeded = [&]() {
+        if (_ctx.numVertices <= 65000) { return; }
+        _ctx.chunkOffsets.emplace_back(_ctx.indices.size() - chunkIndexStart, _ctx.numVertices);
+        chunkIndexStart = _ctx.indices.size();
+        _ctx.numVertices = 0;
+        vertMap.clear();
+        // Cached indices refer to the chunk just flushed - stale (and wrongly reused) against
+        //  the fresh 0-based block that follows, same reason vertMap is cleared above.
+        std::fill(latticeIndex.begin(), latticeIndex.end(), uint16_t(0xFFFFu));
+    };
+
+    Line tri(3), colPiece, piece, tmp;
+    for (size_t t = 0; t + 2 < _ctx.earcut.indices.size(); t += 3) {
+        glm::vec2 A = pts[_ctx.earcut.indices[t]];
+        glm::vec2 B = pts[_ctx.earcut.indices[t + 1]];
+        glm::vec2 C = pts[_ctx.earcut.indices[t + 2]];
+        glm::vec2 lo = glm::vec2(std::min({A.x, B.x, C.x}), std::min({A.y, B.y, C.y}));
+        glm::vec2 hi = glm::vec2(std::max({A.x, B.x, C.x}), std::max({A.y, B.y, C.y}));
+        int tx0 = int(std::floor(lo.x * res)), tx1 = int(std::ceil(hi.x * res));
+        int ty0 = int(std::floor(lo.y * res)), ty1 = int(std::ceil(hi.y * res));
+        if (tx1 - tx0 <= 1 && ty1 - ty0 <= 1) {  // triangle already fits in a single cell
+            flushChunkIfNeeded();
+            emitTriangle(A, B, C);
+            continue;
+        }
+        // winding of this triangle, for the fixed-diagonal full-cell case below
+        bool ccw = (double(B.x - A.x) * (C.y - A.y) - double(C.x - A.x) * (B.y - A.y)) > 0;
+        tri = { A, B, C };
+        for (int gx = tx0; gx < tx1; gx++) {
+            float x0f = gx / res, x1f = (gx + 1) / res;
+            clipConvexAxis(tri, tmp, 0, x0f, false);
+            clipConvexAxis(tmp, colPiece, 0, x1f, true);
+            if (colPiece.empty()) { continue; }
+            float ymin = std::numeric_limits<float>::max(), ymax = std::numeric_limits<float>::lowest();
+            for (auto& p : colPiece) { ymin = std::min(ymin, p.y); ymax = std::max(ymax, p.y); }
+            int cy0 = std::max(ty0, int(std::floor(ymin * res)));
+            int cy1 = std::min(ty1, int(std::ceil(ymax * res)));
+            for (int gy = cy0; gy < cy1; gy++) {
+                flushChunkIfNeeded();
+                float y0f = gy / res, y1f = (gy + 1) / res;
+                clipConvexAxis(colPiece, tmp, 1, y0f, false);
+                clipConvexAxis(tmp, piece, 1, y1f, true);
+                if (piece.empty()) { continue; }
+                // cell fully inside the triangle: emit the two triangles with the same diagonal
+                //  orientation as the RasterStyle terrain mesh (rasterStyle.cpp), so the draped
+                //  surface matches the terrain surface exactly on interior cells. The piece must
+                //  contain each of the 4 distinct cell corners - just checking "4 points on the
+                //  cell bounds" is fooled by half-cell pieces with a duplicated corner when a
+                //  polygon edge crosses the cell exactly corner-to-corner (SH emits the corner
+                //  twice), which would double-cover the cell from both adjacent triangles
+                bool c00 = false, c10 = false, c01 = false, c11 = false;
+                bool fullCell = piece.size() == 4;
+                for (size_t k = 0; fullCell && k < piece.size(); k++) {
+                    const glm::vec2& p = piece[k];
+                    if      (p.x == x0f && p.y == y0f) { c00 = true; }
+                    else if (p.x == x1f && p.y == y0f) { c10 = true; }
+                    else if (p.x == x0f && p.y == y1f) { c01 = true; }
+                    else if (p.x == x1f && p.y == y1f) { c11 = true; }
+                    else { fullCell = false; }
+                }
+                if (fullCell && c00 && c10 && c01 && c11) {
+                    // (gx, gy)/(gx+1, gy)/(gx, gy+1)/(gx+1, gy+1) are exactly x0f/y0f/x1f/y1f's
+                    //  lattice indices - route through the direct-index cache (R1.1) instead of
+                    //  emitTriangle's hash lookup, since every interior corner here is shared by
+                    //  up to 4 cells.
+                    if (ccw) {
+                        emitLatticeTriangle(gx, gy, gx + 1, gy, gx, gy + 1);
+                        emitLatticeTriangle(gx + 1, gy, gx + 1, gy + 1, gx, gy + 1);
+                    } else {
+                        emitLatticeTriangle(gx, gy, gx, gy + 1, gx + 1, gy);
+                        emitLatticeTriangle(gx + 1, gy, gx, gy + 1, gx + 1, gy + 1);
+                    }
+                    continue;
+                }
+                // convex piece: fan triangulation, winding preserved by the clipping
+                for (size_t k = 1; k + 1 < piece.size(); k++) {
+                    emitTriangle(piece[0], piece[k], piece[k + 1]);
+                }
+            }
+        }
+    }
+}
+
 void Builders::buildPolygon(const Polygon& _polygon, float _height, PolygonBuilder& _ctx) {
 
+    if (_polygon.empty() || _polygon[0].empty()) { return; }
+
     glm::vec2 min, max;
-    if (_ctx.useTexCoords) {
+    if (_ctx.useTexCoords || _ctx.gridRes > 0) {
         min = glm::vec2(std::numeric_limits<float>::max());
-        max = glm::vec2(std::numeric_limits<float>::min());
+        max = glm::vec2(std::numeric_limits<float>::lowest());
 
         for (auto& p : _polygon[0]) {
             min.x = std::min(min.x, p.x);
@@ -72,6 +282,12 @@ void Builders::buildPolygon(const Polygon& _polygon, float _height, PolygonBuild
             max.x = std::max(max.x, p.x);
             max.y = std::max(max.y, p.y);
         }
+    }
+
+    // grid tessellation for terrain draping - only if the polygon actually spans multiple grid cells
+    if (_ctx.gridRes > 0 && (max.x - min.x > 1.f/_ctx.gridRes || max.y - min.y > 1.f/_ctx.gridRes)) {
+        buildPolygonGrid(_polygon, _height, min, max, _ctx);
+        return;
     }
 
     // Run earcut, triangles are stored in _ctx.earcut.indices
