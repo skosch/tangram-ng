@@ -84,6 +84,14 @@ public:
 
     std::unique_ptr<FrameBuffer> selectionBuffer = std::make_unique<FrameBuffer>(0, 0);
 
+    // Background-adaptive halo (docs/label-placement-plan.md Phase 4): full-resolution
+    // (unlike the half-res selectionBuffer above - per-pixel accuracy under label halos
+    // matters here) snapshot of the default framebuffer's color contents, blitted right
+    // before text styles draw each frame (Scene::render) and sampled by sdf.fs's stroke
+    // pass. Texture-backed (colorRenderBuffer=false) like selectionBuffer is once resized,
+    // since it must be bound as a sampler2D.
+    std::unique_ptr<FrameBuffer> backgroundBuffer = std::make_unique<FrameBuffer>(0, 0);
+
     bool cacheGlState = false;
     float pickRadius = .5f;
     bool isAnimating = false;
@@ -234,6 +242,8 @@ void Map::setViewport(int _newX, int _newY, int _newWidth, int _newHeight) {
     impl->view.setViewport(_newX, _newY, _newWidth, _newHeight);
     // force texture (instead of render buffer) so drawDebug() works
     impl->selectionBuffer = std::make_unique<FrameBuffer>(_newWidth/2, _newHeight/2, false);
+    // full resolution (see backgroundBuffer's declaration comment above)
+    impl->backgroundBuffer = std::make_unique<FrameBuffer>(_newWidth, _newHeight, false);
 }
 
 MapState Map::update(float _dt) {
@@ -355,7 +365,7 @@ void Map::render() {
     } else {
         // Render scene
         PROFILE_SCOPE("RenderDraw");
-        bool drawnAnimatedStyle = scene.render(renderState, view);
+        bool drawnAnimatedStyle = scene.render(renderState, view, impl->backgroundBuffer.get());
 
         if (scene.animated() != Scene::animate::no &&
             drawnAnimatedStyle != platform->isContinuousRendering()) {
@@ -978,6 +988,11 @@ void Map::setupGL() {
     if (impl->selectionBuffer->valid()) {
         impl->selectionBuffer = std::make_unique<FrameBuffer>(impl->selectionBuffer->getWidth(),
                                                               impl->selectionBuffer->getHeight(), false);
+    }
+
+    if (impl->backgroundBuffer->valid()) {
+        impl->backgroundBuffer = std::make_unique<FrameBuffer>(impl->backgroundBuffer->getWidth(),
+                                                                impl->backgroundBuffer->getHeight(), false);
     }
 
     // Load GL extensions and capabilities

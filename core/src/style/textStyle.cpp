@@ -83,6 +83,23 @@ void TextStyle::onBeginDrawFrame(RenderState& rs, const View& _view) {
     m_shaderProgram->setUniformMatrix4f(rs, m_mainUniforms.uOrtho,
                                         _view.getOrthoViewportMatrix());
 
+    // Background-adaptive halo (docs/label-placement-plan.md Phase 4): bind this frame's
+    // background color snapshot (set by Scene::render right before text styles draw) to its
+    // own texture unit, distinct from uTex's glyph-atlas unit above which cycles per mesh.
+    // backgroundTexture is 0 before the first resize/blit (e.g. very first frame) - leave
+    // u_background_tex unbound in that case; sdf.fs treats an all-zero sample as "dark" via
+    // the luminance formula, so the halo just stays fully visible rather than erroring.
+    if (rs.backgroundTexture) {
+        auto bgTexUnit = rs.nextAvailableTextureUnit();
+        rs.texture(rs.backgroundTexture, bgTexUnit, GL_TEXTURE_2D);
+        m_shaderProgram->setUniformi(rs, m_mainUniforms.uBackgroundTex, bgTexUnit);
+    }
+
+    // Not yet visually tuned - see m_mainUniforms.uHaloLuminanceDark's comment for why
+    // these are plain constants rather than scene-config-driven.
+    m_shaderProgram->setUniformf(rs, m_mainUniforms.uHaloLuminanceDark, 0.35f);
+    m_shaderProgram->setUniformf(rs, m_mainUniforms.uHaloLuminanceLight, 0.75f);
+
     if (m_sdf) {
         m_shaderProgram->setUniformi(rs, m_mainUniforms.uPass, 1);
 

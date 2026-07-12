@@ -259,6 +259,12 @@ typedef char            GLchar;
 #define GL_RENDERBUFFER_BINDING         0x8CA7
 #define GL_MAX_RENDERBUFFER_SIZE        0x84E8
 #define GL_INVALID_FRAMEBUFFER_OPERATION 0x0506
+// GLES3/GL3.0 split read/draw framebuffer targets, needed for glBlitFramebuffer
+// (used to snapshot the default framebuffer into the background-halo texture, see
+// FrameBuffer::blitColorFrom / docs/label-placement-plan.md Phase 4)
+#define GL_READ_FRAMEBUFFER             0x8CA8
+#define GL_DRAW_FRAMEBUFFER             0x8CA9
+#define GL_READ_FRAMEBUFFER_BINDING     0x8CAA
 
 // glext.h
 #define GL_ARRAY_BUFFER                 0x8892
@@ -363,6 +369,9 @@ struct GL {
     static void deleteFramebuffers(GLsizei n, const GLuint *framebuffers);
     static void deleteRenderbuffers(GLsizei n, const GLuint *renderbuffers);
     static GLenum checkFramebufferStatus(GLenum target);
+    static void blitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
+                                GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1,
+                                GLbitfield mask, GLenum filter);
 
     // Texture
     static void bindTexture(GLenum target, GLuint texture );

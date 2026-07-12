@@ -50,6 +50,7 @@ enum class StyleParamKey : uint8_t {
     placement_spacing,
     point_text,
     priority,
+    priority_texture_shading,
     repeat_distance,
     repeat_group,
     size,

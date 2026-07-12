@@ -1,5 +1,6 @@
 #include "style/pointStyleBuilder.h"
 
+#include "data/properties.h"
 #include "data/propertyItem.h"
 #include "labels/labelCollider.h"
 #include "labels/spriteLabel.h"
@@ -142,6 +143,13 @@ auto PointStyleBuilder::applyRule(const DrawRule& _rule) const -> Parameters {
     StyleParam::Width repeatDistance;
 
     _rule.get(StyleParamKey::priority, p.labelOptions.priority);
+    // docs/label-placement-plan.md Phase 2: opt-in flag (peak draw rule only, currently) --
+    // whether addPoint()/addLine()/addPolygon() below should ask LabelManager to refine this
+    // label's priority via the CPU texture-shading sampler on the main thread. Read here
+    // (feature-independent, just the draw rule's own value); addPoint() etc. additionally
+    // suppress it per-feature when a real OSM `prominence` tag is already present, since that's
+    // a strictly better signal and the JS priority: function already used it.
+    _rule.get(StyleParamKey::priority_texture_shading, p.labelOptions.refinePriorityWithTextureShading);
     _rule.get(StyleParamKey::sprite_default, p.spriteDefault);
     p.dynamicTexture = _rule.get(StyleParamKey::texture, p.texture);
 
@@ -502,10 +510,25 @@ void PointStyleBuilder::labelPointsPlacing(const Line& _line, const glm::vec4& _
     }
 }
 
+// docs/label-placement-plan.md Phase 2: a real OSM `prominence` tag (already available on
+// `_props` here -- same Properties/parsing path as `feature.ele`, see e.g. the peak draw rule's
+// filter in stylus-osm.yaml) is a strictly better salience signal than the CPU texture-shading
+// proxy, and the peak draw rule's `priority:` JS function already uses it when present (that
+// function runs on the same worker thread as this one, with full Properties access -- no
+// threading concern there, only the raster-backed texture-shading term needs the main-thread
+// refinement path). Suppress the main-thread refinement request in that case so it doesn't
+// later overwrite the better, already-final priority value.
+static void suppressTextureShadingIfProminent(PointStyleBuilder::Parameters& p, const Properties& props) {
+    if (p.labelOptions.refinePriorityWithTextureShading && props.contains("prominence")) {
+        p.labelOptions.refinePriorityWithTextureShading = false;
+    }
+}
+
 bool PointStyleBuilder::addPoint(const Point& _point, const Properties& _props,
                                  const DrawRule& _rule) {
 
     Parameters p = applyRule(_rule);
+    suppressTextureShadingIfProminent(p, _props);
     glm::vec4 uvsQuad;
     Texture* texture = nullptr;
 
@@ -528,6 +551,7 @@ bool PointStyleBuilder::addLine(const Line& _line, const Properties& _props,
                                 const DrawRule& _rule) {
 
     Parameters p = applyRule(_rule);
+    suppressTextureShadingIfProminent(p, _props);
     glm::vec4 uvsQuad;
     Texture* texture = nullptr;
 
@@ -550,6 +574,7 @@ bool PointStyleBuilder::addPolygon(const Polygon& _polygon, const Properties& _p
                                    const DrawRule& _rule) {
 
     Parameters p = applyRule(_rule);
+    suppressTextureShadingIfProminent(p, _props);
     glm::vec4 uvsQuad;
     Texture* texture = nullptr;
 
@@ -605,6 +630,19 @@ bool PointStyleBuilder::addFeature(const Feature& _feat, const DrawRule& _rule) 
             for (size_t i = 0; i < iconsCount; i++) {
                 auto pLabel = static_cast<SpriteLabel*>(m_labels[iconsStart + i].get());
                 glm::vec2 p = pLabel->modelCenter();
+
+                // Salience-aware anchor ordering (docs/label-placement-plan.md Phase 3):
+                // steer the linked text label's anchor fallback order away from nearby
+                // water/road/trail geometry (and, once Phase 2 lands, ridge/canyon
+                // texture-shading response) instead of always trying the fixed compass
+                // order first. Icon radius approximated as half the sprite's larger
+                // dimension. The sorted list is handed to the existing anchor-cycling
+                // mechanism unchanged -- no collision/occlusion code is touched.
+                glm::vec2 iconDim = pLabel->dimension();
+                float iconRadiusPx = 0.5f * std::max(iconDim.x, iconDim.y);
+                params.labelOptions.anchors = textStyleBuilder.salienceOrderedAnchors(
+                    params.labelOptions.anchors, p, glm::vec2(attrib.width, attrib.height), iconRadiusPx);
+
                 textStyleBuilder.addLabel(Label::Type::point, {{p, p}}, params, attrib, _rule);
 
                 bool definePriority = !_rule.contains(StyleParamKey::text_priority);

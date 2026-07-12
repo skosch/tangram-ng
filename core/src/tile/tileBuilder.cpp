@@ -5,6 +5,7 @@
 #include "data/propertyItem.h"
 #include "data/tileSource.h"
 #include "gl/mesh.h"
+#include "labels/anchorOccupancyGrid.h"
 #include "log.h"
 #include "scene/dataLayer.h"
 #include "scene/scene.h"
@@ -114,6 +115,19 @@ void TileBuilder::build(Tile& tile, const TileData& _tileData, const TileSource&
     if(globalsGeneration < m_scene.globalsGeneration) {
       globalsGeneration = m_scene.globalsGeneration;
       m_styleContext->setSceneGlobals(m_scene.config()["global"]);
+    }
+
+    // Coarse per-tile index of water/road/trail geometry from *all* of this call's raw
+    // layers, built once before any individual style's builder runs -- a single style's
+    // addFeature() only ever sees the feature(s) of the layer(s) its own draw rules
+    // matched, not the tile's other layers, so this shared pre-pass is the only way for
+    // (e.g.) peak-label anchor placement to react to nearby water/road geometry.
+    // See docs/label-placement-plan.md Phase 3 and labels/anchorOccupancyGrid.h.
+    // Only overwrite an existing grid when this call actually found relevant geometry,
+    // in case build() is ever invoked multiple times for the same Tile across different
+    // sources that don't all carry water/transportation layers.
+    if (auto grid = AnchorOccupancyGrid::build(_tileData)) {
+        tile.setAnchorOccupancyGrid(std::move(grid));
     }
 
     for (auto& builder : m_styleBuilder) {

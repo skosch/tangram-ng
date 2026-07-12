@@ -70,6 +70,26 @@ protected:
         UniformLocation uOrtho{"u_ortho"};
         UniformLocation uPass{"u_pass"};
         UniformLocation uMaxStrokeWidth{"u_max_stroke_width"};
+        // Background-adaptive halo (docs/label-placement-plan.md Phase 4): sampler for the
+        // per-frame default-framebuffer color snapshot (RenderState::backgroundTexture),
+        // read by sdf.fs's stroke pass to fade the halo out over light backgrounds. Only
+        // bound/used on m_mainUniforms - the selection pass doesn't draw halos.
+        UniformLocation uBackgroundTex{"u_background_tex"};
+        // Halo fade-out thresholds (docs/label-placement-plan.md Phase 4) - background
+        // luminance at/below uHaloLuminanceDark keeps the halo at full strength, at/above
+        // uHaloLuminanceLight the halo is fully invisible. Set as plain uniforms (not via
+        // the YAML "shaders: uniforms:" gui_variables mechanism the rest of this feature
+        // otherwise uses) because sdf.fs is shared by multiple distinct TextStyle-derived
+        // Style objects beyond the "text" built-in (contour-labels, and one implicitly
+        // created per point style that has a linked text child, e.g. "points"/"poi-points"/
+        // "track-markers"/"loc-points") - the YAML mechanism only configures one Style
+        // instance per name, so per-style declarations don't reliably reach all of them and
+        // several ended up failing to compile ("undeclared") in Phase 6 integration testing.
+        // Hardcoding both the declaration (sdf.fs) and the value (onBeginDrawFrame) is what
+        // guarantees every TextStyle-derived instance compiles, at the cost of losing live
+        // GUI-slider tuning for now - see onBeginDrawFrame for the values.
+        UniformLocation uHaloLuminanceDark{"u_halo_luminance_dark"};
+        UniformLocation uHaloLuminanceLight{"u_halo_luminance_light"};
     } m_mainUniforms, m_selectionUniforms;
 
     mutable std::vector<std::unique_ptr<DynamicQuadMesh<TextVertex>>> m_meshes;

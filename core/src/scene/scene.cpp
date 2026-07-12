@@ -709,9 +709,10 @@ void Scene::renderBeginFrame(RenderState& _rs) {
     }
 }
 
-bool Scene::render(RenderState& _rs, View& _view) {
+bool Scene::render(RenderState& _rs, View& _view, FrameBuffer* _backgroundBuffer) {
 
     bool drawnAnimatedStyle = false;
+    bool blittedBackground = false;
 
     // draw the sky (if horizon if visible)
     {
@@ -720,6 +721,24 @@ bool Scene::render(RenderState& _rs, View& _view) {
     }
 
     for (const auto& style : m_styles) {
+
+        // Background-adaptive halo (docs/label-placement-plan.md Phase 4): snapshot the
+        // default framebuffer's color contents (everything drawn so far this frame) right
+        // before the first text-type style draws. m_styles is sorted by Style::compare
+        // (style.h) such that all non-opaque styles with default blend_order sort by
+        // ascending Blending enum value, and TextStyle/ContourTextStyle/DebugTextStyle all
+        // default to Blending::overlay - the highest value - so text styles are guaranteed
+        // to be the last group drawn each frame (confirmed: no draw group in stylus-osm.yaml
+        // sets blend_order high enough to reorder past them). If a scene ever adds a style
+        // with a higher blend_order that also isn't text, that style would be blitted "into
+        // the future" as background for halos, which is a visual nit, not a correctness bug.
+        if (_backgroundBuffer && !blittedBackground && style->type() == StyleType::text) {
+            PROFILE_GPU("BackgroundHaloBlit");
+            _backgroundBuffer->blitColorFrom(_rs, _rs.defaultFrameBuffer(),
+                                             _view.getWidth(), _view.getHeight());
+            _rs.backgroundTexture = _backgroundBuffer->getTextureHandle();
+            blittedBackground = true;
+        }
 
         bool styleDrawn;
         {

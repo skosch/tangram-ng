@@ -12,6 +12,7 @@ MODULE_SOURCES = \
   unit/dukTests.cpp \
   unit/fileTests.cpp \
   unit/flyToTest.cpp \
+  unit/geomTests.cpp \
   unit/jobQueueTests.cpp \
   unit/labelsTests.cpp \
   unit/labelTests.cpp \
@@ -30,6 +31,7 @@ MODULE_SOURCES = \
   unit/styleParamTests.cpp \
   unit/styleSortingTests.cpp \
   unit/styleUniformsTests.cpp \
+  unit/textureShadingTests.cpp \
   unit/textureTests.cpp \
   unit/tileIDTests.cpp \
   unit/tileManagerTests.cpp \

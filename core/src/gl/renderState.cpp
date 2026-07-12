@@ -413,6 +413,10 @@ bool RenderState::framebuffer(GLuint handle) {
     return true;
 }
 
+void RenderState::invalidateFramebuffer() {
+    m_framebuffer.set = false;
+}
+
 bool RenderState::viewport(GLint x, GLint y, GLsizei width, GLsizei height) {
     if (!m_viewport.set || m_viewport.x != x || m_viewport.y != y
       || m_viewport.width != width || m_viewport.height != height) {

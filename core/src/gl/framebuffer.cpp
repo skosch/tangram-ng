@@ -54,6 +54,35 @@ bool FrameBuffer::applyAsRenderTarget(RenderState& _rs, ColorF _clearColor) {
     return true;
 }
 
+bool FrameBuffer::blitColorFrom(RenderState& _rs, GLuint _srcFramebuffer, int _srcWidth, int _srcHeight) {
+
+    if (!m_glFrameBufferHandle) {
+        init(_rs);
+    }
+
+    if (!m_valid) {
+        return false;
+    }
+
+    // Bind read/draw framebuffers independently of RenderState's single-target cache
+    // (framebuffer() only tracks a combined GL_FRAMEBUFFER binding), then blit the color
+    // attachment. NEAREST is fine here - background luminance sampling in sdf.fs doesn't need
+    // filtered color, and this avoids implying any particular filtering intent for the general
+    // case where _srcWidth/_srcHeight might differ from this buffer's own size.
+    GL::bindFramebuffer(GL_READ_FRAMEBUFFER, _srcFramebuffer);
+    GL::bindFramebuffer(GL_DRAW_FRAMEBUFFER, m_glFrameBufferHandle);
+    GL::blitFramebuffer(0, 0, _srcWidth, _srcHeight, 0, 0, m_width, m_height,
+                        GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+    // Restore the combined framebuffer binding to what RenderState still believes is current,
+    // and invalidate its cache so the next framebuffer() call re-issues the bind for real
+    // (we just changed the actual GL binding out from under it via the read/draw targets above).
+    GL::bindFramebuffer(GL_FRAMEBUFFER, _srcFramebuffer);
+    _rs.invalidateFramebuffer();
+
+    return true;
+}
+
 void FrameBuffer::apply(RenderState& _rs, GLuint _handle, glm::vec4 _viewport, ColorF _clearColor) {
 
     _rs.framebuffer(_handle);

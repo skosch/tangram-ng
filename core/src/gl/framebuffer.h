@@ -25,6 +25,13 @@ public:
 
     static void apply(RenderState& _rs, GLuint _handle, glm::vec4 _viewport, ColorF _clearColor);
 
+    // Copy (blit) the color contents of _srcFramebuffer (size _srcWidth x _srcHeight) into
+    // this FrameBuffer's own color texture, scaling if the sizes differ. Used to snapshot the
+    // default framebuffer for the background-adaptive text halo (docs/label-placement-plan.md
+    // Phase 4) - reuses this class's existing render-to-texture machinery (lazily init()s on
+    // first use, same as applyAsRenderTarget) rather than a separate mechanism.
+    bool blitColorFrom(RenderState& _rs, GLuint _srcFramebuffer, int _srcWidth, int _srcHeight);
+
     bool valid() const { return m_valid; }
 
     int getWidth() const { return m_width; }

@@ -18,6 +18,17 @@ uniform float u_meters_per_pixel;
 uniform float u_device_pixel_ratio;
 uniform float u_max_stroke_width;
 uniform LOWP int u_pass;
+// Background-adaptive halo (docs/label-placement-plan.md Phase 4): snapshot of the default
+// framebuffer's color contents, blitted just before text styles draw (Scene::render) and
+// bound here by TextStyle::onBeginDrawFrame. Sampled per-fragment in the stroke pass below
+// so halo visibility reacts to what's actually underneath, not a per-label flag.
+uniform sampler2D u_background_tex;
+// Halo fade-out thresholds, set unconditionally in TextStyle::onBeginDrawFrame - see
+// TextStyle::UniformBlock::uHaloLuminanceDark's comment for why these are hardcoded here
+// rather than injected via the "#pragma tangram: uniforms" block below (this file is
+// shared by several distinct TextStyle-derived Style objects, not just one).
+uniform float u_halo_luminance_dark;
+uniform float u_halo_luminance_light;
 
 #pragma tangram: uniforms
 
@@ -67,6 +78,19 @@ void main(void) {
         float smooth_signed_distance = pow(signed_distance, signed_distance_1_over_2);
 
         alpha = smoothstep(start, end, smooth_signed_distance);
+
+        // Background-adaptive halo (docs/label-placement-plan.md Phase 4): fade the halo
+        // out over light backgrounds (e.g. snow, pale fill) and keep it fully visible over
+        // dark ones (forest, water, shadow), decided per-fragment from the actual composited
+        // pixel underneath - not a per-label flag, so a single label's halo can visibly vary
+        // in strength across its own extent (e.g. straddling a shadow edge). u_halo_luminance_dark
+        // / u_halo_luminance_light are gui_variables-tunable (stylus-osm.yaml, same pattern as
+        // hillshade's u_texture_shading_* - see docs/label-placement-plan.md Phase 4) rather
+        // than hardcoded, since the exact falloff is a human visual-tuning call.
+        vec3 bg = texture2D(u_background_tex, gl_FragCoord.xy / u_resolution).rgb;
+        float bg_luminance = dot(bg, vec3(0.299, 0.587, 0.114));
+        float halo_visibility = 1.0 - smoothstep(u_halo_luminance_dark, u_halo_luminance_light, bg_luminance);
+        alpha *= halo_visibility;
     }
 
     color.a *= v_alpha * alpha;

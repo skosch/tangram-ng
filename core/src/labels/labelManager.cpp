@@ -82,6 +82,13 @@ void LabelManager::processLabelUpdate(const ViewState& _viewState, const LabelSe
             continue;
         }
 
+        // docs/label-placement-plan.md Phase 2: keep a linked text label's priority in sync
+        // with its icon's (see Label::syncRelativePriority()'s doc comment for why this can't
+        // just be the one-time copy setRelative() already does). Cheap no-op for any label that
+        // isn't tracking a relative's priority; independent of elevation/terrain being enabled
+        // at all.
+        label->syncRelativePriority();
+
         if (setElev && !label->m_elevationSet) {
             if (_tile) {
                 label->m_elevationSet = label->setElevation(*_elevManager, _tile->getOrigin(), _tile->getScale());
@@ -89,6 +96,23 @@ void LabelManager::processLabelUpdate(const ViewState& _viewState, const LabelSe
                 double scale = _marker->extent();  // see Marker::setMesh()
                 if (scale <= 0) { scale = MapProjection::metersPerTileAtZoom(_marker->builtZoomLevel()); }
                 label->m_elevationSet = label->setElevation(*_elevManager, _marker->origin(), scale);
+            }
+        }
+
+        // docs/label-placement-plan.md Phase 2: refine peak icon priority using the CPU
+        // texture-shading sampler, main-thread only (see textureShading.h's threading note --
+        // this can't safely happen at tile-build time on a TileWorker thread). No-op unless the
+        // label opted in (Label::Options::refinePriorityWithTextureShading); retried every
+        // frame, like m_elevationSet/setElevation above, until the elevation mosaic becomes
+        // available at this label's position.
+        if (_elevManager && !label->m_prominenceRefined) {
+            if (_tile) {
+                label->m_prominenceRefined =
+                    label->refinePriority(*_elevManager, _tile->getOrigin(), _tile->getScale());
+            } else if (_marker) {
+                double scale = _marker->extent();
+                if (scale <= 0) { scale = MapProjection::metersPerTileAtZoom(_marker->builtZoomLevel()); }
+                label->m_prominenceRefined = label->refinePriority(*_elevManager, _marker->origin(), scale);
             }
         }
 
