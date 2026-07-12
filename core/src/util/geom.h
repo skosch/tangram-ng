@@ -4,6 +4,10 @@
 #include "glm/vec4.hpp"
 #include "glm/mat4x4.hpp"
 
+#include <algorithm>
+#include <cmath>
+#include <vector>
+
 namespace Tangram {
 
 constexpr double PI = 3.14159265358979323846;
@@ -113,6 +117,95 @@ Vector centroid(InputIt begin, InputIt end) {
     return centroid;
 }
 
+/// Result of analyzing a polygon's area-weighted principal axis (see polygonPrincipalAxis).
+struct PolygonAxis {
+    glm::vec2 center{0.f, 0.f};     // area centroid
+    glm::vec2 direction{1.f, 0.f};  // unit vector along the major (principal) axis
+    float elongation = 1.f;         // sqrt(largest / smallest eigenvalue) of the area
+                                     // covariance matrix; equals width/height for a
+                                     // rectangle, and 1 for a circle. >= 1.
+};
+
+/// Compute the area-weighted principal axis and elongation ratio of the polygon ring
+/// [begin, end) (a single closed ring; the first point need not be repeated at the end).
+///
+/// Uses the analytic second-moment-of-area formulas for a polygon (integrated over the
+/// polygon's *interior* via Green's theorem) rather than a naive covariance of the
+/// boundary vertices -- the latter would be skewed by uneven vertex density along the
+/// ring (e.g. a finely-subdivided shoreline segment next to a few long straight edges).
+///
+/// For a degenerate (near-zero-area, or fewer than 3 point) ring, returns elongation = 1
+/// and an arbitrary direction; callers should treat that as "not elongated".
+template<class InputIt, class Vector = typename InputIt::value_type>
+PolygonAxis polygonPrincipalAxis(InputIt begin, InputIt end) {
+    PolygonAxis result;
+    if (begin == end || (end - begin) < 3) { return result; }
+
+    // Translate to local coordinates relative to the first vertex for numeric stability
+    // -- same trick as centroid() above, more important here since we accumulate
+    // products of coordinates up to cubic terms.
+    const double ox = begin->x, oy = begin->y;
+
+    double area2 = 0.0; // sum of cross_i == 2 * signed polygon area
+    double sumCx = 0.0, sumCy = 0.0;
+    double sumXX = 0.0, sumYY = 0.0, sumXY = 0.0;
+
+    auto prev = end - 1;
+    for (auto curr = begin; curr != end; prev = curr, ++curr) {
+        double x0 = prev->x - ox, y0 = prev->y - oy;
+        double x1 = curr->x - ox, y1 = curr->y - oy;
+        double cross = x0 * y1 - x1 * y0;
+
+        area2 += cross;
+        sumCx += (x0 + x1) * cross;
+        sumCy += (y0 + y1) * cross;
+        sumXX += (x0 * x0 + x0 * x1 + x1 * x1) * cross;
+        sumYY += (y0 * y0 + y0 * y1 + y1 * y1) * cross;
+        sumXY += (x0 * y1 + 2.0 * x0 * y0 + 2.0 * x1 * y1 + x1 * y0) * cross;
+    }
+
+    if (std::abs(area2) < 1e-12) { return result; }
+
+    double cx = sumCx / (3.0 * area2);
+    double cy = sumCy / (3.0 * area2);
+    result.center = Vector(float(cx + ox), float(cy + oy));
+
+    // Second moments about the origin, shifted to the centroid (parallel axis theorem).
+    // Dividing by the same signed 'area2' throughout keeps Var(x)/Var(y)/Cov(x,y) correct
+    // regardless of the ring's winding direction (moments and area both flip sign
+    // together for a clockwise ring, so the ratio stays positive).
+    double varX = sumXX / (6.0 * area2) - cx * cx;
+    double varY = sumYY / (6.0 * area2) - cy * cy;
+    double covXY = sumXY / (12.0 * area2) - cx * cy;
+
+    // Eigen-decomposition of the symmetric 2x2 covariance matrix [[varX, covXY], [covXY, varY]].
+    double trace = varX + varY;
+    double halfDiff = (varX - varY) * 0.5;
+    double disc = std::sqrt(std::max(0.0, halfDiff * halfDiff + covXY * covXY));
+    double lambda1 = trace * 0.5 + disc; // larger eigenvalue
+    double lambda2 = trace * 0.5 - disc; // smaller eigenvalue
+
+    if (lambda1 <= 1e-12) { return result; } // degenerate (near-zero extent in every direction)
+
+    glm::vec2 dir;
+    if (std::abs(covXY) > 1e-9 * std::max(1.0, std::abs(trace))) {
+        // Eigenvector of the symmetric matrix for eigenvalue lambda1: (lambda1 - varY, covXY).
+        dir = glm::vec2(float(lambda1 - varY), float(covXY));
+    } else {
+        // Axis-aligned (no shear): pick the axis with the larger variance.
+        dir = (varX >= varY) ? glm::vec2(1.f, 0.f) : glm::vec2(0.f, 1.f);
+    }
+    float dirLen = glm::length(dir);
+    result.direction = (dirLen > 1e-12f) ? dir / dirLen : glm::vec2(1.f, 0.f);
+
+    double lambda2c = std::max(lambda2, 0.0);
+    // Cap the ratio for near-degenerate (essentially 1-dimensional) shapes rather than
+    // returning +inf.
+    result.elongation = (lambda2c > 1e-12) ? float(std::sqrt(lambda1 / lambda2c)) : 1000.f;
+
+    return result;
+}
+
 /// Return the signed area of the triangle formed by the points a, b, and c in the plane.
 template<class T>
 float signedArea(const T& a, const T& b, const T& c) {
@@ -124,6 +217,51 @@ float signedArea(const T& a, const T& b, const T& c) {
 /// https://mathworld.wolfram.com/PerpDotProduct.html
 inline float perpDotProduct(const glm::vec2& a, const glm::vec2& b) {
     return (a.x * b.y) - (a.y * b.x);
+}
+
+/// Intersect the infinite line through 'origin' with direction 'dir' against the polygon
+/// ring [begin, end), returning in (outStart, outEnd) the sub-segment of that line lying
+/// inside the ring and containing the origin's own projection (parametric t = 0).
+///
+/// Returns false if no such segment is found -- e.g. 'origin' lies outside the ring for a
+/// concave polygon, or the ring is degenerate. Callers should fall back to a plain
+/// centroid label in that case.
+template<class InputIt>
+bool clipLineToPolygon(glm::vec2 origin, glm::vec2 dir, InputIt begin, InputIt end,
+                        glm::vec2& outStart, glm::vec2& outEnd) {
+    if (begin == end) { return false; }
+
+    std::vector<float> ts;
+    auto prev = end - 1;
+    for (auto curr = begin; curr != end; prev = curr, ++curr) {
+        glm::vec2 a(prev->x, prev->y);
+        glm::vec2 b(curr->x, curr->y);
+        glm::vec2 edge = b - a;
+
+        float denom = perpDotProduct(dir, edge);
+        if (std::abs(denom) < 1e-9f) { continue; } // line parallel to this edge
+
+        glm::vec2 diff = a - origin;
+        float u = perpDotProduct(diff, dir) / denom;
+        if (u < 0.f || u >= 1.f) { continue; } // intersection outside this edge segment
+
+        float t = perpDotProduct(diff, edge) / denom;
+        ts.push_back(t);
+    }
+
+    if (ts.size() < 2) { return false; }
+    std::sort(ts.begin(), ts.end());
+
+    // Pair up consecutive crossings (ray-casting parity: alternating gaps are 'inside'
+    // the polygon). Return the pair that brackets t = 0, i.e. contains the origin.
+    for (size_t i = 0; i + 1 < ts.size(); i += 2) {
+        if (ts[i] <= 0.f && ts[i + 1] >= 0.f) {
+            outStart = origin + dir * ts[i];
+            outEnd = origin + dir * ts[i + 1];
+            return true;
+        }
+    }
+    return false;
 }
 
 /// Map a value from the range [inputMin, inputMax] into the range [0, 1].

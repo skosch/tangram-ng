@@ -57,6 +57,14 @@ public:
     void addCurvedTextLabels(const Line& _feature, const TextStyle::Parameters& _params,
                              const LabelAttributes& _attributes, const DrawRule& _rule);
 
+    // Phase 5 (docs/label-placement-plan.md): for a sufficiently elongated polygon ring,
+    // build a CurvedLabel following its principal axis (reusing addCurvedTextLabels).
+    // Returns false if the ring isn't a good curve candidate (too compact, degenerate, or
+    // the axis couldn't be cleanly clipped to the boundary) -- caller should fall back to
+    // a plain centroid point label in that case.
+    bool addCurvedPolygonLabel(const Line& _ring, const TextStyle::Parameters& _params,
+                               const LabelAttributes& _attributes, const DrawRule& _rule);
+
     bool handleBoundaryLabel(const Feature& _feat, const DrawRule& _rule,
                              const TextStyle::Parameters& _params);
 
