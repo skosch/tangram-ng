@@ -846,6 +846,51 @@ TextStyle::Parameters TextStyleBuilder::applyRule(const DrawRule& _rule,
     return p;
 }
 
+TextStyle::Parameters TextStyleBuilder::applySecondaryTextRule(const DrawRule& _rule,
+                                                                const Properties& _props,
+                                                                const TextStyle::Parameters& _primary) const {
+    const static std::string defaultWeight("400");
+    const static std::string defaultStyle("regular");
+    const static std::string defaultFamily("default");
+
+    // Start from a copy of the primary label's Parameters: fill, stroke, buffer, anchors,
+    // wrap/align/optional, and (via setRelative() at the call site) priority/collide
+    // inheritance all carry over unchanged -- only text and font are independent.
+    TextStyle::Parameters p = _primary;
+    p.text.clear();
+    p.textLeft.clear();
+    p.textRight.clear();
+
+    if (!getTextSource(StyleParamKey::text2_source, _rule, _props, p.text) || p.text.empty()) {
+        p.text.clear();
+        return p;
+    }
+
+    auto fontFamily = _rule.get<std::string>(StyleParamKey::text2_font_family);
+    fontFamily = (!fontFamily) ? &defaultFamily : fontFamily;
+
+    auto fontWeight = _rule.get<std::string>(StyleParamKey::text2_font_weight);
+    fontWeight = (!fontWeight) ? &defaultWeight : fontWeight;
+
+    float fontSize;
+    if (_rule.get(StyleParamKey::text2_font_size, fontSize)) {
+        p.fontSize = fontSize * m_style.pixelScale();
+    } // else: keep _primary's (already pixelScale'd) fontSize as a sane default
+
+    p.font = m_style.context()->getFont(*fontFamily, defaultStyle, *fontWeight, p.fontSize);
+    if (!p.font) {
+        LOGW("Missing font for %s / %s / %s / %d", fontFamily->c_str(), defaultStyle.c_str(),
+             fontWeight->c_str(), p.fontSize);
+        p.text.clear();
+        return p;
+    }
+
+    std::hash<TextStyle::Parameters> hash;
+    p.labelOptions.paramHash = hash(p);
+
+    return p;
+}
+
 #ifdef FONTCONTEXT_STB
 
 static std::wstring to_wstring(std::string const& s) {

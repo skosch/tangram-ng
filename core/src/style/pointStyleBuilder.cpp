@@ -3,6 +3,7 @@
 #include "data/properties.h"
 #include "data/propertyItem.h"
 #include "labels/labelCollider.h"
+#include "labels/labelProperty.h"
 #include "labels/spriteLabel.h"
 #include "log.h"
 #include "marker/marker.h"
@@ -625,7 +626,9 @@ bool PointStyleBuilder::addFeature(const Feature& _feat, const DrawRule& _rule) 
         TextStyle::Parameters params = textStyleBuilder.applyRule(_rule, _feat.props, true);
 
         TextStyleBuilder::LabelAttributes attrib;
-        if (textStyleBuilder.prepareLabel(params, Label::Type::point, attrib)) {
+        size_t primaryLabelsStart = textLabels.size();
+        bool havePrimary = textStyleBuilder.prepareLabel(params, Label::Type::point, attrib);
+        if (havePrimary) {
 
             for (size_t i = 0; i < iconsCount; i++) {
                 auto pLabel = static_cast<SpriteLabel*>(m_labels[iconsStart + i].get());
@@ -654,6 +657,68 @@ bool PointStyleBuilder::addFeature(const Feature& _feat, const DrawRule& _rule) 
 
                 // Link labels together
                 textLabels.back()->setRelative(*pLabel, definePriority, defineCollide);
+            }
+        }
+
+        // Secondary linked text label (docs/label-placement-plan.md Task 1): a second,
+        // independently-styled label (its own font weight/size via text2_*) linked to the
+        // SAME icon via setRelative() -- a sibling of the primary text label, not a child
+        // of it. The engine has no per-line/per-glyph-run font override (confirmed: one
+        // `alfons::Font` per TextStyle::Parameters, shaped as a single run in
+        // FontContext::layoutText) and Label's anchor/offset chain is only ever resolved
+        // one level deep (TextLabel::applyAnchor adds m_relative->dimension(), but never
+        // walks m_relative->relative()) -- so a true 3-level icon->name->elevation chain
+        // would need new chain-walking logic in applyAnchor. Instead: both labels are
+        // direct children of the icon (cheap, no applyAnchor changes needed), and the
+        // second one is pushed further out along its chosen anchor direction by the
+        // primary label's *actual measured* dimension (read back from the already-built
+        // primary TextLabel) plus a small gap, so it visually stacks below/above/beside
+        // the primary label instead of sitting on top of it. Marked `optional` so that if
+        // it can't be placed, only it is dropped -- see LabelCollider::killOccludedLabels,
+        // a required (non-optional) child that can't fit kills its *relative* (the icon),
+        // which would otherwise take the primary label down with it too.
+        // Known limitation: each label's anchor is cycled independently on collision
+        // (LabelManager::handleOcclusions), so if the icon+labels are involved in a
+        // collision retry the two text labels can end up on different anchors and drift
+        // apart. Acceptable for peaks (isolated POIs, collisions are rare); revisit if
+        // this mechanism is reused for denser point styles.
+        if (havePrimary && _rule.contains(StyleParamKey::text2_source)) {
+            TextStyle::Parameters params2 = textStyleBuilder.applySecondaryTextRule(_rule, _feat.props, params);
+            TextStyleBuilder::LabelAttributes attrib2;
+            if (!params2.text.empty() && textStyleBuilder.prepareLabel(params2, Label::Type::point, attrib2)) {
+
+                size_t primaryLabelsCount = textLabels.size() - primaryLabelsStart;
+
+                for (size_t i = 0; i < iconsCount; i++) {
+                    auto pLabel = static_cast<SpriteLabel*>(m_labels[iconsStart + i].get());
+                    glm::vec2 p = pLabel->modelCenter();
+
+                    glm::vec2 iconDim = pLabel->dimension();
+                    float iconRadiusPx = 0.5f * std::max(iconDim.x, iconDim.y);
+                    params2.labelOptions.anchors = textStyleBuilder.salienceOrderedAnchors(
+                        params2.labelOptions.anchors, p, glm::vec2(attrib2.width, attrib2.height), iconRadiusPx);
+
+                    // Push past the primary label's measured extent so the two don't
+                    // overlap. Uses the primary label actually built for this same icon
+                    // (falls back to 0 -- i.e. only the icon-radius offset applies -- if
+                    // for some reason the counts don't line up).
+                    glm::vec2 primaryDim(0);
+                    if (i < primaryLabelsCount) {
+                        primaryDim = textLabels[primaryLabelsStart + i]->dimension();
+                    }
+                    const float gapPx = 2.f * m_style.pixelScale();
+                    glm::vec2 dir = LabelProperty::anchorDirection(params2.labelOptions.anchors[0]);
+                    params2.labelOptions.offset += dir * (0.5f * primaryDim.y + gapPx);
+
+                    params2.labelOptions.optional = true;
+
+                    textStyleBuilder.addLabel(Label::Type::point, {{p, p}}, params2, attrib2, _rule);
+
+                    bool definePriority = !_rule.contains(StyleParamKey::text_priority);
+                    bool defineCollide = _rule.contains(StyleParamKey::collide)
+                        && !_rule.contains(StyleParamKey::text_collide);
+                    textLabels.back()->setRelative(*pLabel, definePriority, defineCollide);
+                }
             }
         }
     }

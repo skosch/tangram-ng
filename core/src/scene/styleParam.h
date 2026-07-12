@@ -57,6 +57,16 @@ enum class StyleParamKey : uint8_t {
     sprite,
     sprite_default,
     style,
+    // Secondary linked text label (docs/label-placement-plan.md Task 1): lets a point/
+    // icon draw rule attach a SECOND independently-styled text child (distinct font
+    // weight/size from the primary `text:` label) alongside the existing icon+text link,
+    // e.g. a peak's name (semibold) plus its elevation (regular weight) as two stacked
+    // labels instead of one combined multi-line string with a single font. See
+    // PointStyleBuilder::addFeature and TextStyleBuilder::applySecondaryTextRule.
+    text2_font_family,
+    text2_font_size,
+    text2_font_weight,
+    text2_source,
     text_align,
     text_anchor,
     text_buffer,

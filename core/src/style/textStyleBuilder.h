@@ -42,6 +42,16 @@ public:
 
     TextStyle::Parameters applyRule(const DrawRule& _rule, const Properties& _props, bool _iconText) const;
 
+    // Secondary linked text label (docs/label-placement-plan.md Task 1): builds a second,
+    // independently-styled Parameters set (own `text2_source`/`text2_font_*`) that shares
+    // everything else -- fill, stroke, buffer, anchors, priority/collide inheritance --
+    // with the already-built primary label `_primary`. Returns a Parameters with an empty
+    // `text` if `text2_source` isn't set on this rule, or evaluates empty for this feature,
+    // or the requested font can't be resolved; callers must check `.text.empty()` before
+    // using the result (mirrors applyRule's own "empty text = nothing to build" contract).
+    TextStyle::Parameters applySecondaryTextRule(const DrawRule& _rule, const Properties& _props,
+                                                 const TextStyle::Parameters& _primary) const;
+
     bool prepareLabel(TextStyle::Parameters& _params, Label::Type _type, LabelAttributes& _attributes);
 
     // Add label to the mesh using the prepared label data

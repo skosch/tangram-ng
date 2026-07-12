@@ -67,6 +67,10 @@ const std::map<std::string, StyleParamKey> s_StyleParamMap = {
     {"sprite", StyleParamKey::sprite},
     {"sprite_default", StyleParamKey::sprite_default},
     {"style", StyleParamKey::style},
+    {"text2:font:family", StyleParamKey::text2_font_family},
+    {"text2:font:size", StyleParamKey::text2_font_size},
+    {"text2:font:weight", StyleParamKey::text2_font_weight},
+    {"text2:text_source", StyleParamKey::text2_source},
     {"text:align", StyleParamKey::text_align},
     {"text:anchor", StyleParamKey::text_anchor},
     {"text:buffer", StyleParamKey::text_buffer},
@@ -193,6 +197,8 @@ StyleParam::Value StyleParam::parseNode(StyleParamKey key, const YAML::Node& nod
         }
         return time;
     }
+    case StyleParamKey::text2_font_family:
+    case StyleParamKey::text2_font_weight:
     case StyleParamKey::text_font_family:
     case StyleParamKey::text_font_weight:
     case StyleParamKey::text_font_style: {
@@ -228,6 +234,7 @@ StyleParam::Value StyleParam::parseNode(StyleParamKey key, const YAML::Node& nod
         }
         return placement;
     }
+    case StyleParamKey::text2_source:
     case StyleParamKey::text_source:
     case StyleParamKey::text_source_left:
     case StyleParamKey::text_source_right: {
@@ -260,6 +267,7 @@ StyleParam::Value StyleParam::parseNode(StyleParamKey key, const YAML::Node& nod
         LOGW("Invalid scalar value: %s", Dump(node).c_str());
         return std::string();
     }
+    case StyleParamKey::text2_font_size:
     case StyleParamKey::text_font_size: {
         float fontSize = 0.f;
         if (!node.IsScalar() || !parseFontSize(node.Scalar(), fontSize)) {
@@ -431,6 +439,7 @@ std::string StyleParam::toString() const {
         auto p = value.get<glm::vec2>();
         return k + "(" + std::to_string(p.x) + "px, " + std::to_string(p.y) + "px)";
     }
+    case StyleParamKey::text2_source:
     case StyleParamKey::text_source:
     case StyleParamKey::text_source_left:
     case StyleParamKey::text_source_right:
@@ -447,6 +456,8 @@ std::string StyleParam::toString() const {
     case StyleParamKey::text_transition_show_time:
     case StyleParamKey::transition_selected_time:
     case StyleParamKey::text_transition_selected_time:
+    case StyleParamKey::text2_font_family:
+    case StyleParamKey::text2_font_weight:
     case StyleParamKey::text_font_family:
     case StyleParamKey::text_font_weight:
     case StyleParamKey::text_font_style:
@@ -481,6 +492,7 @@ std::string StyleParam::toString() const {
     case StyleParamKey::outline_width:
     case StyleParamKey::text_font_stroke_width:
     case StyleParamKey::text_font_size:
+    case StyleParamKey::text2_font_size:
         if (!value.is<Width>()) break;
         return k + std::to_string(value.get<Width>().value);
     case StyleParamKey::order:
@@ -737,6 +749,7 @@ bool StyleParam::isOffsets(StyleParamKey _key) {
 bool StyleParam::isFontSize(StyleParamKey _key) {
     switch (_key) {
         case StyleParamKey::text_font_size:
+        case StyleParamKey::text2_font_size:
             return true;
         default:
             return false;
