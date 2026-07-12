@@ -29,6 +29,7 @@ MODULE_SOURCES = \
   src/gl/texture.cpp                  \
   src/gl/vao.cpp                      \
   src/gl/vertexLayout.cpp             \
+  src/labels/anchorOccupancyGrid.cpp  \
   src/labels/curvedLabel.cpp          \
   src/labels/label.cpp                \
   src/labels/labelCollider.cpp        \

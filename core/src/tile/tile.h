@@ -19,6 +19,7 @@ struct Properties;
 class Style;
 class View;
 struct StyledMesh;
+class AnchorOccupancyGrid;
 
 struct Raster {
     TileID tileID;
@@ -76,6 +77,14 @@ public:
     auto& rasters() { return m_rasters; }
     const auto& rasters() const { return m_rasters; }
 
+    /* Coarse per-tile index of water/road/trail vector geometry, built once from the
+     * tile's full raw layer data before any style's builder runs (see
+     * TileBuilder::build() and labels/anchorOccupancyGrid.h). Used by label builders
+     * (docs/label-placement-plan.md Phase 3) to steer anchor placement away from
+     * visually busy map features. May be null if the tile had no such geometry. */
+    void setAnchorOccupancyGrid(std::shared_ptr<const AnchorOccupancyGrid> _grid) { m_anchorOccupancyGrid = std::move(_grid); }
+    const std::shared_ptr<const AnchorOccupancyGrid>& anchorOccupancyGrid() const { return m_anchorOccupancyGrid; }
+
     /* Update the Tile considering the current view */
     void update(const View& _view, float _dt);
 
@@ -119,6 +128,7 @@ private:
     // Map of <Style>s and their associated <Mesh>es
     std::vector<std::unique_ptr<StyledMesh>> m_geometry;
     std::vector<Raster> m_rasters;
+    std::shared_ptr<const AnchorOccupancyGrid> m_anchorOccupancyGrid;
 
     mutable size_t m_memoryUsage = 0;
 

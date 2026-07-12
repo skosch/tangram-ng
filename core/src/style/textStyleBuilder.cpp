@@ -1,5 +1,6 @@
 #include "style/textStyleBuilder.h"
 
+#include "labels/anchorOccupancyGrid.h"
 #include "labels/curvedLabel.h"
 #include "labels/labelCollider.h"
 #include "labels/labelSet.h"
@@ -15,6 +16,7 @@
 #include "util/geom.h"
 #include "util/mapProjection.h"
 #include "util/lineSampler.h"
+#include "util/textureShading.h"
 #include "view/view.h"
 
 #ifdef FONTCONTEXT_STB
@@ -44,6 +46,8 @@ void TextStyleBuilder::setup(const Tile& _tile){
     // < 1.0 when overzooming a tile
     m_tileScale = pow(2, _tile.getID().s - _tile.getID().z);
     m_tileSize *= m_tileScale;
+
+    m_anchorOccupancyGrid = _tile.anchorOccupancyGrid();
 
     m_atlasRefs.reset();
 
@@ -284,6 +288,10 @@ bool TextStyleBuilder::addFeature(const Feature& _feat, const DrawRule& _rule) {
         if (_feat.geometryType == GeometryType::points) {
             for (auto& point : _feat.points) {
                 auto p = glm::vec2(point);
+                // Standalone text label (no linked icon) -- salience-aware anchor
+                // ordering (docs/label-placement-plan.md Phase 3), zero icon radius.
+                params.labelOptions.anchors = salienceOrderedAnchors(
+                    params.labelOptions.anchors, p, glm::vec2(attrib.width, attrib.height), 0.f);
                 addLabel(Label::Type::point, {{ p }}, params, attrib, _rule);
             }
 
@@ -293,6 +301,8 @@ bool TextStyleBuilder::addFeature(const Feature& _feat, const DrawRule& _rule) {
                 if (!polygon.empty()) {
                     glm::vec2 c;
                     c = centroid(polygon.front().begin(), polygon.front().end());
+                    params.labelOptions.anchors = salienceOrderedAnchors(
+                        params.labelOptions.anchors, c, glm::vec2(attrib.width, attrib.height), 0.f);
                     addLabel(Label::Type::point, {{ c }}, params, attrib, _rule);
                 }
             }
@@ -930,6 +940,103 @@ bool TextStyleBuilder::prepareLabel(TextStyle::Parameters& _params, Label::Type 
     }
 
     return false;
+}
+
+// anchorCandidateCost() intentionally scores only vector-feature proximity (water/
+// road/trail), not texture-shading/ridge avoidance, per a Phase 6 integration finding:
+// Phase 2 (util/textureShading.h) established that RasterSource::m_textures/m_mosaics
+// access is main-thread only, and this function -- like the rest of TextStyleBuilder/
+// PointStyleBuilder::addFeature() -- runs on a TileWorker thread (tileWorker.cpp), so
+// sampleTextureShading() cannot be called here at all, not even with a real
+// RasterSource. The same constraint forced Phase 2's own priority refinement into a
+// main-thread LabelManager pass (Label::refinePriority()); doing the equivalent for
+// anchor ordering would mean re-ordering/re-colliding labels after tile build, a real
+// redesign out of scope for this integration -- left as a documented future extension,
+// not attempted here.
+
+float TextStyleBuilder::anchorCandidateCost(LabelProperty::Anchor _anchor, glm::vec2 _tileLocalPos,
+                                            glm::vec2 _labelSizePixels, float _iconRadiusPixels) const {
+
+    glm::vec2 dir = LabelProperty::anchorDirection(_anchor);
+
+    // Candidate footprint: the label's measured bounding box, offset from the anchor
+    // position by icon_radius + half_label_extent in the anchor's direction (Frozen
+    // Interface Contract, docs/label-placement-plan.md). half_label_extent is taken as
+    // the half-diagonal of the label box so the offset is a sensible "clear of both the
+    // icon and the label" distance in every one of the 8 compass directions, including
+    // diagonals.
+    glm::vec2 halfExtentPx = _labelSizePixels * 0.5f;
+    float offsetPx = _iconRadiusPixels + glm::length(halfExtentPx);
+    glm::vec2 footprintCenterPx = dir * offsetPx;
+
+    // Convert pixel-space offsets to the normalized tile-local [0,1] space Feature
+    // geometry (and m_anchorOccupancyGrid) is expressed in. m_tileSize is "pixels per
+    // full tile width at this tile's build zoom" (see setup()), matching the same
+    // px/tile-unit conversion already used elsewhere in this file (e.g.
+    // addStraightTextLabels()'s `pixelSize = 1.0f/m_tileSize`).
+    glm::vec2 footprintCenterTile = footprintCenterPx / m_tileSize;
+    glm::vec2 halfExtentTile = halfExtentPx / m_tileSize;
+
+    // Sample a handful of points spread across the candidate footprint (not just its
+    // center), per the plan doc's "evaluated over the small candidate footprint... not
+    // just the center".
+    constexpr int kNumSamples = 5;
+    const glm::vec2 sampleOffsets[kNumSamples] = {
+        glm::vec2(0.f, 0.f),
+        glm::vec2(-1.f, -1.f), glm::vec2(1.f, -1.f),
+        glm::vec2(-1.f, 1.f), glm::vec2(1.f, 1.f),
+    };
+
+    float proximityCost = 0.f;
+
+    for (const auto& sampleOffset : sampleOffsets) {
+        glm::vec2 samplePosTile = _tileLocalPos + footprintCenterTile + sampleOffset * halfExtentTile;
+
+        if (m_anchorOccupancyGrid) {
+            proximityCost += m_anchorOccupancyGrid->sample(samplePosTile);
+        }
+    }
+
+    return proximityCost / float(kNumSamples);
+}
+
+LabelProperty::Anchors TextStyleBuilder::salienceOrderedAnchors(const LabelProperty::Anchors& _anchors,
+                                                                 glm::vec2 _tileLocalPos,
+                                                                 glm::vec2 _labelSizePixels,
+                                                                 float _iconRadiusPixels) const {
+    if (_anchors.count <= 1) {
+        // Nothing to reorder.
+        return _anchors;
+    }
+    if (!m_anchorOccupancyGrid) {
+        // Both cost terms unavailable (vector-proximity grid empty/absent for this
+        // tile, texture-shading always unavailable pre-Phase-6) -- every candidate
+        // costs 0, so a stable sort is a no-op. Skip the work.
+        return _anchors;
+    }
+
+    struct ScoredAnchor {
+        LabelProperty::Anchor anchor;
+        float cost;
+    };
+    std::array<ScoredAnchor, LabelProperty::max_anchors> scored;
+    int n = _anchors.count;
+    for (int i = 0; i < n; i++) {
+        LabelProperty::Anchor anchor = _anchors[i];
+        float cost = (anchor == LabelProperty::Anchor::center) ? 0.f
+            : anchorCandidateCost(anchor, _tileLocalPos, _labelSizePixels, _iconRadiusPixels);
+        scored[i] = { anchor, cost };
+    }
+
+    std::stable_sort(scored.begin(), scored.begin() + n,
+                      [](const ScoredAnchor& a, const ScoredAnchor& b) { return a.cost < b.cost; });
+
+    LabelProperty::Anchors result;
+    result.count = n;
+    for (int i = 0; i < n; i++) {
+        result.anchor[i] = scored[i].anchor;
+    }
+    return result;
 }
 
 Label* TextStyleBuilder::addLabel(Label::Type _type, TextLabel::Coordinates _coordinates,
