@@ -3,11 +3,30 @@
 #include "log.h"
 #include "platform.h"
 #include "tile/tile.h"
+#include "util/elevationManager.h"
 #include "util/geom.h"
 #include "util/mapProjection.h"
+#include "util/textureShading.h"
 #include "view/view.h"
 
+#include <algorithm>
+#include <cmath>
+
 namespace Tangram {
+
+namespace {
+// Mirrors the sqrt-compression-into-fractional-priority idiom already used by the scene's own
+// place_fn (assets/scenes/stylus-osm.yaml, "Math.round(Math.sqrt(population))/65536") -- keeps
+// the whole adjustment inside the fractional part of a tier-based priority (see
+// docs/label-placement-plan.md Phase 2, design step 3). `shade` is already a dimensionless,
+// roughly [0,1] value (Brown's contrast curve saturates towards 0/1), so unlike place_fn's
+// population/prominence-in-meters input, no extra normalization constant is needed before the
+// sqrt.
+float compressTextureShading(float shade) {
+    float x = std::max(0.f, shade);
+    return std::round(std::sqrt(x) * 4096.f) / 65536.f;
+}
+}
 
 const float Label::activation_distance_threshold = 2;
 
@@ -37,6 +56,7 @@ Label::~Label() {}
 
 void Label::setRelative(Label& _relative, bool _definePriority, bool _defineCollide) {
     m_relative = &_relative;
+    m_trackRelativePriority = _definePriority;
 
     if (_definePriority) {
         m_options.priority = _relative.options().priority;  //+ 0.5f;
@@ -47,6 +67,35 @@ void Label::setRelative(Label& _relative, bool _definePriority, bool _defineColl
     }
 
     applyAnchor(m_options.anchors[m_anchorIndex]);
+}
+
+void Label::syncRelativePriority() {
+    // docs/label-placement-plan.md Phase 2: setRelative() above only copies priority once, at
+    // tile-build time. A peak's icon label can have its priority updated later (main thread,
+    // see refinePriority() below) once the elevation mosaic becomes available, so a linked text
+    // label that tracks it (_definePriority was true) needs to keep re-copying it every frame
+    // rather than relying on that one-time copy going stale.
+    if (m_trackRelativePriority && m_relative) {
+        m_options.priority = m_relative->options().priority;
+    }
+}
+
+bool Label::refinePriority(ElevationManager& elevMgr, glm::dvec2 origin, double scale) {
+    if (!m_options.refinePriorityWithTextureShading) { return true; }
+    if (!elevMgr.m_elevationSource) { return false; }
+
+    ProjectedMeters worldPos = origin + glm::dvec2(modelCenter()) * scale;
+    bool ok = false;
+    float shade = sampleTextureShading(*elevMgr.m_elevationSource, worldPos, ok);
+    if (!ok) { return false; }
+
+    // Original priority (computed at tile-build time, see the peak draw rule's `priority:`
+    // function in stylus-osm.yaml) is always `global.priority.peak + <fractional in (0,1)>`
+    // (today's pure-elevation weighting), so its integer part reliably recovers the tier;
+    // replace the fractional part with the texture-shading-derived one -- see
+    // docs/label-placement-plan.md Phase 2, design step 3.
+    m_options.priority = std::floor(m_options.priority) - compressTextureShading(shade);
+    return true;
 }
 
 bool Label::visibleState() const {

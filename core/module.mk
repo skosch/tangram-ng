@@ -89,6 +89,7 @@ MODULE_SOURCES = \
   src/util/mapProjection.cpp          \
   src/util/skyManager.cpp             \
   src/util/stbImage.cpp               \
+  src/util/textureShading.cpp         \
   src/util/url.cpp                    \
   src/util/util.cpp                   \
   src/util/wuffs.c                    \
