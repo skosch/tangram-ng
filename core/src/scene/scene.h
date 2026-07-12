@@ -183,7 +183,12 @@ public:
     UpdateState update(RenderState& _rs, View& _view, float _dt);
 
     void renderBeginFrame(RenderState& _rs);
-    bool render(RenderState& _rs, View& _view);
+    // _backgroundBuffer, if non-null, is blitted from the default framebuffer's color
+    // contents right before the first text-type style draws each frame, and its texture
+    // bound as RenderState::backgroundTexture for TextStyle's per-pixel halo luminance
+    // sampling (docs/label-placement-plan.md Phase 4). Null (e.g. selection/offscreen
+    // render paths) simply skips the blit - TextStyle falls back to a full-strength halo.
+    bool render(RenderState& _rs, View& _view, FrameBuffer* _backgroundBuffer = nullptr);
     void renderSelection(RenderState& _rs, View& _view,
                          FrameBuffer& _selectionBuffer,
                          std::vector<SelectionQuery>& _selectionQueries);

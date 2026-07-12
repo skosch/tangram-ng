@@ -70,6 +70,11 @@ protected:
         UniformLocation uOrtho{"u_ortho"};
         UniformLocation uPass{"u_pass"};
         UniformLocation uMaxStrokeWidth{"u_max_stroke_width"};
+        // Background-adaptive halo (docs/label-placement-plan.md Phase 4): sampler for the
+        // per-frame default-framebuffer color snapshot (RenderState::backgroundTexture),
+        // read by sdf.fs's stroke pass to fade the halo out over light backgrounds. Only
+        // bound/used on m_mainUniforms - the selection pass doesn't draw halos.
+        UniformLocation uBackgroundTex{"u_background_tex"};
     } m_mainUniforms, m_selectionUniforms;
 
     mutable std::vector<std::unique_ptr<DynamicQuadMesh<TextVertex>>> m_meshes;

@@ -884,6 +884,21 @@ Scene::Styles SceneLoader::applyStyles(const Node& _node, SceneTextures& _textur
         auto name = entry.first.Scalar();
         const Node& styleConfig =  entry.second;
 
+        // A "styles:" entry naming an already-instantiated built-in style (e.g. "text")
+        // can't go through loadStyle() below: it intentionally refuses to construct a new
+        // Style object shadowing a built-in name (see the "Style with the same name as a
+        // built-in style are ignored" unit test). But scenes still need a way to attach
+        // custom shader uniforms/blocks to those built-ins - the same "shaders: uniforms:"
+        // mechanism used for e.g. hillshade's u_texture_shading_* gui_variables (used here
+        // for TextStyle's halo luminance thresholds, docs/label-placement-plan.md Phase 4).
+        // Apply style props directly onto the existing built-in instance instead.
+        auto builtinIt = std::find_if(styles.begin(), styles.end(),
+            [&](const std::unique_ptr<Style>& s) { return s->getName() == name; });
+        if (builtinIt != styles.end()) {
+            loadStyleProps(styleConfig, **builtinIt, _textures);
+            continue;
+        }
+
         auto style = loadStyle(name, styleConfig);
         if (!style) { continue; }
 
