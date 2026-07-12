@@ -26,6 +26,12 @@ enum class JoinTypes {
 
 JoinTypes JoinTypeFromString(const std::string& str);
 
+// Native grid resolution of the RasterStyle terrain mesh (rasterStyle.cpp) that 3D-terrain-draped
+//  polygons must tessellate on to match the ground exactly when they are NOT overzoomed relative
+//  to their data source (see PolygonBuilder::gridRes and PolygonStyleBuilder::setup, polygonStyle.cpp).
+//  Shared by both files so their grid densities can never drift apart.
+constexpr int kTerrainMeshGridRes = 64;
+
 /* Callback function for PolygonBuilder:
  *
  * @coord  tesselated output coordinate
@@ -51,8 +57,9 @@ struct PolygonBuilder {
     //  polygon bleed through ridges in front of it). Vertices are placed on the terrain mesh's own
     //  piecewise-linear surface (getTerrainMeshElevation, elevation.yaml), so the grid's only job is
     //  ensuring no triangle spans more than one terrain-lattice cell: use a power-of-two multiple of
-    //  the RasterStyle mesh resolution (64) covering the worst-case overzoom of the vector source
-    //  relative to the elevation source - see terrain_grid on unlit-polygons in stylus-osm.yaml.
+    //  kTerrainMeshGridRes (the RasterStyle mesh resolution), scaled up per-tile for however overzoomed
+    //  that tile actually is relative to its data source, capped at the style's configured worst-case
+    //  ceiling - see terrain_grid on unlit-polygons in stylus-osm.yaml and PolygonStyleBuilder::setup.
     //  See Builders::buildPolygon().
     int gridRes = 0;
 

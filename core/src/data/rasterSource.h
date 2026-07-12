@@ -164,6 +164,19 @@ struct ElevationMosaicInfo {
     // All 8 neighbor bits set == kAllRealNeighborsMask means the ring is complete. Drives the
     // R2 patch-upload debounce below (tile-pipeline-perf-plan.md).
     uint16_t neighborMask = 0;
+    // Mosaics only: strong refs to each same-zoom neighbor's texture that this mosaic's cells
+    // were actually stitched from (real data only -- a mirror-extrapolated cell has no entry
+    // here), indexed the same way as neighborMask ((dy+1)*3+(dx+1); index 4 unused). m_textures
+    // only holds WEAK refs, so without this a neighbor tile that's still referenced by nothing
+    // else (e.g. it isn't a Tile's own visible raster right now, just data this mosaic
+    // borrowed) can be evicted the instant it's cached -- then the next time THIS mosaic
+    // rebuilds (styling-zoom churn, cache eviction of the center tile, etc.) it finds that
+    // neighbor gone and silently downgrades that cell to mirror-extrapolation, reintroducing a
+    // seam that wasn't there a moment ago (2026-07 UX report: "edge artifacts... even at
+    // zenith... fine most of the time" -- confirmed via mosaicNeighborRegression* counters
+    // firing repeatedly under real cache pressure). Mirrors the exact reasoning already applied
+    // to ownTexture/plainTexture above, extended to the other 8 textures a mosaic depends on.
+    std::array<std::shared_ptr<Texture>, 9> neighborTextures;
     // Mosaics only: steady_clock seconds this mosaic was first marked dirty by
     // RasterSource::patchNeighborMosaics() since its last GPU-upload flush; 0 means "not
     // currently dirty". A patched mosaic's `resize()` (full re-upload + mip regen on next

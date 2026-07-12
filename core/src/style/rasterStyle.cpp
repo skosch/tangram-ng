@@ -4,6 +4,7 @@
 #include "gl/mesh.h"
 #include "gl/shaderProgram.h"
 #include "log.h"
+#include "util/builders.h"
 
 constexpr float position_scale = 8192.0f;
 
@@ -58,7 +59,7 @@ void RasterStyle::constructShaderProgram() {
 void RasterStyle::build(const Scene& _scene) {
     Style::build(_scene);
 
-    uint32_t resolution = _scene.elevationManager() ? 64 : 1;
+    uint32_t resolution = _scene.elevationManager() ? kTerrainMeshGridRes : 1;
     float elementSize = 1.f / resolution;
     uint16_t index = 0;
     MeshData<RasterVertex> meshData;

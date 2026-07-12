@@ -240,6 +240,22 @@ bool TileManager::updateTileSets(const View& _view) {
     // pass, since it's built from tile-set contents that this very pass will go on to mutate.
     m_upgradeRasterCache.clear();
 
+    // UX diagnosis (2026-07-11): see m_areaDiagRefTile's doc comment in tileManager.h. Pick a
+    // fresh reference tile from the camera's current look-at target the moment each capture
+    // starts (edge-detected via the capturing-state transition), then log that SAME tile's true
+    // continuous on-screen area every frame for the rest of the capture, regardless of whether
+    // it ends up actually visible/subdivided this frame - we want the raw geometry, not the
+    // discretized LOD decision.
+    bool capturingNow = Profiler::isCapturing();
+    if (capturingNow && !m_areaDiagCapturing) {
+        auto pos = _view.getPosition();
+        m_areaDiagRefTile = MapProjection::projectedMetersTile(glm::dvec2(pos.x, pos.y), 16);
+    }
+    m_areaDiagCapturing = capturingNow;
+    if (capturingNow && m_areaDiagRefTile != NOT_A_TILE) {
+        Profiler::counter("areaDiagRefTileArea", double(_view.getTileScreenArea(m_areaDiagRefTile)));
+    }
+
     if (!getDebugFlag(DebugFlags::freeze_tiles)) {
 
         float maxEdge = 2 * _view.pixelScale() * float(MapProjection::tileSize());
@@ -272,14 +288,38 @@ bool TileManager::updateTileSets(const View& _view) {
                 // substantial redesign needed for something like this to work:
                 //for (auto& rs : tileSet.source->rasterSources()) { maxZoom = std::max(maxZoom, rs->maxZoom()); }
                 int maxZoom = std::min(tileSet.source->maxZoom(), _view.getIntegerZoom() - zoomBias);
-                if (tileId.z >= maxZoom || area < effMaxArea*std::exp2(2*float(zoomBias))) {
+                bool stoppedByMaxZoom = tileId.z >= maxZoom;
+                if (stoppedByMaxZoom || area < effMaxArea*std::exp2(2*float(zoomBias))) {
+                    // Perf/UX diagnosis (2026-07-11): lodAreaBias (the "resolution retention"
+                    // sliders) only ever loosens the AREA half of this OR - it can never push a
+                    // tile past `maxZoom`, which is a single value for the WHOLE view
+                    // (_view.getIntegerZoom(), not per-tile/per-distance). If distant tiles are
+                    // stopping here because of maxZoom rather than the area threshold, no amount
+                    // of lodAreaBias will ever change their resolution - these counters make that
+                    // distinguishable instead of guessed at.
+                    if (Profiler::isCapturing()) {
+                        const char* srcName = tileSet.source->name().c_str();
+                        if (stoppedByMaxZoom) {
+                            Profiler::counterAdd(Profiler::intern(std::string("stopByMaxZoom:") + srcName), 1);
+                            Profiler::counter(Profiler::intern(std::string("stopZoomByMaxZoom:") + srcName), double(tileId.z));
+                        } else {
+                            Profiler::counterAdd(Profiler::intern(std::string("stopByArea:") + srcName), 1);
+                            Profiler::counter(Profiler::intern(std::string("stopZoomByArea:") + srcName), double(tileId.z));
+                        }
+                    }
                     TileID visId = tileId;
                     // Ensure that s = z + bias (larger s OK if overzoomed) so that proxy tiles can be found
                     // - otherwise, we get frames where tiles disappear due to no proxy for new tile
                     if (visId.z < tileSet.source->maxZoom()) {
                         visId.s = visId.z + zoomBias;
                     } else {
-                        int s = tileId.z + std::max(0, int(std::ceil(std::log2(area/effMaxArea)/2)));
+                        // Perf/UX (2026-07-11): overzoomStepExponent (default 2.0, i.e. today's
+                        // exact behavior) controls how many doublings of on-screen area must pass
+                        // before `s` - and so e.g. the elevation mosaic's composite resolution -
+                        // steps up by one whole level; raising it spaces those same-size jumps
+                        // further apart in distance/zoom, see ZoomOptions::overzoomStepExponent.
+                        float stepExponent = tileSet.source->overzoomStepExponent();
+                        int s = tileId.z + std::max(0, int(std::ceil(std::log2(area/effMaxArea)/stepExponent)));
                         visId.s = std::max(std::min(s, _view.getIntegerZoom()), visId.z + zoomBias);
                     }
                     tileSet.visibleTiles.insert(visId);

@@ -16,6 +16,7 @@
 #include "glm/vec2.hpp"
 #include "glm/vec3.hpp"
 #include "glm/gtc/type_precision.hpp"
+#include <algorithm>
 #include <cmath>
 
 #include "polygon_fs.h"
@@ -110,9 +111,20 @@ public:
 
     void setup(const Tile& _tile) override {
         m_tileUnitsPerMeter = _tile.getInverseScale();
-        m_zoom = _tile.getID().z;
+        auto id = _tile.getID();
+        m_zoom = id.z;
         m_meshData.clear();
-        m_builder.gridRes = m_style.activeTerrainGrid();
+        // activeTerrainGrid() is sized for the worst-case overzoom (style's data source vs. the
+        //  elevation source's max_zoom), but most tiles aren't overzoomed at all - id.s > id.z only
+        //  when this tile is being displayed finer than its own data zoom. Scale the grid down to
+        //  match how overzoomed THIS tile actually is, so the common (non-overzoomed) case ends up
+        //  exactly at kTerrainMeshGridRes, matching the terrain mesh's own native grid density
+        //  (rasterStyle.cpp) instead of needlessly tessellating finer than the ground it sits on.
+        //  Never exceeds the configured ceiling, so the worst-case tiles are unaffected.
+        int overzoomLevels = std::max(0, int(id.s) - int(id.z));
+        m_builder.gridRes = m_style.activeTerrainGrid() > 0
+            ? std::min(m_style.activeTerrainGrid(), kTerrainMeshGridRes << overzoomLevels)
+            : 0;
     }
 
     void setup(const Marker& _marker, int zoom) override {

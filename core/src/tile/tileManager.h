@@ -180,6 +180,20 @@ protected:
     // pass and cleared at the top of updateTileSets() below.
     std::unordered_map<RasterSource*, std::pair<std::set<TileID>, std::set<TileID>>> m_upgradeRasterCache;
 
+    // UX diagnosis (2026-07-11): a user report of non-monotonic detail (fine -> smoother ->
+    // fine again on a single mountainside while panning) can't be explained by the `s`-staircase
+    // alone (area strictly shrinking with distance would only ever produce a monotonic falloff).
+    // On sloped terrain, true on-screen tile AREA also depends on the local surface's orientation
+    // relative to the view ray (foreshortening), so a genuinely non-monotonic area curve while
+    // panning along a slope is possible without being a bug - but View::getTileScreenArea() has
+    // enough conditional branches (elevation-aware culling, near/far corner projection) that a
+    // real computational anomaly can't be ruled out from reading the code alone either. Track one
+    // fixed world-space reference tile (picked from the camera's look-at target the moment a
+    // capture starts) and log its ACTUAL continuous area every frame while capturing, so the next
+    // trace shows the real area-vs-time curve instead of just the discretized z/s result.
+    bool m_areaDiagCapturing = false;
+    TileID m_areaDiagRefTile = NOT_A_TILE;
+
 };
 
 }

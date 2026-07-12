@@ -325,11 +325,28 @@ std::shared_ptr<Texture> stitchElevationMosaic(const std::shared_ptr<Texture>& o
 
     int mosaicW = 3 * Wp;
     size_t mosaicRowBytes = size_t(mosaicW) * size_t(bpp);
-    std::vector<GLubyte> mosaic(mosaicRowBytes * size_t(mosaicW));
+
+    // Reuse one persistent scratch buffer across calls instead of heap-allocating a fresh
+    // ~9x-tile-sized (e.g. ~7-9MB for a 512px elevation tile) vector on every stitch: this
+    // function was profiled as the single biggest main-thread CPU cost (~30% of capture time),
+    // and the allocation/deallocation itself -- not the per-row memcpy work below -- was the
+    // waste (see docs/tile-pipeline-perf-plan.md). `static thread_local` rather than a plain
+    // `static` is a defensive habit, not a requirement: stitchElevationMosaic() is only ever
+    // called from RasterSource::buildElevationMosaic() on the main thread (same thread-safety
+    // contract as getTexture() above -- see the note on RasterTileTask::addRaster()), so a
+    // plain function-local static would already be safe here; thread_local just costs nothing
+    // extra and avoids relying on that invariant never changing elsewhere. resize() never
+    // shrinks capacity, so repeated calls at the same (or smaller) mosaic size reuse the
+    // existing allocation with no new malloc/free at all. Every byte is unconditionally
+    // overwritten below (own cell + all 8 neighbor cells, real or mirror-extrapolated) before
+    // the buffer is read, so there is no dependency on prior contents or zero-initialization.
+    static thread_local std::vector<GLubyte> s_scratchMosaic;
+    s_scratchMosaic.resize(mosaicRowBytes * size_t(mosaicW));
+    GLubyte* mosaic = s_scratchMosaic.data();
 
     // Tile's own data occupies the center third [Wp, 2Wp) x [Wp, 2Wp) -- see
     // docs/texture-shading-plan.md "Frozen Interface Contract".
-    copyMosaicCell(mosaic.data(), Wp, W, bpp, 0, 0, ownData);
+    copyMosaicCell(mosaic, Wp, W, bpp, 0, 0, ownData);
 
     for (int dy = -1; dy <= 1; dy++) {
         for (int dx = -1; dx <= 1; dx++) {
@@ -340,9 +357,9 @@ std::shared_ptr<Texture> stitchElevationMosaic(const std::shared_ptr<Texture>& o
             if (neighborTex && neighborTex->bufferData() &&
                 neighborTex->width() == W && neighborTex->height() == W &&
                 neighborTex->getOptions().bytesPerPixel() == bpp) {
-                copyMosaicCell(mosaic.data(), Wp, W, bpp, dx, dy, neighborTex->bufferData());
+                copyMosaicCell(mosaic, Wp, W, bpp, dx, dy, neighborTex->bufferData());
             } else {
-                fillMirroredNeighborCell(mosaic.data(), Wp, W, bpp, dx, dy, ownData);
+                fillMirroredNeighborCell(mosaic, Wp, W, bpp, dx, dy, ownData);
             }
         }
     }
@@ -362,7 +379,7 @@ std::shared_ptr<Texture> stitchElevationMosaic(const std::shared_ptr<Texture>& o
     // RasterSource::patchNeighborMosaics() can overwrite individual cells in place when
     // late-arriving neighbor tiles replace their mirror-extrapolated placeholders.
     auto tex = std::make_shared<Texture>(options, false);
-    tex->setPixelData(mosaicW, mosaicW, bpp, mosaic.data(), mosaic.size());
+    tex->setPixelData(mosaicW, mosaicW, bpp, mosaic, s_scratchMosaic.size());
 
     return tex;
 }
@@ -833,11 +850,22 @@ std::shared_ptr<Texture> RasterSource::buildElevationMosaic(TileID _tile, const 
         // No composite achievable right now. Keep an existing mosaic (even a composite-centered
         // one -- its data is closer to any overzoomed target than the plain texture) rather
         // than downgrading; only build fresh (plain-centered) when there is nothing yet.
-        if (existing) { return existing; }
-        if (!_ownTexture) { return nullptr; }      // nothing available to build anything from
+        if (existing) {
+            // Fast-path: reusing the already-live mosaic, no stitchElevationMosaic() call below.
+            Profiler::counterAdd("mosaicCacheHit", 1);
+            return existing;
+        }
+        if (!_ownTexture) {
+            // Fast-path: nothing available to build anything from either -- still an early
+            // return that never reaches stitchElevationMosaic() below.
+            Profiler::counterAdd("mosaicCacheHit", 1);
+            return nullptr;      // nothing available to build anything from
+        }
         ownForMosaic = _ownTexture;
     } else if (existingInfo && existingInfo->ownTexture == ownForMosaic) {
-        // Nothing has actually changed since the live mosaic was built -- share it unchanged.
+        // Fast-path: nothing has actually changed since the live mosaic was built -- share it
+        // unchanged, no stitchElevationMosaic() call below.
+        Profiler::counterAdd("mosaicCacheHit", 1);
         return existing;
     }
 
@@ -881,6 +909,11 @@ std::shared_ptr<Texture> RasterSource::buildElevationMosaic(TileID _tile, const 
         }
     }
 
+    // Every early return above (all three fast paths) counted itself as mosaicCacheHit and
+    // returned before reaching here, so anything that falls through to this point is exactly
+    // the expensive path: a real stitchElevationMosaic() call. Every call to buildElevationMosaic()
+    // hits exactly one of these two counters.
+    Profiler::counterAdd("mosaicFullRebuild", 1);
     auto mosaic = stitchElevationMosaic(ownForMosaic, neighbors);
 
     if (mosaic) {
@@ -922,8 +955,28 @@ std::shared_ptr<Texture> RasterSource::buildElevationMosaic(TileID _tile, const 
                     if (nb && nb->bufferData() && nb->width() == W && nb->height() == W &&
                         nb->getOptions().bytesPerPixel() == bpp) {
                         info->neighborMask |= uint16_t(1u << (size_t(dy + 1) * 3 + size_t(dx + 1)));
+                        // Keep this neighbor's texture alive for as long as THIS mosaic
+                        // references its data -- see ElevationMosaicInfo::neighborTextures.
+                        info->neighborTextures[size_t(dy + 1) * 3 + size_t(dx + 1)] = nb;
                     }
                 }
+            }
+        }
+        // UX diagnosis (2026-07-11): a neighbor cell that read real in the PREVIOUS mosaic but
+        // mirror-extrapolated in THIS rebuild means that neighbor tile's texture was evicted
+        // between the two builds - nothing keeps a neighbor's Texture alive the way `own`'s is
+        // deliberately kept alive via userData above (that fix was for exactly this class of bug,
+        // but only for the center tile; neighbors are looked up fresh via getTexture() every
+        // rebuild with no equivalent protection). This directly reintroduces a texture-shading
+        // seam that wasn't there a moment ago, independent of tilt - see the "edge artifacts even
+        // at zenith, fine most of the time" report.
+        if (existingInfo) {
+            uint16_t lost = existingInfo->neighborMask & ~info->neighborMask;
+            if (lost != 0) {
+                int lostCount = 0;
+                for (uint16_t m = lost; m; m &= uint16_t(m - 1)) { ++lostCount; }
+                Profiler::counterAdd("mosaicNeighborRegressionCells", lostCount);
+                Profiler::counterAdd("mosaicNeighborRegressionEvents", 1);
             }
         }
         mosaic->userData = std::move(info);
@@ -1138,6 +1191,12 @@ void RasterSource::patchNeighborMosaics(const TileID& _tileId, const std::shared
             if (mosaic->userData) {
                 auto* info = static_cast<ElevationMosaicInfo*>(mosaic->userData.get());
                 info->neighborMask |= uint16_t(1u << (size_t(-dy + 1) * 3 + size_t(-dx + 1)));
+                // Keep this newly-arrived neighbor's texture alive too - see
+                // ElevationMosaicInfo::neighborTextures. Without this, a cell patched in here
+                // (rather than found during buildElevationMosaic's own rebuild) would have no
+                // strong ref protecting it, and could still be evicted before any subsequent
+                // rebuild, silently re-losing exactly the data this patch just restored.
+                info->neighborTextures[size_t(-dy + 1) * 3 + size_t(-dx + 1)] = _texture;
                 if (info->firstDirtyTime == 0.0) { info->firstDirtyTime = nowSeconds(); }
             } else {
                 // No info to track dirty state against (shouldn't happen - every registered
