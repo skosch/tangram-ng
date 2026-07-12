@@ -290,7 +290,21 @@ bool TextStyleBuilder::addFeature(const Feature& _feat, const DrawRule& _rule) {
         } else if (_feat.geometryType == GeometryType::polygons) {
             const auto& polygons = _feat.polygons;
             for (const auto& polygon : polygons) {
-                if (!polygon.empty()) {
+                if (polygon.empty() || polygon.front().empty()) { continue; }
+
+                // Phase 5 (docs/label-placement-plan.md): elongated polygons (lakes,
+                // parks, forests) get a curved label along their principal axis instead
+                // of a bare centroid point. Only attempt this for simple polygons (a
+                // single ring, i.e. no holes) with no line-offset/complex-shaping text,
+                // matching the preconditions addLineTextLabels already uses for curved
+                // line labels -- anything else falls back to the point label below.
+                bool curved = false;
+                if (polygon.size() == 1 && !params.hasComplexShaping &&
+                    params.labelOptions.offset == glm::vec2(0)) {
+                    curved = addCurvedPolygonLabel(polygon.front(), params, attrib, _rule);
+                }
+
+                if (!curved) {
                     glm::vec2 c;
                     c = centroid(polygon.front().begin(), polygon.front().end());
                     addLabel(Label::Type::point, {{ c }}, params, attrib, _rule);
@@ -580,6 +594,44 @@ void TextStyleBuilder::addCurvedTextLabels(const Line& _line, const TextStyle::P
         m_labels.back()->debugTag = _params.text;
 #endif
     }
+}
+
+// Elongation ratio (major/minor axis, see util/geom.h PolygonAxis) above which a polygon
+// label is curved along its principal axis instead of sitting at a bare centroid point.
+// Tuned by eye; per docs/label-placement-plan.md Phase 5 this needs human visual tuning.
+static constexpr float kPolygonLabelElongationThreshold = 1.5f;
+
+bool TextStyleBuilder::addCurvedPolygonLabel(const Line& _ring, const TextStyle::Parameters& _params,
+                                             const LabelAttributes& _attributes, const DrawRule& _rule) {
+    if (_ring.size() < 3) { return false; }
+
+    PolygonAxis axis = polygonPrincipalAxis(_ring.begin(), _ring.end());
+    if (axis.elongation < kPolygonLabelElongationThreshold) { return false; }
+
+    glm::vec2 start, end;
+    if (!clipLineToPolygon(axis.center, axis.direction, _ring.begin(), _ring.end(), start, end)) {
+        return false;
+    }
+
+    // Trim inward by a small margin so the text doesn't touch the shoreline/boundary.
+    float pixelSize = 1.0f / m_tileSize;
+    float chordLen = glm::length(end - start);
+    if (chordLen < 1e-9f) { return false; }
+    glm::vec2 dir = (end - start) / chordLen;
+    float margin = std::min(8.f * pixelSize, 0.2f * chordLen);
+    start += dir * margin;
+    end -= dir * margin;
+
+    // Same minimal-length heuristic addCurvedTextLabels uses internally -- check it here
+    // too so we can cleanly fall back to a point label instead of silently adding nothing.
+    float minLength = _attributes.width * pixelSize * 0.6f;
+    if (glm::length(end - start) < minLength) { return false; }
+
+    Line line = { start, end };
+
+    size_t labelsBefore = m_labels.size();
+    addCurvedTextLabels(line, _params, _attributes, _rule);
+    return m_labels.size() > labelsBefore;
 }
 
 void TextStyleBuilder::addLineTextLabels(const Feature& _feat, const TextStyle::Parameters& _params,

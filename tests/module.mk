@@ -12,6 +12,7 @@ MODULE_SOURCES = \
   unit/dukTests.cpp \
   unit/fileTests.cpp \
   unit/flyToTest.cpp \
+  unit/geomTests.cpp \
   unit/jobQueueTests.cpp \
   unit/labelsTests.cpp \
   unit/labelTests.cpp \
