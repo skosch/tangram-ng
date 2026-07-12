@@ -95,6 +95,11 @@ void TextStyle::onBeginDrawFrame(RenderState& rs, const View& _view) {
         m_shaderProgram->setUniformi(rs, m_mainUniforms.uBackgroundTex, bgTexUnit);
     }
 
+    // Not yet visually tuned - see m_mainUniforms.uHaloLuminanceDark's comment for why
+    // these are plain constants rather than scene-config-driven.
+    m_shaderProgram->setUniformf(rs, m_mainUniforms.uHaloLuminanceDark, 0.35f);
+    m_shaderProgram->setUniformf(rs, m_mainUniforms.uHaloLuminanceLight, 0.75f);
+
     if (m_sdf) {
         m_shaderProgram->setUniformi(rs, m_mainUniforms.uPass, 1);
 

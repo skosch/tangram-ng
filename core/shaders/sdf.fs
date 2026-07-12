@@ -23,6 +23,12 @@ uniform LOWP int u_pass;
 // bound here by TextStyle::onBeginDrawFrame. Sampled per-fragment in the stroke pass below
 // so halo visibility reacts to what's actually underneath, not a per-label flag.
 uniform sampler2D u_background_tex;
+// Halo fade-out thresholds, set unconditionally in TextStyle::onBeginDrawFrame - see
+// TextStyle::UniformBlock::uHaloLuminanceDark's comment for why these are hardcoded here
+// rather than injected via the "#pragma tangram: uniforms" block below (this file is
+// shared by several distinct TextStyle-derived Style objects, not just one).
+uniform float u_halo_luminance_dark;
+uniform float u_halo_luminance_light;
 
 #pragma tangram: uniforms
 
