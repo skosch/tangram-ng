@@ -224,6 +224,10 @@ void GL::deleteRenderbuffers(GLsizei n, const GLuint *renderbuffers) {
 GLenum GL::checkFramebufferStatus(GLenum target) {
     return 0;
 }
+void GL::blitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
+                         GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1,
+                         GLbitfield mask, GLenum filter) {
+}
 
 // timer queries unavailable in mock GL: Profiler::GpuZone is a silent no-op
 bool GL::timerQueriesSupported() {

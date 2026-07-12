@@ -343,6 +343,12 @@ GLenum GL::checkFramebufferStatus(GLenum target) {
     return status;
 }
 
+void GL::blitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
+                         GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1,
+                         GLbitfield mask, GLenum filter) {
+    GL_CHECK(glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter));
+}
+
 // GPU timestamp queries for debug/profiler.cpp. Only wired up for TANGRAM_LINUX for now: the
 // desktop ARB_timer_query entry points are exported by GLVND libOpenGL and Mesa dispatches them
 // on GLES contexts exposing GL_EXT_disjoint_timer_query as well (shared dispatch slots). Other

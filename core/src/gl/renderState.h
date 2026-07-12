@@ -97,6 +97,11 @@ public:
 
     bool framebuffer(GLuint handle);
 
+    // Resync the framebuffer state cache after a raw GL_READ_FRAMEBUFFER/GL_DRAW_FRAMEBUFFER
+    // bind (glBlitFramebuffer) bypassed framebuffer() above - forces the next framebuffer()
+    // call to re-issue glBindFramebuffer even if the handle matches the stale cached value.
+    void invalidateFramebuffer();
+
     bool viewport(GLint x, GLint y, GLsizei width, GLsizei height);
 
     void indexBufferUnset(GLuint handle);
@@ -129,6 +134,14 @@ public:
     friend class Scene;
 
     //GLuint m_terrainDepthTexture = 0;
+
+    // Background-adaptive halo (docs/label-placement-plan.md Phase 4): GL texture handle of
+    // the current frame's default-framebuffer color snapshot, blitted by Scene::render right
+    // before text styles draw (see FrameBuffer::blitColorFrom). 0 if not yet populated this
+    // frame (e.g. before the first resize). Set here - rather than threaded through as a
+    // parameter - following the same precedent as the (currently unused) m_terrainDepthTexture
+    // above and PointStyle's commented-out consumer of it.
+    GLuint backgroundTexture = 0;
 
 protected:
     void setFrameTime(float _time) { m_frameTime = _time; }
