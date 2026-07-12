@@ -605,6 +605,19 @@ bool PointStyleBuilder::addFeature(const Feature& _feat, const DrawRule& _rule) 
             for (size_t i = 0; i < iconsCount; i++) {
                 auto pLabel = static_cast<SpriteLabel*>(m_labels[iconsStart + i].get());
                 glm::vec2 p = pLabel->modelCenter();
+
+                // Salience-aware anchor ordering (docs/label-placement-plan.md Phase 3):
+                // steer the linked text label's anchor fallback order away from nearby
+                // water/road/trail geometry (and, once Phase 2 lands, ridge/canyon
+                // texture-shading response) instead of always trying the fixed compass
+                // order first. Icon radius approximated as half the sprite's larger
+                // dimension. The sorted list is handed to the existing anchor-cycling
+                // mechanism unchanged -- no collision/occlusion code is touched.
+                glm::vec2 iconDim = pLabel->dimension();
+                float iconRadiusPx = 0.5f * std::max(iconDim.x, iconDim.y);
+                params.labelOptions.anchors = textStyleBuilder.salienceOrderedAnchors(
+                    params.labelOptions.anchors, p, glm::vec2(attrib.width, attrib.height), iconRadiusPx);
+
                 textStyleBuilder.addLabel(Label::Type::point, {{p, p}}, params, attrib, _rule);
 
                 bool definePriority = !_rule.contains(StyleParamKey::text_priority);

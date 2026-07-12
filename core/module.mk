@@ -29,6 +29,7 @@ MODULE_SOURCES = \
   src/gl/texture.cpp                  \
   src/gl/vao.cpp                      \
   src/gl/vertexLayout.cpp             \
+  src/labels/anchorOccupancyGrid.cpp  \
   src/labels/curvedLabel.cpp          \
   src/labels/label.cpp                \
   src/labels/labelCollider.cpp        \
@@ -89,6 +90,7 @@ MODULE_SOURCES = \
   src/util/mapProjection.cpp          \
   src/util/skyManager.cpp             \
   src/util/stbImage.cpp               \
+  src/util/textureShading.cpp         \
   src/util/url.cpp                    \
   src/util/util.cpp                   \
   src/util/wuffs.c                    \
