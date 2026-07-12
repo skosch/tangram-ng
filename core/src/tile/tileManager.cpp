@@ -1,5 +1,6 @@
 #include "tile/tileManager.h"
 
+#include "debug/profiler.h"
 #include "data/tileSource.h"
 #include "data/rasterSource.h"
 #include "map.h"
@@ -234,6 +235,10 @@ bool TileManager::updateTileSets(const View& _view) {
     m_tiles.clear();
     m_tilesInProgress = 0;
     m_tileSetChanged = false;
+    // Perf: drop last pass's elevSet lookup/rendered/ready cache (see m_upgradeRasterCache's doc
+    // comment in tileManager.h) - it is only valid for the duration of a single updateTileSets()
+    // pass, since it's built from tile-set contents that this very pass will go on to mutate.
+    m_upgradeRasterCache.clear();
 
     if (!getDebugFlag(DebugFlags::freeze_tiles)) {
 
@@ -303,9 +308,15 @@ bool TileManager::updateTileSets(const View& _view) {
     // the elevation tileSet's own completions do, and both must see this cycle's reset rather
     // than whichever tileSet happens to iterate first getting a stale/zero budget.
     const int kStitchBudgetPerUpdate = 2;
+    // Perf (2026-07 profiling): same reasoning as kStitchBudgetPerUpdate above, but for
+    // flushDirtyMosaics()'s GPU re-upload (see RasterSource::m_uploadBudget) - reset alongside
+    // the stitch budget, before any tileSet (and so any flushDirtyMosaics() call) runs this cycle.
+    const int kUploadBudgetPerUpdate = 12;
     for (auto& tileSet : m_tileSets) {
         if (tileSet.source->isRaster()) {
-            static_cast<RasterSource*>(tileSet.source.get())->resetStitchBudget(kStitchBudgetPerUpdate);
+            auto* rasterSource = static_cast<RasterSource*>(tileSet.source.get());
+            rasterSource->resetStitchBudget(kStitchBudgetPerUpdate);
+            rasterSource->resetUploadBudget(kUploadBudgetPerUpdate);
         }
     }
 
@@ -348,11 +359,22 @@ bool TileManager::updateTileSets(const View& _view) {
         }
     }
 
+    if (Profiler::isCapturing()) {
+        size_t proxyTiles = 0;
+        for (const auto& tile : m_tiles) { if (tile->isProxy()) { ++proxyTiles; } }
+        Profiler::counter("visibleTiles", double(m_tiles.size()));
+        Profiler::counter("proxyTiles", double(proxyTiles));
+        Profiler::counter("pendingTiles", double(m_tilesInProgress));
+        Profiler::counter("tileCacheEntries", double(m_tileCache->getNumEntries()));
+        Profiler::counter("tileCacheKB", double(m_tileCache->getMemoryUsage()) / 1024.0);
+    }
+
     return m_tileSetChanged;
 }
 
 void TileManager::updateTileSet(TileSet& _tileSet, const ViewState& _view) {
 
+    PROFILE_SCOPE(Profiler::intern("updateTileSet:" + _tileSet.source->name()));
     //FrameInfo::scope _trace("updateTileSet " + _tileSet.source->name());
 
     if (_tileSet.sourceGeneration != _tileSet.source->generation()) {
@@ -814,6 +836,7 @@ void TileManager::loadTiles() {
 // TileSource::addRasterTasks/addRasterTask populate them) the same way, per raster source's own
 // contract (texture-shading mosaic vs. opportunistic overzoom composite).
 void TileManager::upgradeAttachedRasters(TileSet& _tileSet, Tile& _tile, const TileID& _liveId) {
+    PROFILE_SCOPE("UpgradeAttachedRasters");
     if (_tileSet.source->isRaster()) {
         // Case 1 (pre-existing): _tileSet.source IS the elevation RasterSource, and this tile
         // is its own raster tile (terrain-ground/hillshade) -- single self-referencing entry.
@@ -955,107 +978,120 @@ void TileManager::upgradeAttachedRasters(TileSet& _tileSet, Tile& _tile, const T
         int levels = zt - int(livePrimary.z);
         int N = 1 << levels;
         std::vector<uint8_t> cellCaps;
-        TileSet* elevSet = nullptr;
-        for (auto& ts : m_tileSets) {
-            if (ts.source.get() == static_cast<TileSource*>(rs)) { elevSet = &ts; break; }
-        }
-        if (!elevSet) {
-            for (auto& ts : m_auxTileSets) {
+
+        // Perf (2026-07 profiling): the elevSet lookup and the rendered/ready sets built from it
+        // below are identical for every raster attachment on every tile processed against this
+        // `rs` within one updateTileSets() pass (elevSet's own visibleTiles/tiles are constant
+        // for the rest of the pass once it's reached this call - see m_upgradeRasterCache's doc
+        // comment in tileManager.h), so compute them at most once per pass and reuse afterward.
+        auto cacheIt = m_upgradeRasterCache.find(rs);
+        if (cacheIt == m_upgradeRasterCache.end()) {
+            TileSet* elevSet = nullptr;
+            for (auto& ts : m_tileSets) {
                 if (ts.source.get() == static_cast<TileSource*>(rs)) { elevSet = &ts; break; }
             }
-        }
-        if (!elevSet) {
-            // Caps CANNOT be computed -- the composite would silently fall back to
-            // "finest cached" and disagree with the rendered terrain (the persistent
-            // white-patch mechanism). This is not expected to ever happen (the raster source
-            // is shared by name with its own displayed tileset); scream once if it does.
-            static bool warned = false;
-            if (!warned) {
-                warned = true;
-                LOGW("upgradeAttachedRasters: no tileset found for raster source '%s' -- "
-                     "displayed-zoom caps disabled, drape may mismatch terrain!", rs->name().c_str());
+            if (!elevSet) {
+                for (auto& ts : m_auxTileSets) {
+                    if (ts.source.get() == static_cast<TileSource*>(rs)) { elevSet = &ts; break; }
+                }
             }
-        }
-        if (elevSet) {
-            // Cap against the tileset's CURRENT TRAVERSAL RESULT (visibleTiles) -- the
-            // steady-state display target -- NOT the per-frame rendered set (visible entries
-            // plus whatever proxies happen to be up this instant): folding ALL live proxies
-            // in caused per-frame re-stitch churn from proxy-*selection* noise ("everything
-            // is suddenly slow" regression). visibleTiles changes only when the view
-            // actually changes.
-            //
-            // BUT the target's own data readiness still needs checking (2026-07 live
-            // diagnosis: patches on tiles whose diagnostic stripe color -- the drape's own
-            // lattice zoom -- never changed, yet appeared/disappeared while panning back and
-            // forth over already-visited terrain): a target tile whose GPU texture was
-            // evicted under memory pressure and is being re-fetched from the local mbtiles
-            // cache is NOT actually what's on screen while that reload is in flight -- the
-            // renderer falls back to drawing whatever coarser ANCESTOR is still resident, the
-            // same fallback search updateTileSet() itself performs above. Capping against the
-            // not-yet-ready target instead of that actually-displayed ancestor reproduces the
-            // exact mismatch this whole mechanism exists to prevent. Unlike whole-scale live
-            // proxy selection, checking one specific tile's readiness is a monotonic fact
-            // (changes only on load/evict events, not every frame), so this doesn't
-            // reintroduce the churn regression.
-            // BOTH sets below are normalized (x,y,z) triples, deliberately dropping `s`: TileSet::
-            // tiles (and visibleTiles) are keyed by the RAW traversal TileID, whose `s` climbs
-            // above `z` exactly when THAT tile itself is displayed overzoomed (same formula as
-            // everywhere else) -- at extreme view zoom this now applies to the ELEVATION
-            // tileset's OWN z16 tiles too (previously only the draped VECTOR tile was ever
-            // overzoomed enough for this to matter). A readiness lookup keyed with a
-            // freshly-constructed 3-arg TileID(x,y,z) (s forced = z) therefore silently misses
-            // any entry actually stored under s > z -- confirmed live: mottled, contour-scale,
-            // contiguous salmon patches at close/grazing zoom on already-at-cap (z16) tiles,
-            // NOT healed by settling, because the lookup was deterministically wrong, not stale.
-            // Building explicit normalized sets up front (one pass over visibleTiles/tiles) lets
-            // every subsequent lookup below compare like-for-like instead of needing to guess a
-            // real `s` for each candidate (x,y,z).
+            if (!elevSet) {
+                // Caps CANNOT be computed -- the composite would silently fall back to
+                // "finest cached" and disagree with the rendered terrain (the persistent
+                // white-patch mechanism). This is not expected to ever happen (the raster source
+                // is shared by name with its own displayed tileset); scream once if it does.
+                static bool warned = false;
+                if (!warned) {
+                    warned = true;
+                    LOGW("upgradeAttachedRasters: no tileset found for raster source '%s' -- "
+                         "displayed-zoom caps disabled, drape may mismatch terrain!", rs->name().c_str());
+                }
+            }
             std::set<TileID> rendered;  // normalized traversal-target ids
-            for (const TileID& vid : elevSet->visibleTiles) {
-                rendered.insert(TileID(vid.x, vid.y, vid.z));
-            }
             std::set<TileID> ready;  // normalized ids of entries with a built (ready) Tile
-            for (auto& kv : elevSet->tiles) {
-                if (kv.second.tile) { ready.insert(TileID(kv.first.x, kv.first.y, kv.first.z)); }
+            if (elevSet) {
+                // Cap against the tileset's CURRENT TRAVERSAL RESULT (visibleTiles) -- the
+                // steady-state display target -- NOT the per-frame rendered set (visible entries
+                // plus whatever proxies happen to be up this instant): folding ALL live proxies
+                // in caused per-frame re-stitch churn from proxy-*selection* noise ("everything
+                // is suddenly slow" regression). visibleTiles changes only when the view
+                // actually changes.
+                //
+                // BUT the target's own data readiness still needs checking (2026-07 live
+                // diagnosis: patches on tiles whose diagnostic stripe color -- the drape's own
+                // lattice zoom -- never changed, yet appeared/disappeared while panning back and
+                // forth over already-visited terrain): a target tile whose GPU texture was
+                // evicted under memory pressure and is being re-fetched from the local mbtiles
+                // cache is NOT actually what's on screen while that reload is in flight -- the
+                // renderer falls back to drawing whatever coarser ANCESTOR is still resident, the
+                // same fallback search updateTileSet() itself performs above. Capping against the
+                // not-yet-ready target instead of that actually-displayed ancestor reproduces the
+                // exact mismatch this whole mechanism exists to prevent. Unlike whole-scale live
+                // proxy selection, checking one specific tile's readiness is a monotonic fact
+                // (changes only on load/evict events, not every frame), so this doesn't
+                // reintroduce the churn regression.
+                // BOTH sets below are normalized (x,y,z) triples, deliberately dropping `s`: TileSet::
+                // tiles (and visibleTiles) are keyed by the RAW traversal TileID, whose `s` climbs
+                // above `z` exactly when THAT tile itself is displayed overzoomed (same formula as
+                // everywhere else) -- at extreme view zoom this now applies to the ELEVATION
+                // tileset's OWN z16 tiles too (previously only the draped VECTOR tile was ever
+                // overzoomed enough for this to matter). A readiness lookup keyed with a
+                // freshly-constructed 3-arg TileID(x,y,z) (s forced = z) therefore silently misses
+                // any entry actually stored under s > z -- confirmed live: mottled, contour-scale,
+                // contiguous salmon patches at close/grazing zoom on already-at-cap (z16) tiles,
+                // NOT healed by settling, because the lookup was deterministically wrong, not stale.
+                // Building explicit normalized sets up front (one pass over visibleTiles/tiles) lets
+                // every subsequent lookup below compare like-for-like instead of needing to guess a
+                // real `s` for each candidate (x,y,z).
+                for (const TileID& vid : elevSet->visibleTiles) {
+                    rendered.insert(TileID(vid.x, vid.y, vid.z));
+                }
+                for (auto& kv : elevSet->tiles) {
+                    if (kv.second.tile) { ready.insert(TileID(kv.first.x, kv.first.y, kv.first.z)); }
+                }
             }
-            if (!rendered.empty()) {
-                cellCaps.assign(size_t(N) * size_t(N), uint8_t(zt));
-                int32_t baseX = int32_t(livePrimary.x) << levels;
-                int32_t baseY = int32_t(livePrimary.y) << levels;
-                for (int row = 0; row < N; row++) {
-                    for (int col = 0; col < N; col++) {
-                        int32_t cx = baseX + col, cy = baseY + row;
-                        int zTarget = -1;
-                        for (int za = zt; za >= 0; za--) {
-                            int dl = zt - za;
-                            if (rendered.count(TileID(cx >> dl, cy >> dl, za))) {
-                                zTarget = za;
+            cacheIt = m_upgradeRasterCache.emplace(
+                    rs, std::make_pair(std::move(rendered), std::move(ready))).first;
+        }
+        const std::set<TileID>& rendered = cacheIt->second.first;
+        const std::set<TileID>& ready = cacheIt->second.second;
+        if (!rendered.empty()) {
+            cellCaps.assign(size_t(N) * size_t(N), uint8_t(zt));
+            int32_t baseX = int32_t(livePrimary.x) << levels;
+            int32_t baseY = int32_t(livePrimary.y) << levels;
+            for (int row = 0; row < N; row++) {
+                for (int col = 0; col < N; col++) {
+                    int32_t cx = baseX + col, cy = baseY + row;
+                    int zTarget = -1;
+                    for (int za = zt; za >= 0; za--) {
+                        int dl = zt - za;
+                        if (rendered.count(TileID(cx >> dl, cy >> dl, za))) {
+                            zTarget = za;
+                            break;
+                        }
+                    }
+                    if (zTarget < 0) { continue; }  // no target covers this cell; leave at zt
+                    int dl = zt - zTarget;
+                    int32_t txAtTarget = cx >> dl, tyAtTarget = cy >> dl;
+                    bool isReady = ready.count(TileID(txAtTarget, tyAtTarget, zTarget)) != 0;
+                    int chosen = zTarget;
+                    if (!isReady) {
+                        // Target not loaded (yet) -- walk to the nearest ready ANCESTOR,
+                        // mirroring what the renderer is actually showing as a proxy right
+                        // now. If nothing is ready even down to the vector tile's own
+                        // zoom, fall back to that zoom (equivalent to the pre-composite
+                        // plain-texture baseline for this cell).
+                        chosen = int(livePrimary.z);
+                        for (int za2 = zTarget - 1; za2 >= int(livePrimary.z); za2--) {
+                            int dl2 = zTarget - za2;
+                            if (ready.count(TileID(txAtTarget >> dl2, tyAtTarget >> dl2, za2))) {
+                                chosen = za2;
                                 break;
                             }
                         }
-                        if (zTarget < 0) { continue; }  // no target covers this cell; leave at zt
-                        int dl = zt - zTarget;
-                        int32_t txAtTarget = cx >> dl, tyAtTarget = cy >> dl;
-                        bool isReady = ready.count(TileID(txAtTarget, tyAtTarget, zTarget)) != 0;
-                        int chosen = zTarget;
-                        if (!isReady) {
-                            // Target not loaded (yet) -- walk to the nearest ready ANCESTOR,
-                            // mirroring what the renderer is actually showing as a proxy right
-                            // now. If nothing is ready even down to the vector tile's own
-                            // zoom, fall back to that zoom (equivalent to the pre-composite
-                            // plain-texture baseline for this cell).
-                            chosen = int(livePrimary.z);
-                            for (int za2 = zTarget - 1; za2 >= int(livePrimary.z); za2--) {
-                                int dl2 = zTarget - za2;
-                                if (ready.count(TileID(txAtTarget >> dl2, tyAtTarget >> dl2, za2))) {
-                                    chosen = za2;
-                                    break;
-                                }
-                            }
-                        }
-                        cellCaps[size_t(row) * size_t(N) + size_t(col)] =
-                                uint8_t(std::max(chosen, int(livePrimary.z)));
                     }
+                    cellCaps[size_t(row) * size_t(N) + size_t(col)] =
+                            uint8_t(std::max(chosen, int(livePrimary.z)));
                 }
             }
         }

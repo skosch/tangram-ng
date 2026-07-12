@@ -1,4 +1,5 @@
 #include "data/rasterSource.h"
+#include "debug/profiler.h"
 #include "data/propertyItem.h"
 #include "data/tileData.h"
 #include "tile/tile.h"
@@ -792,6 +793,7 @@ std::shared_ptr<Texture> RasterSource::getExistingMosaic(TileID _tile) {
 
 std::shared_ptr<Texture> RasterSource::buildElevationMosaic(TileID _tile, const std::shared_ptr<Texture>& _ownTexture,
                                                             const uint8_t* _cellZoomCaps) {
+    PROFILE_SCOPE(Profiler::intern("buildElevationMosaic:" + name()));
     TileID id(_tile.x, _tile.y, _tile.z);
 
     // Reuse a live registered mosaic: every Tile referencing this elevation tile shares one
@@ -981,6 +983,8 @@ std::shared_ptr<Texture> RasterSource::buildOverzoomElevationMosaic(TileID _prim
     int zt = overzoomTargetZoom(_primary);
     if (zt <= _primary.z) { return nullptr; }  // not overzoomed enough to be worth compensating
 
+    PROFILE_SCOPE(Profiler::intern("buildOverzoomElevationMosaic:" + name()));
+
     int levels = zt - _primary.z;
     int N = 1 << levels;
     int32_t baseX = _primary.x << levels;
@@ -1149,6 +1153,7 @@ void RasterSource::patchNeighborMosaics(const TileID& _tileId, const std::shared
 }
 
 void RasterSource::flushDirtyMosaics() {
+    PROFILE_SCOPE(Profiler::intern("flushDirtyMosaics:" + name()));
     double now = nowSeconds();
     for (auto it = m_mosaics.begin(); it != m_mosaics.end();) {
         auto mosaic = it->second.lock();
@@ -1162,8 +1167,16 @@ void RasterSource::flushDirtyMosaics() {
         if (info->firstDirtyTime != 0.0) {  // dirty: decide whether to flush this cycle
             bool staleTooLong = (now - info->firstDirtyTime) >= kMosaicFlushDebounceSeconds;
             if (ringComplete || staleTooLong) {
-                mosaic->resize(mosaic->width(), mosaic->height());
-                info->firstDirtyTime = 0.0;
+                // Perf (2026-07 profiling): gate the actual GPU re-upload on this update's
+                // upload budget - a burst of mosaics going ring-complete-or-stale-dirty in the
+                // same update must not all resize() in one frame (measured up to ~500MB
+                // uploaded in a single frame). Leave firstDirtyTime untouched when budget-
+                // limited so this mosaic is retried (with priority, since it's already
+                // eligible) on the next update instead of silently dropped.
+                if (tryConsumeUploadBudget()) {
+                    mosaic->resize(mosaic->width(), mosaic->height());
+                    info->firstDirtyTime = 0.0;
+                }
             }
             continue;  // just (re)dirtied or just flushed - either way, not yet safe to free
         }

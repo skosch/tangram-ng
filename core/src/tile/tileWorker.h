@@ -44,7 +44,7 @@ private:
         std::unique_ptr<TileBuilder> tileBuilder;
     };
 
-    void run(Worker* instance);
+    void run(Worker* instance, int index);
 
     bool m_running;
 

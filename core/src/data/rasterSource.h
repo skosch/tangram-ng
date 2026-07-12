@@ -258,6 +258,22 @@ class RasterSource : public TileSource {
         return true;
     }
 
+    // Perf (2026-07 profiling): remaining number of mosaic GPU re-uploads flushDirtyMosaics()
+    // may perform this update cycle. Mirrors m_stitchBudget above but bounds Texture::resize()
+    // calls (the actual GPU upload) rather than CPU-side stitching: a fast pan/zoom burst can
+    // make many mosaics ring-complete-or-stale-dirty in the same update, and uploading all of
+    // them in one frame was observed to spike a single frame's texture upload by up to ~500MB.
+    // Reset once per TileManager::updateTileSets() via resetUploadBudget() below.
+    int m_uploadBudget = 0;
+
+    // Consume one unit of this update cycle's upload budget; false means the caller should
+    // leave the mosaic dirty and retry the upload on a later, less busy update.
+    bool tryConsumeUploadBudget() {
+        if (m_uploadBudget <= 0) { return false; }
+        --m_uploadBudget;
+        return true;
+    }
+
     friend class RasterTileTask;
     friend class TileSource;
     friend class FrameInfo;
@@ -301,6 +317,11 @@ public:
     // this source a fresh main-thread stitch budget for the update cycle about to run (see
     // m_stitchBudget above).
     void resetStitchBudget(int n) { m_stitchBudget = n; }
+
+    // Perf (2026-07 profiling): called once per TileManager::updateTileSets() to grant this
+    // source a fresh mosaic GPU-upload budget for the update cycle about to run (see
+    // m_uploadBudget above).
+    void resetUploadBudget(int n) { m_uploadBudget = n; }
 
     // Get-or-build the shared 3W x 3W mosaic texture for `_tile`: an already-registered live
     // mosaic is returned as-is (its cells are kept current by patchNeighborMosaics());

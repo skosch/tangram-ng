@@ -1,5 +1,6 @@
 #include "gl/texture.h"
 
+#include "debug/profiler.h"
 #include "gl/glError.h"
 #include "gl/renderState.h"
 #include "gl/hardware.h"
@@ -106,6 +107,7 @@ void Texture::generate(RenderState& _rs, GLuint _textureUnit) {
 }
 
 bool Texture::upload(RenderState& _rs, GLuint _textureUnit) {
+    PROFILE_SCOPE("TextureUpload");
     m_shouldResize = false;
 
     if (Hardware::maxTextureSize < m_width ||
@@ -114,6 +116,11 @@ bool Texture::upload(RenderState& _rs, GLuint _textureUnit) {
         if (m_disposeBuffer) { m_buffer.reset(); }
         return false;
     }
+    // Diagnose whether this is a first-ever upload (new GL handle) or a re-upload of a texture
+    // that already had live content, before generate() below creates the handle. counterAdd is
+    // mutex-guarded, so this is safe from both the main thread and the elevation-worker thread.
+    bool isFirstUpload = (m_glHandle == 0);
+
     if (m_glHandle == 0) {
         generate(_rs, _textureUnit);
     } else {
@@ -122,6 +129,9 @@ bool Texture::upload(RenderState& _rs, GLuint _textureUnit) {
 
     auto internalfmt = static_cast<GLint>(m_options.pixelFormat);
     // desktop GL doesn't support GL_ALPHA, GLES doesn't support GL_RED, so have to use GL_R8
+    double uploadKB = double(m_width) * double(m_height) * double(bpp()) / 1024.0;
+    Profiler::counterAdd("texUploadKB", uploadKB);
+    Profiler::counterAdd(isFirstUpload ? "texUploadNewKB" : "texUploadReuploadKB", uploadKB);
     GL::texImage2D(GL_TEXTURE_2D, 0, internalfmt, m_width, m_height, 0, m_options.glFormat(),
                    m_options.glType(), m_buffer.get());
 

@@ -1,5 +1,6 @@
 #include "labels/labelManager.h"
 
+#include "debug/profiler.h"
 #include "data/tileSource.h"
 #include "gl/primitives.h"
 #include "gl/shaderProgram.h"
@@ -570,7 +571,10 @@ void LabelManager::updateLabelSet(const View& _view, float _dt, const Scene& _sc
 
     auto _viewState = _view.state();
     /// Collect and update labels from visible tiles
-    updateLabels(_viewState, _dt, _scene, _tiles, _markers, _onlyRender);
+    {
+        PROFILE_SCOPE("LabelsCollect");
+        updateLabels(_viewState, _dt, _scene, _tiles, _markers, _onlyRender);
+    }
     if (_onlyRender) { return; }
 
     std::sort(m_labels.begin(), m_labels.end(), LabelManager::priorityComparator);
@@ -584,7 +588,10 @@ void LabelManager::updateLabelSet(const View& _view, float _dt, const Scene& _sc
     m_isect2d.resize({_viewState.viewportSize.x / 256, _viewState.viewportSize.y / 256},
                      {_viewState.viewportSize.x, _viewState.viewportSize.y});
 
-    handleOcclusions(_viewState, _scene.hideExtraLabels);
+    {
+        PROFILE_SCOPE("LabelsCollision");
+        handleOcclusions(_viewState, _scene.hideExtraLabels);
+    }
 
     // Update label state
     for (auto& entry : m_labels) {
@@ -640,6 +647,8 @@ void LabelManager::updateLabelSet(const View& _view, float _dt, const Scene& _sc
     m_lastZoom = _viewState.zoom;
     m_lastViewPos = _view.getPosition();
     m_lastViewProj = _view.getViewProjectionMatrix();
+
+    Profiler::counter("labelsActive", double(m_labels.size()));
 }
 
 void LabelManager::drawDebug(RenderState& rs, const View& _view) {

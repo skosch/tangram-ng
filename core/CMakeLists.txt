@@ -37,6 +37,8 @@ add_library(tangram-core
   src/data/formats/topoJson.cpp
   src/debug/frameInfo.h
   src/debug/frameInfo.cpp
+  src/debug/profiler.h
+  src/debug/profiler.cpp
   src/debug/textDisplay.h
   src/debug/textDisplay.cpp
   src/gl/framebuffer.h

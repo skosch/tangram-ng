@@ -1,5 +1,6 @@
 #include "marker/markerManager.h"
 
+#include "debug/profiler.h"
 #include "data/tileData.h"
 #include "gl/texture.h"
 #include "marker/marker.h"
@@ -273,6 +274,8 @@ bool MarkerManager::setPolygon(MarkerID markerID, LngLat* coordinates, int* coun
 MarkerManager::UpdateState MarkerManager::update(const View& _view, float _dt) {
     if (!m_scene.isReady() || (!m_dirty && m_markers.empty())) { return {false, false}; }
 
+    PROFILE_SCOPE("MarkerManagerUpdate");
+
     // do this here instead of Scene::update so we don't print every time map is moved
     LOGTInit(">>> update");
 
@@ -317,6 +320,8 @@ MarkerManager::UpdateState MarkerManager::update(const View& _view, float _dt) {
         easing |= marker->isEasing();
     }
     LOGT("<<< update");
+
+    Profiler::counter("markersActive", double(m_markers.size()));
 
     return {rebuilt || easing || dirty, easing};
 }

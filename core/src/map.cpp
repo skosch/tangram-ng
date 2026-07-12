@@ -2,6 +2,7 @@
 
 #include "debug/textDisplay.h"
 #include "debug/frameInfo.h"
+#include "debug/profiler.h"
 #include "gl.h"
 #include "gl/glError.h"
 #include "gl/framebuffer.h"
@@ -261,9 +262,18 @@ MapState Map::update(float _dt) {
 
         // Sync ClientTileSource changes with TileManager
         bool firstUpdate = !wasReady;
-        impl->syncClientTileSources(firstUpdate);
+        {
+            PROFILE_SCOPE("SyncClientTileSources");
+            impl->syncClientTileSources(firstUpdate);
+        }
 
-        auto sceneState = scene.update(impl->renderState, impl->view, _dt);
+        Scene::UpdateState sceneState;
+        {
+            PROFILE_SCOPE("SceneUpdate");
+            sceneState = scene.update(impl->renderState, impl->view, _dt);
+        }
+
+        Profiler::counter("activeUrlRequests", double(platform->activeUrlRequests()));
 
         if (sceneState.animateLabels || sceneState.animateMarkers) {
             state |= MapState::labels_changing;
@@ -306,6 +316,8 @@ void Map::render() {
         return;
     }
 
+    PROFILE_GPU("Render");
+
     Primitives::setResolution(renderState, view.getWidth(), view.getHeight());
     FrameInfo::beginFrame();
 
@@ -317,6 +329,8 @@ void Map::render() {
     bool drawSelectionBuffer = !impl->selectionQueries.empty();
 
     if (drawSelectionBuffer || drawSelectionDebug) {
+        PROFILE_SCOPE("RenderSelectionPass");
+
         impl->selectionBuffer->applyAsRenderTarget(impl->renderState);
 
         scene.renderSelection(renderState, view,
@@ -340,6 +354,7 @@ void Map::render() {
         scene.elevationManager()->drawDepthDebug(renderState, view);
     } else {
         // Render scene
+        PROFILE_SCOPE("RenderDraw");
         bool drawnAnimatedStyle = scene.render(renderState, view);
 
         if (scene.animated() != Scene::animate::no &&

@@ -2,6 +2,7 @@
 
 #include "data/tileSource.h"
 #include "data/rasterSource.h"
+#include "debug/profiler.h"
 #include "gl/framebuffer.h"
 #include "gl/shaderProgram.h"
 #include "labels/labelManager.h"
@@ -713,13 +714,25 @@ bool Scene::render(RenderState& _rs, View& _view) {
     bool drawnAnimatedStyle = false;
 
     // draw the sky (if horizon if visible)
-    m_skyManager->draw(_rs, _view);
+    {
+        PROFILE_GPU("Sky");
+        m_skyManager->draw(_rs, _view);
+    }
 
     for (const auto& style : m_styles) {
 
-        bool styleDrawn = style->draw(_rs, _view,
+        bool styleDrawn;
+        {
+            // Safe to nest inside the caller's PROFILE_GPU("Render") zone (map.cpp): each
+            // GpuZone allocates its own pair of GL timer-query objects, so nested/concurrent
+            // zones don't collide. Only safe here because Scene::render always runs on the
+            // main GL thread/context (see the CPU-only style:<name> zone in style.cpp for the
+            // same hazard when Style::draw is called from the offscreen elevation thread).
+            PROFILE_GPU(Profiler::intern("style-gpu:" + style->getName()));
+            styleDrawn = style->draw(_rs, _view,
                                       m_tileManager->getVisibleTiles(),
                                       m_markerManager->markers());
+        }
 
         drawnAnimatedStyle |= (styleDrawn && style->isAnimated());
     }
@@ -735,11 +748,16 @@ void Scene::renderSelection(RenderState& _rs, View& _view, FrameBuffer& _selecti
         GL::bindVertexArray(selectionVAO);
     }
 
-    for (const auto& style : m_styles) {
+    {
+        // Called only from Map::render's PROFILE_SCOPE("RenderSelectionPass") block on the
+        // main GL thread, so a GPU zone is safe here too (see Scene::render above).
+        PROFILE_GPU("Selection");
+        for (const auto& style : m_styles) {
 
-        style->drawSelectionFrame(_rs, _view,
-                                  m_tileManager->getVisibleTiles(),
-                                  m_markerManager->markers());
+            style->drawSelectionFrame(_rs, _view,
+                                      m_tileManager->getVisibleTiles(),
+                                      m_markerManager->markers());
+        }
     }
 
     if(selectionVAO) { GL::deleteVertexArrays(1, &selectionVAO); }

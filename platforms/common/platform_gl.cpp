@@ -343,4 +343,84 @@ GLenum GL::checkFramebufferStatus(GLenum target) {
     return status;
 }
 
+// GPU timestamp queries for debug/profiler.cpp. Only wired up for TANGRAM_LINUX for now: the
+// desktop ARB_timer_query entry points are exported by GLVND libOpenGL and Mesa dispatches them
+// on GLES contexts exposing GL_EXT_disjoint_timer_query as well (shared dispatch slots). Other
+// platforms report no support, making Profiler::GpuZone a silent no-op there.
+#if defined(TANGRAM_LINUX)
+
+#ifndef GL_GPU_DISJOINT_EXT
+#define GL_GPU_DISJOINT_EXT 0x8FBB
+#endif
+
+bool GL::timerQueriesSupported() {
+    // Runtime probe instead of an extension-string check: GL::getString(GL_EXTENSIONS) is
+    // faked on desktop builds (see above), and this works for both a GLES context with
+    // GL_EXT_disjoint_timer_query and a desktop GL >= 3.3 context.
+    static int s_supported = -1;
+    if (s_supported < 0) {
+        while (glGetError() != GL_NO_ERROR) {}  // clear any pending errors
+        GLuint q = 0;
+        GLint64 t = 0;
+        glGenQueries(1, &q);
+        if (q) {
+            glQueryCounter(q, GL_TIMESTAMP);
+            glGetInteger64v(GL_TIMESTAMP, &t);
+        }
+        s_supported = (q && t > 0 && glGetError() == GL_NO_ERROR) ? 1 : 0;
+        if (q) { glDeleteQueries(1, &q); }
+    }
+    return s_supported == 1;
+}
+
+void GL::genQueries(GLsizei n, GLuint *ids) {
+    GL_CHECK(glGenQueries(n, ids));
+}
+
+void GL::deleteQueries(GLsizei n, const GLuint *ids) {
+    GL_CHECK(glDeleteQueries(n, ids));
+}
+
+void GL::queryCounter(GLuint id) {
+    GL_CHECK(glQueryCounter(id, GL_TIMESTAMP));
+}
+
+bool GL::queryResultAvailable(GLuint id) {
+    GLuint available = 0;
+    GL_CHECK(glGetQueryObjectuiv(id, GL_QUERY_RESULT_AVAILABLE, &available));
+    return available != 0;
+}
+
+unsigned long long GL::queryResult64(GLuint id) {
+    GLuint64 result = 0;
+    GL_CHECK(glGetQueryObjectui64v(id, GL_QUERY_RESULT, &result));
+    return result;
+}
+
+long long GL::gpuTimestampNs() {
+    GLint64 t = 0;
+    GL_CHECK(glGetInteger64v(GL_TIMESTAMP, &t));
+    return t;
+}
+
+bool GL::gpuDisjointOccurred() {
+    GLint disjoint = 0;
+    glGetIntegerv(GL_GPU_DISJOINT_EXT, &disjoint);
+    while (glGetError() != GL_NO_ERROR) {}  // enum only exists with GL_EXT_disjoint_timer_query
+    return disjoint != 0;
+}
+
+#else  // !TANGRAM_LINUX
+
+bool GL::timerQueriesSupported() { return false; }
+void GL::genQueries(GLsizei n, GLuint *ids) { for (GLsizei i = 0; i < n; i++) { ids[i] = 0; } }
+void GL::deleteQueries(GLsizei, const GLuint *) {}
+void GL::queryCounter(GLuint) {}
+bool GL::queryResultAvailable(GLuint) { return false; }
+unsigned long long GL::queryResult64(GLuint) { return 0; }
+long long GL::gpuTimestampNs() { return 0; }
+bool GL::gpuDisjointOccurred() { return false; }
+
+#endif
+
 }

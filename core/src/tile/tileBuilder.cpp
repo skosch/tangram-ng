@@ -1,5 +1,6 @@
 #include "tile/tileBuilder.h"
 
+#include "debug/profiler.h"
 #include "data/properties.h"
 #include "data/propertyItem.h"
 #include "data/tileSource.h"
@@ -119,25 +120,30 @@ void TileBuilder::build(Tile& tile, const TileData& _tileData, const TileSource&
         if (builder.second) { builder.second->setup(tile); }
     }
 
-    for (const auto& datalayer : m_scene.layers()) {
+    {
+        PROFILE_SCOPE(Profiler::intern("applyStyling:" + _source.name()));
+        for (const auto& datalayer : m_scene.layers()) {
 
-        if (datalayer.source() != _source.name() || !datalayer.enabled()) { continue; }
+            if (datalayer.source() != _source.name() || !datalayer.enabled()) { continue; }
 
-        for (const auto& collection : _tileData.layers) {
+            for (const auto& collection : _tileData.layers) {
 
-            if (!collection.name.empty()) {
-                const auto& dlc = datalayer.collections();
-                bool layerContainsCollection =
-                    std::find(dlc.begin(), dlc.end(), collection.name) != dlc.end();
+                if (!collection.name.empty()) {
+                    const auto& dlc = datalayer.collections();
+                    bool layerContainsCollection =
+                        std::find(dlc.begin(), dlc.end(), collection.name) != dlc.end();
 
-                if (!layerContainsCollection) { continue; }
-            }
+                    if (!layerContainsCollection) { continue; }
+                }
 
-            for (const auto& feat : collection.features) {
-                applyStyling(feat, datalayer);
+                for (const auto& feat : collection.features) {
+                    applyStyling(feat, datalayer);
+                }
             }
         }
     }
+
+    PROFILE_SCOPE(Profiler::intern("buildMesh:" + _source.name()));
 
     for (auto& builder : m_styleBuilder) {
 

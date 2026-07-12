@@ -15,6 +15,7 @@ MODULE_SOURCES = \
   src/data/formats/mvt.cpp            \
   src/data/formats/topoJson.cpp       \
   src/debug/frameInfo.cpp             \
+  src/debug/profiler.cpp              \
   src/debug/textDisplay.cpp           \
   src/gl/framebuffer.cpp              \
   src/gl/glError.cpp                  \

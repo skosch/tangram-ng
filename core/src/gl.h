@@ -430,5 +430,19 @@ struct GL {
     static void deleteVertexArrays(GLsizei n, const GLuint *arrays);
     static void genVertexArrays(GLsizei n, GLuint *arrays);
 
+    // GPU timestamp queries for debug/profiler.cpp (GL_EXT_disjoint_timer_query on GLES,
+    // ARB_timer_query on desktop GL). timerQueriesSupported() performs a runtime check and
+    // requires a current GL context; on unsupported platforms/drivers it returns false and
+    // the remaining functions are no-ops. 64-bit types are spelled out to avoid conflicting
+    // with GLuint64/GLint64 typedefs in the real GL headers.
+    static bool timerQueriesSupported();
+    static void genQueries(GLsizei n, GLuint *ids);
+    static void deleteQueries(GLsizei n, const GLuint *ids);
+    static void queryCounter(GLuint id);                 // records GL_TIMESTAMP(_EXT)
+    static bool queryResultAvailable(GLuint id);
+    static unsigned long long queryResult64(GLuint id);  // ns
+    static long long gpuTimestampNs();                   // current GPU clock (GL_TIMESTAMP), ns
+    static bool gpuDisjointOccurred();                   // GL_GPU_DISJOINT_EXT, read-and-clear
+
 };
 }

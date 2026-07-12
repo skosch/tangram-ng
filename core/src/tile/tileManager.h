@@ -12,12 +12,15 @@
 #include <mutex>
 #include <tuple>
 #include <set>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace Tangram {
 
 class Platform;
 class TileSource;
+class RasterSource;
 class TileCache;
 class View;
 struct ViewState;
@@ -164,6 +167,18 @@ protected:
     /* Temporary list of tiles that need to be loaded */
     struct TileLoadTask { double dist; TileSet* tileSet; TileID tileID; };
     std::vector<TileLoadTask> m_loadTasks;
+
+    // Perf (2026-07 profiling): upgradeAttachedRasters() (Case 2, draped vector tiles) looks up
+    // the elevation RasterSource's own TileSet and builds normalized `rendered`/`ready` id sets
+    // from its ENTIRE visibleTiles/tiles to compute per-cell displayed-zoom caps - see that
+    // function's doc comment for why these sets must exist at all. Both the elevSet lookup and
+    // the sets built from it are identical for every raster attachment on every tile processed
+    // within one updateTileSets() pass (elevSet's own visibleTiles/tiles don't change again once
+    // that pass has reached this tileSet), yet the un-cached code was redoing this full rebuild
+    // once per (visible tile x raster attachment) - up to ~140 times per update for the same
+    // handful of RasterSources. Cache keyed by RasterSource*, populated lazily on first use each
+    // pass and cleared at the top of updateTileSets() below.
+    std::unordered_map<RasterSource*, std::pair<std::set<TileID>, std::set<TileID>>> m_upgradeRasterCache;
 
 };
 

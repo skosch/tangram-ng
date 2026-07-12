@@ -1,5 +1,6 @@
 #include "debug/frameInfo.h"
 
+#include "debug/profiler.h"
 #include "debug/textDisplay.h"
 #include "gl.h"
 #include "gl/glError.h"
@@ -65,6 +66,7 @@ struct ProfInfo {
 static std::map<std::string, ProfInfo> profInfos;
 
 void FrameInfo::begin(const std::string& tag) {
+    if (Profiler::isCapturing()) { Profiler::zoneBegin(Profiler::intern(tag)); }
     if (!getDebugFlag(DebugFlags::tangram_infos)) { return; }
     auto& entry = profInfos[tag];
     entry.startReal = std::chrono::steady_clock::now();
@@ -72,6 +74,7 @@ void FrameInfo::begin(const std::string& tag) {
 }
 
 void FrameInfo::end(const std::string& tag) {
+    if (Profiler::isCapturing()) { Profiler::zoneEnd(Profiler::intern(tag)); }
     if (!getDebugFlag(DebugFlags::tangram_infos)) { return; }
     auto& entry = profInfos[tag];
     auto endReal = std::chrono::steady_clock::now();

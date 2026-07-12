@@ -20,6 +20,7 @@ MODULE_SOURCES = \
   unit/mapProjectionTests.cpp \
   unit/meshTests.cpp \
   unit/networkDataSourceTests.cpp \
+  unit/profilerTests.cpp \
   unit/rasterMosaicTests.cpp \
   unit/sceneImportTests.cpp \
   unit/sceneLoaderTests.cpp \
