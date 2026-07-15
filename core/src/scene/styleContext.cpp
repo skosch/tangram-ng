@@ -174,6 +174,7 @@ bool StyleContext::evalStyle(FunctionID _id, StyleParamKey _key, StyleParam::Val
             case StyleParamKey::sprite:
             case StyleParamKey::sprite_default:
             case StyleParamKey::style:
+            case StyleParamKey::text2_source:
             case StyleParamKey::text_align:
             case StyleParamKey::text_repeat_group:
             case StyleParamKey::text_source:
@@ -279,6 +280,7 @@ bool StyleContext::evalStyle(FunctionID _id, StyleParamKey _key, StyleParam::Val
             LOGD("duk evaluates JS method to NAN.\n");
         }
         switch (_key) {
+            case StyleParamKey::text2_source:
             case StyleParamKey::text_source:
             case StyleParamKey::text_source_left:
             case StyleParamKey::text_source_right:

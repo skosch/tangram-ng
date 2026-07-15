@@ -693,22 +693,39 @@ bool PointStyleBuilder::addFeature(const Feature& _feat, const DrawRule& _rule) 
                     auto pLabel = static_cast<SpriteLabel*>(m_labels[iconsStart + i].get());
                     glm::vec2 p = pLabel->modelCenter();
 
-                    glm::vec2 iconDim = pLabel->dimension();
-                    float iconRadiusPx = 0.5f * std::max(iconDim.x, iconDim.y);
-                    params2.labelOptions.anchors = textStyleBuilder.salienceOrderedAnchors(
-                        params2.labelOptions.anchors, p, glm::vec2(attrib2.width, attrib2.height), iconRadiusPx);
+                    // Pinned to a single fixed anchor (bottom), NOT the primary label's
+                    // salience-ordered anchor list: the primary and this label cycle
+                    // anchors independently at runtime on collision
+                    // (LabelManager::handleOcclusions calls Label::nextAnchor() per-label),
+                    // so computing this label's push distance from "whichever anchor the
+                    // primary label *currently* has" is fragile -- if salienceOrderedAnchors
+                    // (called separately here, with this label's own smaller footprint)
+                    // picked a different first anchor than the primary's, or either label
+                    // cycles away from anchor 0 independently, the two directions can
+                    // disagree and the push computed for one direction ends up applied
+                    // while the actual rendered anchor is another, leaving this label
+                    // sitting on top of (and losing a collision against) the primary one --
+                    // confirmed via a diagnostic build that a fixed anchor + large constant
+                    // offset renders fine, whereas the salience-ordered-and-computed version
+                    // silently never did. A single fixed anchor sidesteps the mismatch
+                    // entirely; the tradeoff is the elevation line doesn't rotate away from
+                    // clutter the way the name label does.
+                    params2.labelOptions.anchors = LabelProperty::Anchors(LabelProperty::Anchor::bottom);
 
-                    // Push past the primary label's measured extent so the two don't
-                    // overlap. Uses the primary label actually built for this same icon
-                    // (falls back to 0 -- i.e. only the icon-radius offset applies -- if
-                    // for some reason the counts don't line up).
+                    // Push straight down by the primary label's actual measured height
+                    // (read back from the already-built primary label for this same icon)
+                    // plus a small gap, so it sits just below the name instead of
+                    // overlapping it. TextLabel::applyAnchor already offsets this label a
+                    // half-extent below the icon, so the push only needs to cover the
+                    // primary's full height, not a half/half split -- see the (reverted)
+                    // horizontal-anchor version of this comment in git history for the
+                    // arithmetic if this needs revisiting.
                     glm::vec2 primaryDim(0);
                     if (i < primaryLabelsCount) {
                         primaryDim = textLabels[primaryLabelsStart + i]->dimension();
                     }
                     const float gapPx = 2.f * m_style.pixelScale();
-                    glm::vec2 dir = LabelProperty::anchorDirection(params2.labelOptions.anchors[0]);
-                    params2.labelOptions.offset += dir * (0.5f * primaryDim.y + gapPx);
+                    params2.labelOptions.offset = glm::vec2(0.f, primaryDim.y + gapPx);
 
                     params2.labelOptions.optional = true;
 
