@@ -1,10 +1,12 @@
 #include "catch.hpp"
 #include "labels/label.h"
+#include "labels/labelCollider.h"
 #include "labels/screenTransform.h"
 #include "labels/textLabel.h"
 #include "labels/textLabels.h"
 #include "map.h"
 #include "style/textStyle.h"
+#include "tile/tileID.h"
 #include "view/view.h"
 
 #include "glm/mat4x4.hpp"
@@ -213,4 +215,65 @@ TEST_CASE( "Sine interpolation", "[Core][Label][Fade]" ) {
     fadeIn.update(0.01);
 
     REQUIRE(fadeIn.isFinished());
+}
+
+// docs/label-placement-plan.md Task 3: peaks sharing a draw rule get an implicit repeatGroup
+// and repeatDistance (one tile width by default, see TextStyleBuilder::applyRule). Two peaks
+// within that distance are pre-emptively resolved by LabelCollider::process() at tile-build
+// time, using whatever priority is available *then* (provisional/elevation-only for peaks
+// without a real OSM prominence tag -- the texture-shading-refined priority only exists later,
+// via Label::refinePriority() on the main thread). This locks down that the suppression
+// radius really is controlled by Options::repeatDistance (screen pixels, in the normal
+// per-tile code path LabelCollider::process() takes -- the tileSize=0 branch of
+// filterRepeatGroups, distance measured via Label::screenCenter()), so retuning the peak draw
+// rule's repeat_distance in stylus-osm.yaml has the predictable effect the fix relies on.
+std::unique_ptr<Label> makeRepeatGroupLabel(glm::vec2 _pos, float _priority, size_t _repeatGroup,
+                                            float _repeatDistance) {
+    Label::Options options;
+    options.offset = {0.0f, 0.0f};
+    options.anchors.anchor[0] = LabelProperty::Anchor::center;
+    options.anchors.count = 1;
+    options.priority = _priority;
+    options.repeatGroup = _repeatGroup;
+    options.repeatDistance = _repeatDistance;
+
+    TextRange textRanges;
+
+    return std::make_unique<TextLabel>(TextLabel::Coordinates{{_pos, _pos}}, Label::Type::point,
+                                       options, TextLabel::VertexAttributes{}, glm::vec2(1.f, 1.f),
+                                       dummy, textRanges, TextLabelProperty::Align::none);
+}
+
+TEST_CASE( "LabelCollider repeat-group suppression radius tracks repeatDistance", "[Core][LabelCollider]" ) {
+    // Two same-repeatGroup labels a fixed distance apart on screen; only repeatDistance
+    // varies between sections. TileID(0,0,10) with a real tileSize keeps LabelCollider's
+    // internal isect2d grid happy without needing thousands of labels.
+    TileID tileID(0, 0, 10);
+
+    SECTION( "closer than repeatDistance: lower-priority label is suppressed" ) {
+        LabelCollider collider;
+        std::vector<std::unique_ptr<Label>> labels;
+        // priority is "lower numeric value wins" (see labelCollider.cpp's priorityComparator).
+        labels.push_back(makeRepeatGroupLabel({0.5f, 0.5f}, 0.1f, 1, 200.f));
+        labels.push_back(makeRepeatGroupLabel({0.55f, 0.5f}, 0.2f, 1, 200.f));
+
+        collider.addLabels(labels);
+        collider.process(tileID, 1.0f, 256.f);
+
+        REQUIRE(labels[0]->state() != Label::State::dead);
+        REQUIRE(labels[1]->state() == Label::State::dead);
+    }
+
+    SECTION( "farther than repeatDistance: both labels survive" ) {
+        LabelCollider collider;
+        std::vector<std::unique_ptr<Label>> labels;
+        labels.push_back(makeRepeatGroupLabel({0.1f, 0.5f}, 0.1f, 1, 20.f));
+        labels.push_back(makeRepeatGroupLabel({0.9f, 0.5f}, 0.2f, 1, 20.f));
+
+        collider.addLabels(labels);
+        collider.process(tileID, 1.0f, 256.f);
+
+        REQUIRE(labels[0]->state() != Label::State::dead);
+        REQUIRE(labels[1]->state() != Label::State::dead);
+    }
 }
