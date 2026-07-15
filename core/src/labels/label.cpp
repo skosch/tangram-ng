@@ -98,6 +98,73 @@ bool Label::refinePriority(ElevationManager& elevMgr, glm::dvec2 origin, double 
     return true;
 }
 
+bool Label::refineAnchor(ElevationManager& elevMgr, glm::dvec2 origin, double scale) {
+    if (!m_options.refineAnchorWithTextureShading) { return true; }
+    if (m_options.anchors.count <= 1) { return true; } // nothing to choose between
+    if (!elevMgr.m_elevationSource) { return false; }
+
+    ProjectedMeters worldPos = origin + glm::dvec2(modelCenter()) * scale;
+
+    // Fixed real-world sampling radius, not the label's actual measured extent -- see this
+    // method's doc comment in label.h for why a screen-pixel footprint can't be converted to
+    // world meters here. 25m is in the right ballpark for how far a small peak label's text
+    // actually sits from its icon on the ground at typical label-visible zooms; tune by eye.
+    const double kSampleRadiusMeters = 25.0;
+
+    // "Ridge/canyon response" is distance from the texture-shading formula's neutral value
+    // (0.5, see textureShading.cpp/hillshade.yaml's contrast curve) -- a gentle slope reads
+    // close to neutral in either direction, while a strong ridge or canyon pushes the shade
+    // value away from it. Lower cost = gentler ground to stamp the label across.
+    auto ridgeCost = [](float shade) { return std::fabs(shade - 0.5f); };
+
+    std::vector<float> costs(m_options.anchors.count);
+
+    for (int i = 0; i < m_options.anchors.count; i++) {
+        glm::vec2 dir = LabelProperty::anchorDirection(m_options.anchors.anchor[i]);
+        ProjectedMeters samplePos = worldPos + glm::dvec2(dir) * kSampleRadiusMeters;
+
+        bool ok = false;
+        float shade = sampleTextureShading(*elevMgr.m_elevationSource, samplePos, ok);
+        if (!ok) { return false; } // retry next frame once every candidate is sampleable
+
+        costs[i] = ridgeCost(shade);
+    }
+
+    // Only switch for a meaningful improvement -- avoid churn between near-tied candidates.
+    const float kMinImprovement = 0.08f;
+    int bestIndex = pickBetterAnchorIndex(costs, m_anchorIndex, kMinImprovement);
+    if (bestIndex >= 0) {
+        // Rotate the chosen anchor to the front of the fallback list (mirrors Phase 3's
+        // salienceOrderedAnchors()'s "resort, hand to the existing anchor-cycling mechanism
+        // unchanged" approach) and switch to it now.
+        LabelProperty::Anchor best = m_options.anchors.anchor[bestIndex];
+        for (int i = bestIndex; i > 0; i--) {
+            m_options.anchors.anchor[i] = m_options.anchors.anchor[i - 1];
+        }
+        m_options.anchors.anchor[0] = best;
+        setAnchorIndex(0);
+    }
+
+    return true;
+}
+
+int Label::pickBetterAnchorIndex(const std::vector<float>& _costs, int _currentIndex,
+                                 float _minImprovement) {
+    if (_costs.empty() || _currentIndex < 0 || _currentIndex >= (int)_costs.size()) {
+        return -1;
+    }
+
+    int bestIndex = 0;
+    for (size_t i = 1; i < _costs.size(); i++) {
+        if (_costs[i] < _costs[bestIndex]) { bestIndex = (int)i; }
+    }
+
+    if (bestIndex == _currentIndex) { return -1; }
+    if (_costs[bestIndex] + _minImprovement >= _costs[_currentIndex]) { return -1; }
+
+    return bestIndex;
+}
+
 bool Label::visibleState() const {
     int visibleFlags = (State::visible |
                         State::fading_in |

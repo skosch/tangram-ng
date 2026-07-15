@@ -69,6 +69,10 @@ enum class StyleParamKey : uint8_t {
     text2_source,
     text_align,
     text_anchor,
+    // docs/label-placement-plan.md Task 4: opt-in flag (peak name text only, currently) --
+    // mirrors priority_texture_shading's pattern exactly, but for Label::refineAnchor()
+    // instead of refinePriority(). See Label::Options::refineAnchorWithTextureShading.
+    text_anchor_texture_shading,
     text_buffer,
     text_collide,
     text_font_alpha,

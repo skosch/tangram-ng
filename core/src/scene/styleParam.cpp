@@ -73,6 +73,7 @@ const std::map<std::string, StyleParamKey> s_StyleParamMap = {
     {"text2:text_source", StyleParamKey::text2_source},
     {"text:align", StyleParamKey::text_align},
     {"text:anchor", StyleParamKey::text_anchor},
+    {"text:anchor_texture_shading", StyleParamKey::text_anchor_texture_shading},
     {"text:buffer", StyleParamKey::text_buffer},
     {"text:collide", StyleParamKey::text_collide},
     {"text:font:alpha", StyleParamKey::text_font_alpha},
@@ -285,6 +286,7 @@ StyleParam::Value StyleParam::parseNode(StyleParamKey key, const YAML::Node& nod
     case StyleParamKey::collide:
     case StyleParamKey::text_optional:
     case StyleParamKey::priority_texture_shading:
+    case StyleParamKey::text_anchor_texture_shading:
     case StyleParamKey::text_collide: {
         bool result = false;
         if (YamlUtil::getBool(node, result)) {
@@ -485,6 +487,7 @@ std::string StyleParam::toString() const {
     case StyleParamKey::collide:
     case StyleParamKey::text_optional:
     case StyleParamKey::priority_texture_shading:
+    case StyleParamKey::text_anchor_texture_shading:
     case StyleParamKey::text_collide:
         if (!value.is<bool>()) break;
         return k + std::to_string(value.get<bool>());

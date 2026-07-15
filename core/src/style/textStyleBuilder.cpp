@@ -758,6 +758,10 @@ TextStyle::Parameters TextStyleBuilder::applyRule(const DrawRule& _rule,
             p.labelOptions.anchors.count = 4;
         }
 
+        // docs/label-placement-plan.md Task 4: opt-in flag (peak name text only, currently)
+        // for Label::refineAnchor()'s main-thread ridge-avoidance pass.
+        _rule.get(StyleParamKey::text_anchor_texture_shading, p.labelOptions.refineAnchorWithTextureShading);
+
         // child text's repeat group params
         if (_rule.get(StyleParamKey::text_repeat_distance, repeatDistance)) {
             p.labelOptions.repeatDistance = repeatDistance.value;

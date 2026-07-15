@@ -277,3 +277,38 @@ TEST_CASE( "LabelCollider repeat-group suppression radius tracks repeatDistance"
         REQUIRE(labels[1]->state() != Label::State::dead);
     }
 }
+
+// docs/label-placement-plan.md Task 4: Label::refineAnchor() steers a peak name label's
+// anchor away from a strong ridge/canyon texture-shading response, main-thread only, once
+// the elevation mosaic is available. The sampling itself needs a real ElevationManager/
+// RasterSource (heavy to construct in a unit test, same reasoning the Frozen Interface
+// Contract gives for keeping sampleTextureShading's pure core separately testable in
+// rasterMosaicTests.cpp) -- so the switch-or-not *decision* is factored out into
+// Label::pickBetterAnchorIndex(), tested directly here against hand-built cost arrays.
+TEST_CASE( "Label::pickBetterAnchorIndex", "[Core][Label]" ) {
+    SECTION( "keeps current anchor when it's already the best" ) {
+        std::vector<float> costs = {0.1f, 0.5f, 0.5f, 0.5f};
+        REQUIRE(Label::pickBetterAnchorIndex(costs, 0, 0.08f) == -1);
+    }
+
+    SECTION( "switches to a materially better anchor" ) {
+        std::vector<float> costs = {0.6f, 0.05f, 0.5f, 0.5f};
+        REQUIRE(Label::pickBetterAnchorIndex(costs, 0, 0.08f) == 1);
+    }
+
+    SECTION( "does not switch for a marginal, sub-threshold improvement" ) {
+        std::vector<float> costs = {0.30f, 0.25f, 0.5f, 0.5f}; // 0.05 apart, threshold is 0.08
+        REQUIRE(Label::pickBetterAnchorIndex(costs, 0, 0.08f) == -1);
+    }
+
+    SECTION( "out-of-range current index is handled safely" ) {
+        std::vector<float> costs = {0.1f, 0.2f};
+        REQUIRE(Label::pickBetterAnchorIndex(costs, -1, 0.08f) == -1);
+        REQUIRE(Label::pickBetterAnchorIndex(costs, 5, 0.08f) == -1);
+    }
+
+    SECTION( "empty cost list is handled safely" ) {
+        std::vector<float> costs;
+        REQUIRE(Label::pickBetterAnchorIndex(costs, 0, 0.08f) == -1);
+    }
+}

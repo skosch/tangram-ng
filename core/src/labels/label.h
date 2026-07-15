@@ -15,6 +15,7 @@
 #include <string>
 #include <limits>
 #include <memory>
+#include <vector>
 
 namespace Tangram {
 
@@ -78,6 +79,15 @@ public:
         // LabelManager refines such a label's priority once, on the main thread, the first time
         // the elevation mosaic is available at its position -- see Label::refinePriority().
         bool refinePriorityWithTextureShading = false;
+        // docs/label-placement-plan.md Task 4: true for a label (currently only peak name
+        // text, via the `text:anchor_texture_shading` style param) whose anchor fallback
+        // order should be refined once, on the main thread, using the CPU texture-shading
+        // sampler -- steering it away from a candidate anchor that would stamp the label
+        // across a ridge/canyon, the same way Phase 3's salienceOrderedAnchors() already
+        // steers it away from water/road/trail geometry at tile-build time (that term
+        // couldn't include texture shading itself, since the sampler is main-thread-only --
+        // see anchorCandidateCost()'s comment). See Label::refineAnchor().
+        bool refineAnchorWithTextureShading = false;
     };
 
     static const float activation_distance_threshold;
@@ -120,6 +130,34 @@ public:
     // see LabelManager::processLabelUpdate(). worldPos = origin + modelCenter() * scale, same
     // convention as SpriteLabel::setElevation().
     bool refinePriority(ElevationManager& elevMgr, glm::dvec2 origin, double scale);
+
+    // docs/label-placement-plan.md Task 4: attempt to steer this label's anchor fallback
+    // order away from a strong ridge/canyon texture-shading response, main-thread only, the
+    // same "retry every frame until the mosaic is available, then do it once" pattern as
+    // refinePriority() above. No-op (returns true) unless
+    // m_options.refineAnchorWithTextureShading is set, or the label has only one candidate
+    // anchor to begin with. Samples a fixed real-world radius (not the label's actual
+    // measured screen footprint, unlike Phase 3's tile-build-time anchorCandidateCost() --
+    // this runs at the current view zoom/tilt, not the tile's fixed styling zoom, so there's
+    // no single "footprint in world meters" to convert screen pixels through) around each
+    // candidate anchor direction; if a materially better (lower ridge/canyon response)
+    // anchor than the current one is found, moves it to the front of the fallback list and
+    // switches to it immediately via setAnchorIndex(0) -- the normal per-frame
+    // LabelManager::handleOcclusions() collision pass that runs right after this call
+    // re-validates the new position exactly like any other anchor (and falls back further
+    // via nextAnchor() if it turns out to newly collide with something), so no separate
+    // occlusion re-check needs to be triggered here.
+    bool refineAnchor(ElevationManager& elevMgr, glm::dvec2 origin, double scale);
+
+    // Pure decision logic factored out of refineAnchor() so it's unit-testable without a real
+    // ElevationManager/RasterSource (see tests/unit/labelTests.cpp): given a "ridge/canyon
+    // response" cost per candidate anchor (same indexing as Options::anchors, lower = gentler
+    // ground) and the currently-active anchor's index, returns the index that should become
+    // the new anchor[0], or -1 if no switch should happen -- either the current anchor is
+    // already best, or the best alternative isn't enough of an improvement
+    // (_minImprovement) to be worth the switch.
+    static int pickBetterAnchorIndex(const std::vector<float>& _costs, int _currentIndex,
+                                     float _minImprovement);
 
     // If this label tracks a relative's priority (see setRelative()'s _definePriority), copy
     // the relative's current priority again. setRelative() only does this copy once, at
@@ -192,6 +230,9 @@ public:
     // texture-shading value (or immediately, if refinePriorityWithTextureShading isn't set at
     // all) -- mirrors m_elevationSet's "retry every frame until success, then stop" pattern.
     bool m_prominenceRefined = false;
+    // docs/label-placement-plan.md Task 4: mirrors m_prominenceRefined's "retry every frame
+    // until success, then stop" pattern for refineAnchor().
+    bool m_anchorRefined = false;
 #ifdef DEBUG
     std::string debugTag;
 #endif
@@ -236,6 +277,7 @@ namespace std {
             hash_combine(seed, o.priority);
             hash_combine(seed, o.collide);
             hash_combine(seed, o.refinePriorityWithTextureShading);
+            hash_combine(seed, o.refineAnchorWithTextureShading);
             hash_combine(seed, o.repeatDistance);
             hash_combine(seed, o.repeatGroup);
             hash_combine(seed, (int)o.selectTransition.ease);

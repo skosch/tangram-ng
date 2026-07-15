@@ -116,6 +116,21 @@ void LabelManager::processLabelUpdate(const ViewState& _viewState, const LabelSe
             }
         }
 
+        // docs/label-placement-plan.md Task 4: steer this label's anchor away from a strong
+        // ridge/canyon texture-shading response, main-thread only -- same retry pattern as
+        // refinePriority() above. No-op unless the label opted in
+        // (Label::Options::refineAnchorWithTextureShading).
+        if (_elevManager && !label->m_anchorRefined) {
+            if (_tile) {
+                label->m_anchorRefined =
+                    label->refineAnchor(*_elevManager, _tile->getOrigin(), _tile->getScale());
+            } else if (_marker) {
+                double scale = _marker->extent();
+                if (scale <= 0) { scale = MapProjection::metersPerTileAtZoom(_marker->builtZoomLevel()); }
+                label->m_anchorRefined = label->refineAnchor(*_elevManager, _marker->origin(), scale);
+            }
+        }
+
         // terrain depth is from previous frame, so we must compare label position before Label::update()
         glm::vec4 screenCoord = label->screenCoord();   //glm::vec4(0);
         if (recalcPos) {
