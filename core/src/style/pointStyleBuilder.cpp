@@ -626,7 +626,6 @@ bool PointStyleBuilder::addFeature(const Feature& _feat, const DrawRule& _rule) 
         TextStyle::Parameters params = textStyleBuilder.applyRule(_rule, _feat.props, true);
 
         TextStyleBuilder::LabelAttributes attrib;
-        size_t primaryLabelsStart = textLabels.size();
         bool havePrimary = textStyleBuilder.prepareLabel(params, Label::Type::point, attrib);
         if (havePrimary) {
 
@@ -666,37 +665,53 @@ bool PointStyleBuilder::addFeature(const Feature& _feat, const DrawRule& _rule) 
         // elevation glued together -- plenty of peaks have one without the other, and even
         // when both exist, professional cartography places each independently by the same
         // placement-quality rules (Imhof/Yoeli ranking, modulated by ridge/vector
-        // avoidance), only defaulting to a stacked "name, then elevation right below" look
-        // when that's convenient (not worse than placing them separately). So: this label
-        // is a genuine SIBLING of the icon again (relative = the icon, matching the
-        // primary), gets the SAME Imhof-ordered anchor list and the SAME
+        // avoidance). This label is a genuine SIBLING of the icon (relative = the icon,
+        // matching the primary), gets the SAME Imhof-ordered anchor list and the SAME
         // salienceOrderedAnchors() tile-build-time pass as the primary, and independently
         // opts into Label::refineAnchor()'s ridge/vector-aware main-thread refinement
         // (inherited automatically: applySecondaryTextRule() copies the primary's
-        // Parameters, including refineAnchorWithTextureShading, wholesale). The one
-        // deliberate coupling: setStackFallbackTarget(primary) tells refineAnchor() to
-        // treat "directly under the name" as one more scored candidate (preferred, not
-        // required, over an independent compass anchor -- see refineAnchor()'s own doc
-        // comment for the full mechanism and why this is safe against the primary label
-        // dying independently, unlike an earlier version that made this label's actual
-        // `relative` the primary instead of the icon).
-        // Marked `optional` so a placement failure only drops this label, not the icon+
-        // primary -- see LabelCollider::killOccludedLabels.
+        // Parameters, including refineAnchorWithTextureShading, wholesale).
+        //
+        // No stack-fallback/"prefer directly under the name" coupling anymore (revised
+        // 2026-07-16, user report: "elevations are still too far away from the peak dots
+        // sometimes -- their distance seems to be sometimes very close, sometimes quite
+        // far"). That mechanism (setStackFallbackTarget(), removed along with
+        // Label::m_stackFallbackTarget/clearStackFallbackTargetIfEquals()) computed the
+        // elevation's offset from the NAME's own dimension/position when it won -- so the
+        // effective icon-to-elevation distance varied with the name's text length/wrapping
+        // instead of staying constant, exactly the reported inconsistency (and it was
+        // already the second use-after-free source found this session, via
+        // clearStackFallbackTargetIfEquals() -- one less risky pointer relationship to
+        // maintain). Now BOTH labels always use the identical icon-relative anchor formula
+        // (icon radius + own half-extent + anchorGapScale gap, see refineAnchor()), so the
+        // distance from icon to name and icon to elevation is the same fixed value for
+        // every peak, always -- "stacked under the name" is no longer a distinct mode, it's
+        // just what independent close placement often looks like when both happen to pick
+        // vertically adjacent anchors.
+        //
+        // Marked `optional=false` (the default -- see stylus-osm.yaml's text2: block does
+        // NOT set optional, unlike text: which now sets optional:true) so a placement
+        // failure here cascades to occlude+kill the icon (and by extension the name, which
+        // dies when its relative/icon dies) -- see LabelCollider::killOccludedLabels /
+        // LabelManager::handleOcclusions, both keyed on Options::optional. Revised
+        // 2026-07-16, user report: "peak dots shouldn't be shown unless at least an
+        // elevation number is shown... or an elevation AND a name" -- the OLD split (name
+        // non-optional, elevation optional) gated the dot on the wrong label; a dot could
+        // end up on screen with only a bare elevation number and no way to hide it if THAT
+        // failed, or could show with a name but no number. Flipped so the icon strictly
+        // requires a successfully-placed elevation; the name is free extra context that can
+        // fail on its own without hiding the dot+elevation.
         //
         // Deliberately NOT gated on havePrimary (revised 2026-07-16, user report: unnamed
         // elevation-only peaks were rendering their number in the PRIMARY label's big/
         // semibold font -- see stylus-osm.yaml's peak: text: text_source comment). Now the
         // primary's own text_source returns "" (havePrimary=false) whenever there's no
         // name, and text2 is the ONLY place elevation ever renders -- so it must still get
-        // built in that case, or an unnamed peak would show nothing at all. The loop below
-        // already handles primaryLabelsCount == 0 safely (just skips setStackFallbackTarget
-        // -- nothing to stack under when there's no primary label).
+        // built in that case, or an unnamed peak would show nothing at all.
         if (_rule.contains(StyleParamKey::text2_source)) {
             TextStyle::Parameters params2 = textStyleBuilder.applySecondaryTextRule(_rule, _feat.props, params);
             TextStyleBuilder::LabelAttributes attrib2;
             if (!params2.text.empty() && textStyleBuilder.prepareLabel(params2, Label::Type::point, attrib2)) {
-
-                size_t primaryLabelsCount = textLabels.size() - primaryLabelsStart;
 
                 for (size_t i = 0; i < iconsCount; i++) {
                     auto pLabel = static_cast<SpriteLabel*>(m_labels[iconsStart + i].get());
@@ -731,12 +746,15 @@ bool PointStyleBuilder::addFeature(const Feature& _feat, const DrawRule& _rule) 
                     params2.labelOptions.repeatDistance = 0.f;
                     params2.labelOptions.repeatGroup = 0;
 
-                    params2.labelOptions.optional = true;
+                    // optional=false (the default -- applySecondaryTextRule() copies it
+                    // from the primary, which now explicitly sets optional:true in YAML, so
+                    // this MUST be reset here or text2 would inherit the wrong value): see
+                    // this block's top-level comment for why the icon's visibility now
+                    // gates on THIS label succeeding, not the name.
+                    params2.labelOptions.optional = false;
                     // Reset: applySecondaryTextRule() copied the primary's offset too,
-                    // which is meaningless here -- this label computes its own, either via
-                    // the normal anchor mechanism (independent placement) or via
-                    // refineAnchor()'s stack-fallback path (see setStackFallbackTarget()
-                    // below).
+                    // which is meaningless here -- this label always computes its own via
+                    // the normal icon-relative anchor mechanism, independent of the name.
                     params2.labelOptions.offset = glm::vec2(0.f);
 
                     textStyleBuilder.addLabel(Label::Type::point, {{p, p}}, params2, attrib2, _rule);
@@ -748,10 +766,6 @@ bool PointStyleBuilder::addFeature(const Feature& _feat, const DrawRule& _rule) 
                     // top-level comment for why this label no longer makes the primary
                     // its `relative`.
                     textLabels.back()->setRelative(*pLabel, definePriority, defineCollide);
-
-                    if (i < primaryLabelsCount) {
-                        textLabels.back()->setStackFallbackTarget(*textLabels[primaryLabelsStart + i]);
-                    }
                 }
             }
         }

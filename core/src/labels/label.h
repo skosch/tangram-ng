@@ -156,25 +156,21 @@ public:
     // relates a fixed-size footprint to its own tile's coordinate system, not the camera),
     // and fully re-sorts the list by ascending combined cost.
     //
-    // If setStackFallbackTarget() was called (currently only the peak elevation sub-label,
-    // targeting the name label), ALSO scores one more candidate: sitting just below the
-    // target's own current position, aligned to whichever of its edges is nearest the icon
-    // (see the horizontal-alignment switch in the .cpp). This is a *fallback default*, not
-    // a hard link (per user direction: name and elevation don't have to be adjacent in real
-    // topo-map practice -- OSM peaks routinely have one without the other -- so this label
-    // is free to end up anywhere the 8 compass anchors say is best; stacking under the
-    // target is simply preferred, via `kStackPreferenceMargin`, when it isn't meaningfully
-    // worse than the best independent spot). The target pointer is read ONLY here, ONCE
-    // (this whole method only ever runs once per label, see m_anchorRefined) -- its public
-    // dimension()/anchorType()/options() are sampled synchronously to compute a final
-    // absolute m_options.offset if stacking wins, and the pointer itself is never touched
-    // again afterward. m_relative (used for the icon<->label gap and the occlusion-cascade
-    // "die together" logic, needed every frame for the label's whole lifetime) stays the
-    // icon throughout, exactly like every other icon-linked label in this engine -- the
-    // stack-fallback target is a separate, much lower-stakes pointer than m_relative would
-    // be if it pointed at a sibling label instead of the icon (an earlier version of this
-    // mechanism did exactly that, via setRelative(), and was reverted after finding it
-    // couldn't be shown safe against a sibling label dying independently).
+    // Revised 2026-07-16 (user report: "elevations are still too far away from the peak
+    // dots sometimes -- their distance seems to be sometimes very close, sometimes quite
+    // far"): this used to ALSO score a "stack directly under a target label" candidate
+    // (setStackFallbackTarget(), removed) for the peak elevation sub-label. That computed
+    // its offset from the TARGET's own dimension/position, so the effective icon-to-label
+    // distance varied with the target's text length/wrapping instead of staying constant --
+    // exactly the reported inconsistency. Removed entirely: every label now always uses
+    // this same icon-relative formula (icon radius + own half-extent + anchorGapScale gap),
+    // so two sibling labels of the same icon (e.g. a peak's name and elevation) are always
+    // the same fixed distance from it, regardless of which anchors they end up on. A
+    // "stacked under the name" look can still happen when both independently pick
+    // vertically-adjacent anchors, but it's no longer a distinct mode with its own offset
+    // math -- one less pointer relationship to keep safe (this was also the second
+    // use-after-free source found this session, via the target-tracking mechanism this
+    // replaced).
     //
     // The normal per-frame LabelManager::handleOcclusions() collision pass that runs right
     // after this call re-validates the new position exactly like any other anchor (and
@@ -184,29 +180,6 @@ public:
     // vector-clutter term is simply skipped in that case.
     bool refineAnchor(ElevationManager& elevMgr, glm::dvec2 origin, double scale,
                       const AnchorOccupancyGrid* occupancyGrid);
-
-    // Sets a *preferred fallback* position for refineAnchor() (see its doc comment above):
-    // this label will prefer stacking directly under _target when that's cost-competitive
-    // with the best independent compass anchor, but is not required to. Currently only used
-    // for the peak elevation sub-label (targeting the name label) -- see
-    // PointStyleBuilder::addFeature. Does not affect m_relative/occlusion cascading.
-    void setStackFallbackTarget(Label& _target) { m_stackFallbackTarget = &_target; }
-
-    // Real use-after-free bug found during Phase 7 verification (headless launch: garbage
-    // anchor indices, occasionally a full SIGSEGV): a dead label is dropped -- and its
-    // unique_ptr destroyed -- by TextStyleBuilder::build()'s "Add only alive labels" pass,
-    // but nothing invalidated any OTHER label's m_stackFallbackTarget still pointing at it
-    // (there's no cascade between siblings via this pointer -- see setStackFallbackTarget()'s
-    // own comment: "does not affect m_relative/occlusion cascading" -- so a text2/elevation
-    // label with `optional: true` and its own repeatGroup opted out (see stylus-osm.yaml's
-    // peak draw rule) routinely survives a tile-build-time repeat-group/priority cut that
-    // kills its target, the name label, in the very same pass). refineAnchor() then
-    // dereferences the dangling pointer on some LATER frame (whenever the elevation mosaic
-    // finally loads), reading freed/reused memory. Called from build() right before it drops
-    // a dead label -- see build()'s own comment for why an O(n) scan per drop is fine here.
-    void clearStackFallbackTargetIfEquals(const Label* _target) {
-        if (m_stackFallbackTarget == _target) { m_stackFallbackTarget = nullptr; }
-    }
 
     // Pure decision logic factored out of refineAnchor() so it's unit-testable without a
     // real ElevationManager/RasterSource (see tests/unit/labelTests.cpp): given a combined
@@ -309,10 +282,6 @@ protected:
     // sync with m_relative's every frame -- set from setRelative()'s _definePriority; see
     // syncRelativePriority().
     bool m_trackRelativePriority = false;
-    // docs/label-placement-plan.md Task 1 (2026-07-16 redesign): see
-    // setStackFallbackTarget()/refineAnchor()'s doc comments -- read at most once, inside
-    // refineAnchor(), never stored anywhere else or dereferenced again afterward.
-    Label* m_stackFallbackTarget = nullptr;
 
     State m_state;
     FadeEffect m_fade;

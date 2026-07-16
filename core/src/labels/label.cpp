@@ -110,7 +110,7 @@ bool Label::refinePriority(ElevationManager& elevMgr, glm::dvec2 origin, double 
 bool Label::refineAnchor(ElevationManager& elevMgr, glm::dvec2 origin, double scale,
                          const AnchorOccupancyGrid* occupancyGrid) {
     if (!m_options.refineAnchorWithTextureShading) { return true; }
-    if (m_options.anchors.count <= 1 && !m_stackFallbackTarget) { return true; } // nothing to choose between
+    if (m_options.anchors.count <= 1) { return true; } // nothing to choose between
     if (!elevMgr.m_elevationSource) { return false; }
 
     // "Ridge/canyon response" is distance from the texture-shading formula's neutral value
@@ -186,81 +186,12 @@ bool Label::refineAnchor(ElevationManager& elevMgr, glm::dvec2 origin, double sc
         }
     }
 
-    // docs/label-placement-plan.md user feedback 2026-07-16: name and elevation labels
-    // don't have to be adjacent (real topo maps -- and OSM -- routinely have one without
-    // the other), so this is a *preferred fallback*, not a hard link. Score one more
-    // candidate -- sitting just below stackFallbackTarget's current position, aligned to
-    // whichever edge is nearest the icon -- and only take it over the best independent
-    // compass anchor when it isn't meaningfully worse (kStackPreferenceMargin). Reads
-    // stackFallbackTarget's PUBLIC state once, synchronously, right here -- never stored,
-    // never used to change m_relative (which stays the icon throughout, for both the
-    // gap-to-icon math above and the occlusion-cascade "die together" logic) -- so this
-    // introduces no persistent cross-sibling-label pointer.
-    bool haveStack = false;
-    float stackCost = 0.f;
-    glm::vec2 stackOffsetPx(0.f);
-
-    if (m_stackFallbackTarget) {
-        using LabelProperty::Anchor;
-        glm::vec2 targetDim = m_stackFallbackTarget->dimension();
-        Anchor targetAnchor = m_stackFallbackTarget->anchorType();
-        float targetGapScale = m_stackFallbackTarget->options().anchorGapScale;
-        glm::vec2 targetDir = LabelProperty::anchorDirection(targetAnchor);
-
-        // Where the target itself sits relative to the (shared) icon -- mirrors
-        // TextLabel::applyAnchor()'s own formula exactly.
-        glm::vec2 targetOffsetPx = targetDir * (targetDim + iconDim * targetGapScale) * 0.5f;
-
-        // This label, stacked just below the target, in the target's own local frame
-        // (dir=(0,1) = "below" regardless of which way targetDir itself points).
-        const float kStackGapScale = 0.35f; // tune by eye
-        glm::vec2 stackExtraPx = glm::vec2(0.f, 1.f) * (halfExtentPx * 2.f + targetDim * kStackGapScale) * 0.5f;
-
-        // Horizontal alignment: left-align under a right-anchored target (both edges
-        // start from the same left margin, reading like a line break), right-align under
-        // a left-anchored one, stay centered under a centered one.
-        float dx = 0.f;
-        switch (targetAnchor) {
-            case Anchor::right:
-            case Anchor::top_right:
-            case Anchor::bottom_right:
-                dx = -(targetDim.x - dimension().x) * 0.5f;
-                break;
-            case Anchor::left:
-            case Anchor::top_left:
-            case Anchor::bottom_left:
-                dx = (targetDim.x - dimension().x) * 0.5f;
-                break;
-            default:
-                dx = 0.f;
-                break;
-        }
-
-        glm::vec2 candidateOffsetPx = targetOffsetPx + stackExtraPx + glm::vec2(dx, 0.f);
-        glm::vec2 candidateCenterTile = iconPosTile + candidateOffsetPx / tileSizePx;
-
-        if (!sampleFootprintCost(candidateCenterTile, stackCost)) {
-            return false; // retry next frame
-        }
-        stackOffsetPx = candidateOffsetPx;
-        haveStack = true;
-    }
-
-    if (haveStack) {
-        float bestCompass = costs.empty() ? std::numeric_limits<float>::max()
-                                           : *std::min_element(costs.begin(), costs.end());
-        const float kStackPreferenceMargin = 0.1f; // tune by eye
-        if (stackCost <= bestCompass + kStackPreferenceMargin) {
-            m_options.anchors = LabelProperty::Anchors(LabelProperty::Anchor::center);
-            m_options.offset = stackOffsetPx;
-            setAnchorIndex(0);
-            return true;
-        }
-    }
-
-    // Independent placement: fully re-sort the compass anchors by ascending cost -- this
-    // only ever runs once per label (see m_anchorRefined), so there's no per-frame flicker/
-    // churn risk to guard against with a "only switch if meaningfully better" threshold.
+    // Fully re-sort the compass anchors by ascending cost -- this only ever runs once per
+    // label (see m_anchorRefined), so there's no per-frame flicker/churn risk to guard
+    // against with a "only switch if meaningfully better" threshold. No more "stack
+    // directly under a target label" special case (removed 2026-07-16, see this method's
+    // header comment) -- every label, including a peak's elevation sub-label, always picks
+    // among these same icon-relative compass anchors.
     if (!costs.empty()) {
         std::vector<int> order = sortAnchorIndicesByCost(costs);
         std::array<LabelProperty::Anchor, LabelProperty::max_anchors> sorted;
