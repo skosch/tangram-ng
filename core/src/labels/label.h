@@ -24,6 +24,7 @@ struct ViewState;
 struct OBBBuffer;
 class Texture;
 class ElevationManager;
+class AnchorOccupancyGrid;
 
 class Label {
 
@@ -131,33 +132,44 @@ public:
     // convention as SpriteLabel::setElevation().
     bool refinePriority(ElevationManager& elevMgr, glm::dvec2 origin, double scale);
 
-    // docs/label-placement-plan.md Task 4: attempt to steer this label's anchor fallback
-    // order away from a strong ridge/canyon texture-shading response, main-thread only, the
-    // same "retry every frame until the mosaic is available, then do it once" pattern as
-    // refinePriority() above. No-op (returns true) unless
-    // m_options.refineAnchorWithTextureShading is set, or the label has only one candidate
-    // anchor to begin with. Samples a fixed real-world radius (not the label's actual
-    // measured screen footprint, unlike Phase 3's tile-build-time anchorCandidateCost() --
-    // this runs at the current view zoom/tilt, not the tile's fixed styling zoom, so there's
-    // no single "footprint in world meters" to convert screen pixels through) around each
-    // candidate anchor direction; if a materially better (lower ridge/canyon response)
-    // anchor than the current one is found, moves it to the front of the fallback list and
-    // switches to it immediately via setAnchorIndex(0) -- the normal per-frame
-    // LabelManager::handleOcclusions() collision pass that runs right after this call
-    // re-validates the new position exactly like any other anchor (and falls back further
-    // via nextAnchor() if it turns out to newly collide with something), so no separate
-    // occlusion re-check needs to be triggered here.
-    bool refineAnchor(ElevationManager& elevMgr, glm::dvec2 origin, double scale);
+    // docs/label-placement-plan.md Task 4 (revised 2026-07-15 after review): steer this
+    // label's anchor fallback order away from both a strong ridge/canyon texture-shading
+    // response AND nearby vector clutter (water/road/trail, via the tile's
+    // AnchorOccupancyGrid -- the same structure Phase 3's tile-build-time
+    // anchorCandidateCost() uses), main-thread only, the same "retry every frame until the
+    // mosaic is available, then do it once" pattern as refinePriority() above. No-op
+    // (returns true) unless m_options.refineAnchorWithTextureShading is set, or the label
+    // has only one candidate anchor to begin with. For each candidate anchor, samples cost
+    // at several points spread across that anchor's actual footprint (this label's own
+    // measured screen dimension() plus its relative icon's radius, converted to the tile's
+    // normalized [0,1] local space via MapProjection::tileSize() -- the same fixed
+    // pixels-per-tile convention anchorCandidateCost() uses; this is a per-tile-geometry
+    // conversion, not a screen/view-zoom-dependent one, so it's valid to reuse here even
+    // though this runs at the current view zoom/tilt rather than the tile's own styling
+    // zoom), not just a single fixed-radius point -- see anchorCandidateCost()'s own
+    // comment for why (an earlier version of this method sampled one fixed-25m-radius
+    // point per direction; too coarse, and 25m has no principled connection to the label's
+    // actual size). Combines the texture-shading and occupancy-grid costs (equal weight;
+    // tune by eye), fully re-sorts the candidate list by ascending combined cost (not just
+    // "switch if better than current" -- with this only running once per label, there's no
+    // flicker/churn risk to guard against), and switches to the new best anchor via
+    // setAnchorIndex(0). The normal per-frame LabelManager::handleOcclusions() collision
+    // pass that runs right after this call re-validates the new position exactly like any
+    // other anchor (and falls back further via nextAnchor() if it turns out to newly
+    // collide with something), so no separate occlusion re-check needs to be triggered
+    // here. `_occupancyGrid` may be null (e.g. a marker label, or a tile with no water/
+    // transportation geometry) -- the vector-clutter term is simply skipped in that case.
+    bool refineAnchor(ElevationManager& elevMgr, glm::dvec2 origin, double scale,
+                      const AnchorOccupancyGrid* occupancyGrid);
 
-    // Pure decision logic factored out of refineAnchor() so it's unit-testable without a real
-    // ElevationManager/RasterSource (see tests/unit/labelTests.cpp): given a "ridge/canyon
-    // response" cost per candidate anchor (same indexing as Options::anchors, lower = gentler
-    // ground) and the currently-active anchor's index, returns the index that should become
-    // the new anchor[0], or -1 if no switch should happen -- either the current anchor is
-    // already best, or the best alternative isn't enough of an improvement
-    // (_minImprovement) to be worth the switch.
-    static int pickBetterAnchorIndex(const std::vector<float>& _costs, int _currentIndex,
-                                     float _minImprovement);
+    // Pure decision logic factored out of refineAnchor() so it's unit-testable without a
+    // real ElevationManager/RasterSource (see tests/unit/labelTests.cpp): given a combined
+    // cost per candidate anchor (same indexing as Options::anchors, lower = better), returns
+    // the permutation of [0, costs.size()) that stably sorts anchors by ascending cost --
+    // ties keep their original relative order, so an unmodified/all-tied cost list is a
+    // no-op (preserves whatever base order -- e.g. the Imhof/Yoeli default, see
+    // TextStyleBuilder::applyRule -- the caller started with).
+    static std::vector<int> sortAnchorIndicesByCost(const std::vector<float>& _costs);
 
     // If this label tracks a relative's priority (see setRelative()'s _definePriority), copy
     // the relative's current priority again. setRelative() only does this copy once, at

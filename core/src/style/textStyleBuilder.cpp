@@ -753,9 +753,28 @@ TextStyle::Parameters TextStyleBuilder::applyRule(const DrawRule& _rule,
 
         _rule.get(StyleParamKey::text_anchor, p.labelOptions.anchors);
         if (p.labelOptions.anchors.count == 0) {
-            p.labelOptions.anchors.anchor = { {LabelProperty::Anchor::bottom, LabelProperty::Anchor::top,
-                                               LabelProperty::Anchor::right, LabelProperty::Anchor::left} };
-            p.labelOptions.anchors.count = 4;
+            // docs/label-placement-plan.md Task 4 follow-up: default fallback order for
+            // icon-linked text with no explicit text_anchor, changed from the old fixed
+            // 4-direction {bottom, top, right, left} to the classic 8-position cartographic
+            // point-label priority ranking (Yoeli, P. (1972), "The Logic of Automated Map
+            // Lettering," The Cartographic Journal 9(2):99-108 -- the numeric ranking
+            // commonly (if loosely) attributed to Imhof's descriptive principles;
+            // Christensen/Marks/Shieber, "An Empirical Study of Algorithms for
+            // Point-Feature Label Placement," ACM ToG 14(3), 1995, adopt the same ranking
+            // as their placement-quality objective function): upper-right first (Latin-
+            // script reading order and ascender-heavy letterforms make a label above/right
+            // of its symbol read as unambiguously "attached" to it), then upper-left,
+            // lower-left, lower-right, then the four axis-centered sides (right, top, left,
+            // bottom last). This is only the STARTING order -- both
+            // TextStyleBuilder::salienceOrderedAnchors() (tile-build time, vector-proximity
+            // cost) and Label::refineAnchor() (main-thread, texture-shading + vector cost)
+            // re-sort it per-label; this default only matters as the base/tie-break order
+            // before that happens, or when neither refinement runs (e.g. no terrain data).
+            p.labelOptions.anchors.anchor = { {LabelProperty::Anchor::top_right, LabelProperty::Anchor::top_left,
+                                               LabelProperty::Anchor::bottom_left, LabelProperty::Anchor::bottom_right,
+                                               LabelProperty::Anchor::right, LabelProperty::Anchor::top,
+                                               LabelProperty::Anchor::left, LabelProperty::Anchor::bottom} };
+            p.labelOptions.anchors.count = 8;
         }
 
         // docs/label-placement-plan.md Task 4: opt-in flag (peak name text only, currently)

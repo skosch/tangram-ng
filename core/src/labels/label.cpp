@@ -1,5 +1,6 @@
 #include "labels/label.h"
 
+#include "labels/anchorOccupancyGrid.h"
 #include "log.h"
 #include "platform.h"
 #include "tile/tile.h"
@@ -98,18 +99,11 @@ bool Label::refinePriority(ElevationManager& elevMgr, glm::dvec2 origin, double 
     return true;
 }
 
-bool Label::refineAnchor(ElevationManager& elevMgr, glm::dvec2 origin, double scale) {
+bool Label::refineAnchor(ElevationManager& elevMgr, glm::dvec2 origin, double scale,
+                         const AnchorOccupancyGrid* occupancyGrid) {
     if (!m_options.refineAnchorWithTextureShading) { return true; }
     if (m_options.anchors.count <= 1) { return true; } // nothing to choose between
     if (!elevMgr.m_elevationSource) { return false; }
-
-    ProjectedMeters worldPos = origin + glm::dvec2(modelCenter()) * scale;
-
-    // Fixed real-world sampling radius, not the label's actual measured extent -- see this
-    // method's doc comment in label.h for why a screen-pixel footprint can't be converted to
-    // world meters here. 25m is in the right ballpark for how far a small peak label's text
-    // actually sits from its icon on the ground at typical label-visible zooms; tune by eye.
-    const double kSampleRadiusMeters = 25.0;
 
     // "Ridge/canyon response" is distance from the texture-shading formula's neutral value
     // (0.5, see textureShading.cpp/hillshade.yaml's contrast curve) -- a gentle slope reads
@@ -117,52 +111,91 @@ bool Label::refineAnchor(ElevationManager& elevMgr, glm::dvec2 origin, double sc
     // value away from it. Lower cost = gentler ground to stamp the label across.
     auto ridgeCost = [](float shade) { return std::fabs(shade - 0.5f); };
 
+    // Candidate footprint geometry, mirroring TextStyleBuilder::anchorCandidateCost()
+    // (tile-build-time equivalent of this function): icon radius + half this label's own
+    // measured extent, offset from the icon position in the anchor's direction. Icon
+    // radius is approximated the same way PointStyleBuilder does (half the icon's larger
+    // dimension) -- 0 if this label isn't an icon-linked child (e.g. a standalone text
+    // label), which just means the footprint starts right at the label's own position.
+    glm::vec2 iconDim = isChild() ? m_relative->dimension() : glm::vec2(0.f);
+    float iconRadiusPx = 0.5f * std::max(iconDim.x, iconDim.y);
+    glm::vec2 halfExtentPx = dimension() * 0.5f;
+
+    // Convert pixel-space offsets to the tile's normalized [0,1] local space modelCenter()
+    // and AnchorOccupancyGrid are both expressed in. MapProjection::tileSize() (pixels per
+    // full tile width) is a fixed constant, not the current view's screen projection -- see
+    // this method's doc comment in label.h for why that's the correct conversion to reuse
+    // here even though this runs at an arbitrary view zoom/tilt.
+    float tileSizePx = float(MapProjection::tileSize());
+    glm::vec2 halfExtentTile = halfExtentPx / tileSizePx;
+
+    // Sample a handful of points spread across each candidate's footprint (not just its
+    // center), matching anchorCandidateCost()'s pattern.
+    constexpr int kNumSamples = 5;
+    const glm::vec2 sampleOffsets[kNumSamples] = {
+        glm::vec2(0.f, 0.f),
+        glm::vec2(-1.f, -1.f), glm::vec2(1.f, -1.f),
+        glm::vec2(-1.f, 1.f), glm::vec2(1.f, 1.f),
+    };
+
+    // Equal weight between "don't stamp across a ridge" and "don't stamp across a river/
+    // road/trail" -- both costs are roughly [0, 0.5]-[0,1] in practice, comparable
+    // magnitude; tune by eye if one term should dominate.
+    const float kOccupancyWeight = 1.0f;
+
     std::vector<float> costs(m_options.anchors.count);
 
     for (int i = 0; i < m_options.anchors.count; i++) {
         glm::vec2 dir = LabelProperty::anchorDirection(m_options.anchors.anchor[i]);
-        ProjectedMeters samplePos = worldPos + glm::dvec2(dir) * kSampleRadiusMeters;
+        float offsetPx = iconRadiusPx + glm::length(halfExtentPx);
+        glm::vec2 footprintCenterTile = (dir * offsetPx) / tileSizePx;
 
-        bool ok = false;
-        float shade = sampleTextureShading(*elevMgr.m_elevationSource, samplePos, ok);
-        if (!ok) { return false; } // retry next frame once every candidate is sampleable
+        float shadeCostSum = 0.f;
+        float occupancyCostSum = 0.f;
 
-        costs[i] = ridgeCost(shade);
-    }
+        for (const auto& sampleOffset : sampleOffsets) {
+            glm::vec2 sampleTile = glm::vec2(modelCenter()) + footprintCenterTile + sampleOffset * halfExtentTile;
+            ProjectedMeters sampleWorld = origin + glm::dvec2(sampleTile) * scale;
 
-    // Only switch for a meaningful improvement -- avoid churn between near-tied candidates.
-    const float kMinImprovement = 0.08f;
-    int bestIndex = pickBetterAnchorIndex(costs, m_anchorIndex, kMinImprovement);
-    if (bestIndex >= 0) {
-        // Rotate the chosen anchor to the front of the fallback list (mirrors Phase 3's
-        // salienceOrderedAnchors()'s "resort, hand to the existing anchor-cycling mechanism
-        // unchanged" approach) and switch to it now.
-        LabelProperty::Anchor best = m_options.anchors.anchor[bestIndex];
-        for (int i = bestIndex; i > 0; i--) {
-            m_options.anchors.anchor[i] = m_options.anchors.anchor[i - 1];
+            bool ok = false;
+            float shade = sampleTextureShading(*elevMgr.m_elevationSource, sampleWorld, ok);
+            if (!ok) { return false; } // retry next frame once every sample is available
+
+            shadeCostSum += ridgeCost(shade);
+            if (occupancyGrid) {
+                occupancyCostSum += occupancyGrid->sample(sampleTile);
+            }
         }
-        m_options.anchors.anchor[0] = best;
-        setAnchorIndex(0);
+
+        costs[i] = (shadeCostSum + kOccupancyWeight * occupancyCostSum) / float(kNumSamples);
     }
+
+    // Fully re-sort by ascending combined cost -- this only ever runs once per label (see
+    // m_anchorRefined), so there's no per-frame flicker/churn risk to guard against with a
+    // "only switch if meaningfully better" threshold the way an earlier version of this
+    // method did.
+    std::vector<int> order = sortAnchorIndicesByCost(costs);
+    std::array<LabelProperty::Anchor, LabelProperty::max_anchors> sorted;
+    for (size_t i = 0; i < order.size(); i++) {
+        sorted[i] = m_options.anchors.anchor[order[i]];
+    }
+    for (size_t i = 0; i < order.size(); i++) {
+        m_options.anchors.anchor[i] = sorted[i];
+    }
+    setAnchorIndex(0);
 
     return true;
 }
 
-int Label::pickBetterAnchorIndex(const std::vector<float>& _costs, int _currentIndex,
-                                 float _minImprovement) {
-    if (_costs.empty() || _currentIndex < 0 || _currentIndex >= (int)_costs.size()) {
-        return -1;
-    }
+std::vector<int> Label::sortAnchorIndicesByCost(const std::vector<float>& _costs) {
+    std::vector<int> order(_costs.size());
+    for (size_t i = 0; i < order.size(); i++) { order[i] = int(i); }
 
-    int bestIndex = 0;
-    for (size_t i = 1; i < _costs.size(); i++) {
-        if (_costs[i] < _costs[bestIndex]) { bestIndex = (int)i; }
-    }
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+        return _costs[a] < _costs[b];
+    });
 
-    if (bestIndex == _currentIndex) { return -1; }
-    if (_costs[bestIndex] + _minImprovement >= _costs[_currentIndex]) { return -1; }
-
-    return bestIndex;
+    return order;
 }
 
 bool Label::visibleState() const {

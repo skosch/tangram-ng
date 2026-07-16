@@ -279,36 +279,43 @@ TEST_CASE( "LabelCollider repeat-group suppression radius tracks repeatDistance"
 }
 
 // docs/label-placement-plan.md Task 4: Label::refineAnchor() steers a peak name label's
-// anchor away from a strong ridge/canyon texture-shading response, main-thread only, once
-// the elevation mosaic is available. The sampling itself needs a real ElevationManager/
-// RasterSource (heavy to construct in a unit test, same reasoning the Frozen Interface
-// Contract gives for keeping sampleTextureShading's pure core separately testable in
-// rasterMosaicTests.cpp) -- so the switch-or-not *decision* is factored out into
-// Label::pickBetterAnchorIndex(), tested directly here against hand-built cost arrays.
-TEST_CASE( "Label::pickBetterAnchorIndex", "[Core][Label]" ) {
-    SECTION( "keeps current anchor when it's already the best" ) {
-        std::vector<float> costs = {0.1f, 0.5f, 0.5f, 0.5f};
-        REQUIRE(Label::pickBetterAnchorIndex(costs, 0, 0.08f) == -1);
+// anchor away from both a strong ridge/canyon texture-shading response and nearby vector
+// clutter (water/road/trail), main-thread only, once the elevation mosaic is available. The
+// sampling itself needs a real ElevationManager/RasterSource (heavy to construct in a unit
+// test, same reasoning the Frozen Interface Contract gives for keeping
+// sampleTextureShading's pure core separately testable in rasterMosaicTests.cpp) -- so the
+// sort *decision* is factored out into Label::sortAnchorIndicesByCost(), tested directly
+// here against hand-built cost arrays.
+TEST_CASE( "Label::sortAnchorIndicesByCost", "[Core][Label]" ) {
+    SECTION( "already-sorted costs come back unchanged" ) {
+        std::vector<float> costs = {0.1f, 0.2f, 0.3f, 0.4f};
+        std::vector<int> order = Label::sortAnchorIndicesByCost(costs);
+        REQUIRE(order == std::vector<int>{0, 1, 2, 3});
     }
 
-    SECTION( "switches to a materially better anchor" ) {
-        std::vector<float> costs = {0.6f, 0.05f, 0.5f, 0.5f};
-        REQUIRE(Label::pickBetterAnchorIndex(costs, 0, 0.08f) == 1);
+    SECTION( "reorders by ascending cost" ) {
+        std::vector<float> costs = {0.6f, 0.05f, 0.5f, 0.1f};
+        std::vector<int> order = Label::sortAnchorIndicesByCost(costs);
+        REQUIRE(order == std::vector<int>{1, 3, 2, 0});
     }
 
-    SECTION( "does not switch for a marginal, sub-threshold improvement" ) {
-        std::vector<float> costs = {0.30f, 0.25f, 0.5f, 0.5f}; // 0.05 apart, threshold is 0.08
-        REQUIRE(Label::pickBetterAnchorIndex(costs, 0, 0.08f) == -1);
-    }
-
-    SECTION( "out-of-range current index is handled safely" ) {
-        std::vector<float> costs = {0.1f, 0.2f};
-        REQUIRE(Label::pickBetterAnchorIndex(costs, -1, 0.08f) == -1);
-        REQUIRE(Label::pickBetterAnchorIndex(costs, 5, 0.08f) == -1);
+    SECTION( "ties keep their original relative order (stable sort)" ) {
+        // Mirrors an all-tied-cost list (e.g. no occupancy grid, flat texture shading):
+        // the caller's original order (e.g. the Imhof/Yoeli default) must survive intact.
+        std::vector<float> costs = {0.5f, 0.5f, 0.5f, 0.5f};
+        std::vector<int> order = Label::sortAnchorIndicesByCost(costs);
+        REQUIRE(order == std::vector<int>{0, 1, 2, 3});
     }
 
     SECTION( "empty cost list is handled safely" ) {
         std::vector<float> costs;
-        REQUIRE(Label::pickBetterAnchorIndex(costs, 0, 0.08f) == -1);
+        std::vector<int> order = Label::sortAnchorIndicesByCost(costs);
+        REQUIRE(order.empty());
+    }
+
+    SECTION( "single candidate is a no-op" ) {
+        std::vector<float> costs = {0.42f};
+        std::vector<int> order = Label::sortAnchorIndicesByCost(costs);
+        REQUIRE(order == std::vector<int>{0});
     }
 }
