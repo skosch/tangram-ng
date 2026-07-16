@@ -64,7 +64,7 @@ void TextLabel::applyAnchor(Anchor _anchor) {
     }
 
     glm::vec2 offset = m_dim;
-    if (isChild()) { offset += m_relative->dimension(); }
+    if (isChild()) { offset += m_relative->dimension() * m_options.anchorGapScale; }
 
     m_anchor = LabelProperty::anchorDirection(_anchor) * offset * 0.5f;
 }

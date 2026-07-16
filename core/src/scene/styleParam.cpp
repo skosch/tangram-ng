@@ -73,6 +73,7 @@ const std::map<std::string, StyleParamKey> s_StyleParamMap = {
     {"text2:text_source", StyleParamKey::text2_source},
     {"text:align", StyleParamKey::text_align},
     {"text:anchor", StyleParamKey::text_anchor},
+    {"text:anchor_gap_scale", StyleParamKey::text_anchor_gap_scale},
     {"text:anchor_texture_shading", StyleParamKey::text_anchor_texture_shading},
     {"text:buffer", StyleParamKey::text_buffer},
     {"text:collide", StyleParamKey::text_collide},
@@ -372,6 +373,7 @@ StyleParam::Value StyleParam::parseNode(StyleParamKey key, const YAML::Node& nod
     case StyleParamKey::miter_limit:
     case StyleParamKey::outline_miter_limit:
     case StyleParamKey::placement_min_length_ratio:
+    case StyleParamKey::text_anchor_gap_scale:
     case StyleParamKey::text_font_stroke_width: {
         float floatValue;
         if (YamlUtil::getFloat(node, floatValue, true)) {
@@ -524,6 +526,7 @@ std::string StyleParam::toString() const {
     case StyleParamKey::miter_limit:
     case StyleParamKey::angle:
     case StyleParamKey::outline_miter_limit:
+    case StyleParamKey::text_anchor_gap_scale:
         if (!value.is<float>()) break;
         return k + std::to_string(value.get<float>());
     default:

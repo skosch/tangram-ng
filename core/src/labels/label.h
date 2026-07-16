@@ -72,6 +72,13 @@ public:
         bool flat = false;
         float angle = 0.f;
         uint32_t featureId = 0;
+        // docs/label-placement-plan.md Task 1/user feedback 2026-07-15 ("labels too far
+        // from peaks"): TextLabel::applyAnchor()/CurvedLabel::applyAnchor() add the full
+        // relative's dimension() into the icon<->label gap (offset = m_dim +
+        // relative.dimension(), then halved) -- scales that contribution, 1.0 = unchanged
+        // default. A child label can set this below 1 to sit closer to its relative than
+        // the standard "clear of the whole icon" gap.
+        float anchorGapScale = 1.0f;
         // docs/label-placement-plan.md Phase 2: true for a label (currently only peak icons,
         // via the `priority_texture_shading` style param) whose `priority` above was computed
         // from a provisional fallback (pure-elevation weighting) at tile-build time because the
@@ -212,7 +219,29 @@ public:
     bool isChild() const { return bool(m_relative); }
     bool isSibling() const { return bool(m_relative) && bool(m_relative->relative()); }
 
-    void setRelative(Label& _relative, bool _definePriority, bool _defineCollide);
+    // docs/label-placement-plan.md Task 1, redesigned 2026-07-15 after user feedback that
+    // the elevation sub-label's separate anchoring "made no sense": _trackAnchor lets a
+    // label (currently just the peak elevation sub-label) follow _relative's *horizontal*
+    // side every frame (see syncRelativeAnchor()) -- this label should itself use a single
+    // fixed anchor (typically `bottom`, so it always stacks directly below _relative
+    // regardless of _relative's own anchor -- see applyAnchor()'s single-level relative-
+    // dimension offset, which this deliberately reuses rather than re-deriving) and
+    // _relative here is expected to be the sibling label to stack under (e.g. the peak
+    // name text), not necessarily the same Label _definePriority/_defineCollide track.
+    void setRelative(Label& _relative, bool _definePriority, bool _defineCollide,
+                     bool _trackAnchor = false);
+
+    // If this label tracks a relative's horizontal alignment (see setRelative()'s
+    // _trackAnchor), adjusts this label's horizontal offset every frame to align with
+    // _relative's current side: _relative anchored on its right side (right/top_right/
+    // bottom_right) -> align this label's LEFT edge with _relative's left edge (both read
+    // as starting from the same left margin, like a line break); _relative anchored on its
+    // left side -> align RIGHT edges instead; _relative centered (top/bottom/center) ->
+    // stay centered under it. _relative's own anchor can change after construction (see
+    // Label::refineAnchor(), main-thread, runs later than tile build) so this needs
+    // re-evaluating every frame, not just once -- cheap no-op when _relative's anchor
+    // hasn't changed side. See LabelManager::processLabelUpdate().
+    void syncRelativeAnchor();
 
     LabelProperty::Anchor anchorType() const {
         return m_options.anchors[m_anchorIndex];
@@ -263,6 +292,10 @@ protected:
     // sync with m_relative's every frame -- set from setRelative()'s _definePriority; see
     // syncRelativePriority().
     bool m_trackRelativePriority = false;
+    // docs/label-placement-plan.md Task 1 (2026-07-15 redesign): whether this label's
+    // horizontal alignment should track m_relative's current anchor side every frame --
+    // set from setRelative()'s _trackAnchor; see syncRelativeAnchor().
+    bool m_trackRelativeAnchor = false;
 
     State m_state;
     FadeEffect m_fade;

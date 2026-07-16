@@ -781,6 +781,10 @@ TextStyle::Parameters TextStyleBuilder::applyRule(const DrawRule& _rule,
         // for Label::refineAnchor()'s main-thread ridge-avoidance pass.
         _rule.get(StyleParamKey::text_anchor_texture_shading, p.labelOptions.refineAnchorWithTextureShading);
 
+        // docs/label-placement-plan.md user feedback 2026-07-15 ("labels too far from
+        // peaks"): optional icon<->label gap scale, default unchanged (1.0) unless set.
+        _rule.get(StyleParamKey::text_anchor_gap_scale, p.labelOptions.anchorGapScale);
+
         // child text's repeat group params
         if (_rule.get(StyleParamKey::text_repeat_distance, repeatDistance)) {
             p.labelOptions.repeatDistance = repeatDistance.value;

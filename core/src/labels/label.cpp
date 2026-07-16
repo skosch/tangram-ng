@@ -55,9 +55,11 @@ Label::Label(glm::vec2 _size, Type _type, Options _options)
 
 Label::~Label() {}
 
-void Label::setRelative(Label& _relative, bool _definePriority, bool _defineCollide) {
+void Label::setRelative(Label& _relative, bool _definePriority, bool _defineCollide,
+                        bool _trackAnchor) {
     m_relative = &_relative;
     m_trackRelativePriority = _definePriority;
+    m_trackRelativeAnchor = _trackAnchor;
 
     if (_definePriority) {
         m_options.priority = _relative.options().priority;  //+ 0.5f;
@@ -68,6 +70,10 @@ void Label::setRelative(Label& _relative, bool _definePriority, bool _defineColl
     }
 
     applyAnchor(m_options.anchors[m_anchorIndex]);
+
+    if (_trackAnchor) {
+        syncRelativeAnchor();
+    }
 }
 
 void Label::syncRelativePriority() {
@@ -79,6 +85,46 @@ void Label::syncRelativePriority() {
     if (m_trackRelativePriority && m_relative) {
         m_options.priority = m_relative->options().priority;
     }
+}
+
+void Label::syncRelativeAnchor() {
+    if (!m_trackRelativeAnchor || !m_relative) { return; }
+
+    using LabelProperty::Anchor;
+    Anchor relAnchor = m_relative->anchorType();
+    glm::vec2 relDim = m_relative->dimension();
+
+    // Without correction, applyAnchor() centers this label under _relative (dir.x == 0 for
+    // the fixed `bottom` anchor this label uses -- see setRelative()'s doc comment). To
+    // align LEFT edges instead (this label's left edge == _relative's left edge), this
+    // label's center must move by -(relDim.x - m_dim.x)/2 from that centered position
+    // (negative = leftward when _relative is wider, which it usually is): e.g. relDim.x=100,
+    // m_dim.x=30 -> centered has this label's left edge 35px right of _relative's left edge;
+    // moving the center left by (100-30)/2=35 removes exactly that gap. Symmetric (opposite
+    // sign) for right-edge alignment.
+    float dx;
+    switch (relAnchor) {
+        case Anchor::right:
+        case Anchor::top_right:
+        case Anchor::bottom_right:
+            // _relative sits to the right of ITS OWN relative (e.g. the peak icon), so its
+            // own left edge is the near/inner edge -- align this label's left edge to it,
+            // reading like a line break under _relative's text.
+            dx = -(relDim.x - m_dim.x) * 0.5f;
+            break;
+        case Anchor::left:
+        case Anchor::top_left:
+        case Anchor::bottom_left:
+            dx = (relDim.x - m_dim.x) * 0.5f;
+            break;
+        default:
+            // top/bottom/center: _relative is horizontally centered on its own relative,
+            // so this label should stay centered under it too.
+            dx = 0.f;
+            break;
+    }
+
+    m_options.offset.x = dx;
 }
 
 bool Label::refinePriority(ElevationManager& elevMgr, glm::dvec2 origin, double scale) {

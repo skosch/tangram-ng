@@ -69,6 +69,11 @@ enum class StyleParamKey : uint8_t {
     text2_source,
     text_align,
     text_anchor,
+    // docs/label-placement-plan.md user feedback 2026-07-15 ("labels too far from
+    // peaks"): scales the icon<->label gap in TextLabel::applyAnchor()/CurvedLabel::
+    // applyAnchor(); see Label::Options::anchorGapScale. Default 1.0 (unchanged) when
+    // unset.
+    text_anchor_gap_scale,
     // docs/label-placement-plan.md Task 4: opt-in flag (peak name text only, currently) --
     // mirrors priority_texture_shading's pattern exactly, but for Label::refineAnchor()
     // instead of refinePriority(). See Label::Options::refineAnchorWithTextureShading.
