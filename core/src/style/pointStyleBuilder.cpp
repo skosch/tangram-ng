@@ -712,6 +712,25 @@ bool PointStyleBuilder::addFeature(const Feature& _feat, const DrawRule& _rule) 
                     // clutter the way the name label does.
                     params2.labelOptions.anchors = LabelProperty::Anchors(LabelProperty::Anchor::bottom);
 
+                    // Real bug found via user report ("elevation number isn't showing at
+                    // all"): applySecondaryTextRule() copies the primary label's Parameters
+                    // wholesale, including its repeatGroup/repeatDistance -- meaning this
+                    // label was inheriting the exact same repeatGroup as the primary name
+                    // label (and every other peak's name label sharing this rule). LabelManager
+                    // ::withinRepeatDistance() checks proximity within a repeatGroup with NO
+                    // exemption for isChild()/relative() (unlike the real per-anchor collision
+                    // loop, which does skip a label's own relative) -- so whenever the primary
+                    // successfully placed nearby (nearly always, since this label sits right
+                    // next to it by construction), this label got occluded outright by the
+                    // repeat-group check, before ever reaching real per-anchor collision
+                    // testing. Disabling repeat-group participation here (0 = opts out, see
+                    // TextStyleBuilder::applyRule's `if (repeatDistance > 0.f)` gate) is
+                    // correct: this label isn't a competing peak candidate that needs
+                    // deduplicating against other same-rule labels, it's a fixed decoration of
+                    // one specific already-chosen peak.
+                    params2.labelOptions.repeatDistance = 0.f;
+                    params2.labelOptions.repeatGroup = 0;
+
                     // Push straight down by the primary label's actual measured height
                     // (read back from the already-built primary label for this same icon)
                     // plus a small gap, so it sits just below the name instead of
