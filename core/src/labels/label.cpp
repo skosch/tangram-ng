@@ -91,11 +91,19 @@ bool Label::refinePriority(ElevationManager& elevMgr, glm::dvec2 origin, double 
     if (!ok) { return false; }
 
     // Original priority (computed at tile-build time, see the peak draw rule's `priority:`
-    // function in stylus-osm.yaml) is always `global.priority.peak + <fractional in (0,1)>`
-    // (today's pure-elevation weighting), so its integer part reliably recovers the tier;
-    // replace the fractional part with the texture-shading-derived one -- see
-    // docs/label-placement-plan.md Phase 2, design step 3.
-    m_options.priority = std::floor(m_options.priority) - compressTextureShading(shade);
+    // function in stylus-osm.yaml) is always `<half-tier band> + <fractional in [0, 0.4]>`,
+    // where the peak tier is split into two HALF-integer bands -- named peaks get
+    // [global.priority.peak, +0.4], unnamed/elevation-only ones get
+    // [global.priority.peak+0.5, +0.9] -- so that an unnamed peak can never outrank a named
+    // one regardless of texture-shading timing (revised 2026-07-16, user report: a famous
+    // named summit was losing to nearby anonymous elevation nodes). Recovering the coarser
+    // `floor(priority)` here (as this used to) would collapse both bands back to the same
+    // integer and erase that separation the moment refinement runs; floor(priority*2)/2
+    // recovers the correct HALF-tier band instead, preserving it. Whichever band this
+    // started in, replace the fractional part with the texture-shading-derived one -- see
+    // docs/label-placement-plan.md Phase 2, design step 3, and Task 3's 2026-07-16 revision.
+    float bandFloor = std::floor(m_options.priority * 2.f) / 2.f;
+    m_options.priority = bandFloor - compressTextureShading(shade);
     return true;
 }
 

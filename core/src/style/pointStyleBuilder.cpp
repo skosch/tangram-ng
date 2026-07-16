@@ -682,7 +682,16 @@ bool PointStyleBuilder::addFeature(const Feature& _feat, const DrawRule& _rule) 
         // `relative` the primary instead of the icon).
         // Marked `optional` so a placement failure only drops this label, not the icon+
         // primary -- see LabelCollider::killOccludedLabels.
-        if (havePrimary && _rule.contains(StyleParamKey::text2_source)) {
+        //
+        // Deliberately NOT gated on havePrimary (revised 2026-07-16, user report: unnamed
+        // elevation-only peaks were rendering their number in the PRIMARY label's big/
+        // semibold font -- see stylus-osm.yaml's peak: text: text_source comment). Now the
+        // primary's own text_source returns "" (havePrimary=false) whenever there's no
+        // name, and text2 is the ONLY place elevation ever renders -- so it must still get
+        // built in that case, or an unnamed peak would show nothing at all. The loop below
+        // already handles primaryLabelsCount == 0 safely (just skips setStackFallbackTarget
+        // -- nothing to stack under when there's no primary label).
+        if (_rule.contains(StyleParamKey::text2_source)) {
             TextStyle::Parameters params2 = textStyleBuilder.applySecondaryTextRule(_rule, _feat.props, params);
             TextStyleBuilder::LabelAttributes attrib2;
             if (!params2.text.empty() && textStyleBuilder.prepareLabel(params2, Label::Type::point, attrib2)) {
