@@ -139,35 +139,58 @@ public:
     // convention as SpriteLabel::setElevation().
     bool refinePriority(ElevationManager& elevMgr, glm::dvec2 origin, double scale);
 
-    // docs/label-placement-plan.md Task 4 (revised 2026-07-15 after review): steer this
-    // label's anchor fallback order away from both a strong ridge/canyon texture-shading
-    // response AND nearby vector clutter (water/road/trail, via the tile's
-    // AnchorOccupancyGrid -- the same structure Phase 3's tile-build-time
-    // anchorCandidateCost() uses), main-thread only, the same "retry every frame until the
-    // mosaic is available, then do it once" pattern as refinePriority() above. No-op
-    // (returns true) unless m_options.refineAnchorWithTextureShading is set, or the label
-    // has only one candidate anchor to begin with. For each candidate anchor, samples cost
-    // at several points spread across that anchor's actual footprint (this label's own
-    // measured screen dimension() plus its relative icon's radius, converted to the tile's
-    // normalized [0,1] local space via MapProjection::tileSize() -- the same fixed
-    // pixels-per-tile convention anchorCandidateCost() uses; this is a per-tile-geometry
-    // conversion, not a screen/view-zoom-dependent one, so it's valid to reuse here even
-    // though this runs at the current view zoom/tilt rather than the tile's own styling
-    // zoom), not just a single fixed-radius point -- see anchorCandidateCost()'s own
-    // comment for why (an earlier version of this method sampled one fixed-25m-radius
-    // point per direction; too coarse, and 25m has no principled connection to the label's
-    // actual size). Combines the texture-shading and occupancy-grid costs (equal weight;
-    // tune by eye), fully re-sorts the candidate list by ascending combined cost (not just
-    // "switch if better than current" -- with this only running once per label, there's no
-    // flicker/churn risk to guard against), and switches to the new best anchor via
-    // setAnchorIndex(0). The normal per-frame LabelManager::handleOcclusions() collision
-    // pass that runs right after this call re-validates the new position exactly like any
-    // other anchor (and falls back further via nextAnchor() if it turns out to newly
-    // collide with something), so no separate occlusion re-check needs to be triggered
-    // here. `_occupancyGrid` may be null (e.g. a marker label, or a tile with no water/
-    // transportation geometry) -- the vector-clutter term is simply skipped in that case.
+    // docs/label-placement-plan.md Task 4 (revised 2026-07-16 after user review): steer
+    // this label's anchor away from both a strong ridge/canyon texture-shading response
+    // AND nearby vector clutter (water/road/trail, via the tile's AnchorOccupancyGrid --
+    // the same structure Phase 3's tile-build-time anchorCandidateCost() uses), main-thread
+    // only, the same "retry every frame until the mosaic is available, then do it once"
+    // pattern as refinePriority() above. No-op (returns true) unless
+    // m_options.refineAnchorWithTextureShading is set.
+    //
+    // Scores every candidate anchor in m_options.anchors (the Imhof/Yoeli-ordered default,
+    // see TextStyleBuilder::applyRule, or whatever text_anchor was set explicitly) at
+    // several points spread across that anchor's actual footprint (this label's own
+    // measured dimension() plus its relative icon's radius, converted to the tile's
+    // normalized [0,1] local space via MapProjection::tileSize() -- a fixed per-tile-
+    // geometry conversion, not the current view's screen projection, valid here since this
+    // relates a fixed-size footprint to its own tile's coordinate system, not the camera),
+    // and fully re-sorts the list by ascending combined cost.
+    //
+    // If setStackFallbackTarget() was called (currently only the peak elevation sub-label,
+    // targeting the name label), ALSO scores one more candidate: sitting just below the
+    // target's own current position, aligned to whichever of its edges is nearest the icon
+    // (see the horizontal-alignment switch in the .cpp). This is a *fallback default*, not
+    // a hard link (per user direction: name and elevation don't have to be adjacent in real
+    // topo-map practice -- OSM peaks routinely have one without the other -- so this label
+    // is free to end up anywhere the 8 compass anchors say is best; stacking under the
+    // target is simply preferred, via `kStackPreferenceMargin`, when it isn't meaningfully
+    // worse than the best independent spot). The target pointer is read ONLY here, ONCE
+    // (this whole method only ever runs once per label, see m_anchorRefined) -- its public
+    // dimension()/anchorType()/options() are sampled synchronously to compute a final
+    // absolute m_options.offset if stacking wins, and the pointer itself is never touched
+    // again afterward. m_relative (used for the icon<->label gap and the occlusion-cascade
+    // "die together" logic, needed every frame for the label's whole lifetime) stays the
+    // icon throughout, exactly like every other icon-linked label in this engine -- the
+    // stack-fallback target is a separate, much lower-stakes pointer than m_relative would
+    // be if it pointed at a sibling label instead of the icon (an earlier version of this
+    // mechanism did exactly that, via setRelative(), and was reverted after finding it
+    // couldn't be shown safe against a sibling label dying independently).
+    //
+    // The normal per-frame LabelManager::handleOcclusions() collision pass that runs right
+    // after this call re-validates the new position exactly like any other anchor (and
+    // falls back further via nextAnchor() if it turns out to newly collide with something),
+    // so no separate occlusion re-check needs to be triggered here. `_occupancyGrid` may be
+    // null (e.g. a marker label, or a tile with no water/transportation geometry) -- the
+    // vector-clutter term is simply skipped in that case.
     bool refineAnchor(ElevationManager& elevMgr, glm::dvec2 origin, double scale,
                       const AnchorOccupancyGrid* occupancyGrid);
+
+    // Sets a *preferred fallback* position for refineAnchor() (see its doc comment above):
+    // this label will prefer stacking directly under _target when that's cost-competitive
+    // with the best independent compass anchor, but is not required to. Currently only used
+    // for the peak elevation sub-label (targeting the name label) -- see
+    // PointStyleBuilder::addFeature. Does not affect m_relative/occlusion cascading.
+    void setStackFallbackTarget(Label& _target) { m_stackFallbackTarget = &_target; }
 
     // Pure decision logic factored out of refineAnchor() so it's unit-testable without a
     // real ElevationManager/RasterSource (see tests/unit/labelTests.cpp): given a combined
@@ -219,29 +242,7 @@ public:
     bool isChild() const { return bool(m_relative); }
     bool isSibling() const { return bool(m_relative) && bool(m_relative->relative()); }
 
-    // docs/label-placement-plan.md Task 1, redesigned 2026-07-15 after user feedback that
-    // the elevation sub-label's separate anchoring "made no sense": _trackAnchor lets a
-    // label (currently just the peak elevation sub-label) follow _relative's *horizontal*
-    // side every frame (see syncRelativeAnchor()) -- this label should itself use a single
-    // fixed anchor (typically `bottom`, so it always stacks directly below _relative
-    // regardless of _relative's own anchor -- see applyAnchor()'s single-level relative-
-    // dimension offset, which this deliberately reuses rather than re-deriving) and
-    // _relative here is expected to be the sibling label to stack under (e.g. the peak
-    // name text), not necessarily the same Label _definePriority/_defineCollide track.
-    void setRelative(Label& _relative, bool _definePriority, bool _defineCollide,
-                     bool _trackAnchor = false);
-
-    // If this label tracks a relative's horizontal alignment (see setRelative()'s
-    // _trackAnchor), adjusts this label's horizontal offset every frame to align with
-    // _relative's current side: _relative anchored on its right side (right/top_right/
-    // bottom_right) -> align this label's LEFT edge with _relative's left edge (both read
-    // as starting from the same left margin, like a line break); _relative anchored on its
-    // left side -> align RIGHT edges instead; _relative centered (top/bottom/center) ->
-    // stay centered under it. _relative's own anchor can change after construction (see
-    // Label::refineAnchor(), main-thread, runs later than tile build) so this needs
-    // re-evaluating every frame, not just once -- cheap no-op when _relative's anchor
-    // hasn't changed side. See LabelManager::processLabelUpdate().
-    void syncRelativeAnchor();
+    void setRelative(Label& _relative, bool _definePriority, bool _defineCollide);
 
     LabelProperty::Anchor anchorType() const {
         return m_options.anchors[m_anchorIndex];
@@ -292,10 +293,10 @@ protected:
     // sync with m_relative's every frame -- set from setRelative()'s _definePriority; see
     // syncRelativePriority().
     bool m_trackRelativePriority = false;
-    // docs/label-placement-plan.md Task 1 (2026-07-15 redesign): whether this label's
-    // horizontal alignment should track m_relative's current anchor side every frame --
-    // set from setRelative()'s _trackAnchor; see syncRelativeAnchor().
-    bool m_trackRelativeAnchor = false;
+    // docs/label-placement-plan.md Task 1 (2026-07-16 redesign): see
+    // setStackFallbackTarget()/refineAnchor()'s doc comments -- read at most once, inside
+    // refineAnchor(), never stored anywhere else or dereferenced again afterward.
+    Label* m_stackFallbackTarget = nullptr;
 
     State m_state;
     FadeEffect m_fade;

@@ -89,12 +89,6 @@ void LabelManager::processLabelUpdate(const ViewState& _viewState, const LabelSe
         // at all.
         label->syncRelativePriority();
 
-        // docs/label-placement-plan.md Task 1 (2026-07-15 redesign): keep the peak elevation
-        // sub-label's horizontal alignment in sync with the name label's current anchor side
-        // (which can change later via Label::refineAnchor(), main-thread, run separately for
-        // each label). Cheap no-op for any label that isn't tracking a relative's anchor.
-        label->syncRelativeAnchor();
-
         if (setElev && !label->m_elevationSet) {
             if (_tile) {
                 label->m_elevationSet = label->setElevation(*_elevManager, _tile->getOrigin(), _tile->getScale());

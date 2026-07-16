@@ -55,11 +55,9 @@ Label::Label(glm::vec2 _size, Type _type, Options _options)
 
 Label::~Label() {}
 
-void Label::setRelative(Label& _relative, bool _definePriority, bool _defineCollide,
-                        bool _trackAnchor) {
+void Label::setRelative(Label& _relative, bool _definePriority, bool _defineCollide) {
     m_relative = &_relative;
     m_trackRelativePriority = _definePriority;
-    m_trackRelativeAnchor = _trackAnchor;
 
     if (_definePriority) {
         m_options.priority = _relative.options().priority;  //+ 0.5f;
@@ -70,10 +68,6 @@ void Label::setRelative(Label& _relative, bool _definePriority, bool _defineColl
     }
 
     applyAnchor(m_options.anchors[m_anchorIndex]);
-
-    if (_trackAnchor) {
-        syncRelativeAnchor();
-    }
 }
 
 void Label::syncRelativePriority() {
@@ -85,46 +79,6 @@ void Label::syncRelativePriority() {
     if (m_trackRelativePriority && m_relative) {
         m_options.priority = m_relative->options().priority;
     }
-}
-
-void Label::syncRelativeAnchor() {
-    if (!m_trackRelativeAnchor || !m_relative) { return; }
-
-    using LabelProperty::Anchor;
-    Anchor relAnchor = m_relative->anchorType();
-    glm::vec2 relDim = m_relative->dimension();
-
-    // Without correction, applyAnchor() centers this label under _relative (dir.x == 0 for
-    // the fixed `bottom` anchor this label uses -- see setRelative()'s doc comment). To
-    // align LEFT edges instead (this label's left edge == _relative's left edge), this
-    // label's center must move by -(relDim.x - m_dim.x)/2 from that centered position
-    // (negative = leftward when _relative is wider, which it usually is): e.g. relDim.x=100,
-    // m_dim.x=30 -> centered has this label's left edge 35px right of _relative's left edge;
-    // moving the center left by (100-30)/2=35 removes exactly that gap. Symmetric (opposite
-    // sign) for right-edge alignment.
-    float dx;
-    switch (relAnchor) {
-        case Anchor::right:
-        case Anchor::top_right:
-        case Anchor::bottom_right:
-            // _relative sits to the right of ITS OWN relative (e.g. the peak icon), so its
-            // own left edge is the near/inner edge -- align this label's left edge to it,
-            // reading like a line break under _relative's text.
-            dx = -(relDim.x - m_dim.x) * 0.5f;
-            break;
-        case Anchor::left:
-        case Anchor::top_left:
-        case Anchor::bottom_left:
-            dx = (relDim.x - m_dim.x) * 0.5f;
-            break;
-        default:
-            // top/bottom/center: _relative is horizontally centered on its own relative,
-            // so this label should stay centered under it too.
-            dx = 0.f;
-            break;
-    }
-
-    m_options.offset.x = dx;
 }
 
 bool Label::refinePriority(ElevationManager& elevMgr, glm::dvec2 origin, double scale) {
@@ -148,7 +102,7 @@ bool Label::refinePriority(ElevationManager& elevMgr, glm::dvec2 origin, double 
 bool Label::refineAnchor(ElevationManager& elevMgr, glm::dvec2 origin, double scale,
                          const AnchorOccupancyGrid* occupancyGrid) {
     if (!m_options.refineAnchorWithTextureShading) { return true; }
-    if (m_options.anchors.count <= 1) { return true; } // nothing to choose between
+    if (m_options.anchors.count <= 1 && !m_stackFallbackTarget) { return true; } // nothing to choose between
     if (!elevMgr.m_elevationSource) { return false; }
 
     // "Ridge/canyon response" is distance from the texture-shading formula's neutral value
@@ -174,6 +128,7 @@ bool Label::refineAnchor(ElevationManager& elevMgr, glm::dvec2 origin, double sc
     // here even though this runs at an arbitrary view zoom/tilt.
     float tileSizePx = float(MapProjection::tileSize());
     glm::vec2 halfExtentTile = halfExtentPx / tileSizePx;
+    glm::vec2 iconPosTile = glm::vec2(modelCenter());
 
     // Sample a handful of points spread across each candidate's footprint (not just its
     // center), matching anchorCandidateCost()'s pattern.
@@ -189,46 +144,126 @@ bool Label::refineAnchor(ElevationManager& elevMgr, glm::dvec2 origin, double sc
     // magnitude; tune by eye if one term should dominate.
     const float kOccupancyWeight = 1.0f;
 
-    std::vector<float> costs(m_options.anchors.count);
-
-    for (int i = 0; i < m_options.anchors.count; i++) {
-        glm::vec2 dir = LabelProperty::anchorDirection(m_options.anchors.anchor[i]);
-        float offsetPx = iconRadiusPx + glm::length(halfExtentPx);
-        glm::vec2 footprintCenterTile = (dir * offsetPx) / tileSizePx;
-
+    // Samples kNumSamples points around footprintCenterTile (already tile-local, already
+    // including the icon's own position) and returns the combined ridge+occupancy cost, or
+    // false if any sample isn't available yet (caller should retry next frame).
+    auto sampleFootprintCost = [&](glm::vec2 footprintCenterTile, float& outCost) -> bool {
         float shadeCostSum = 0.f;
         float occupancyCostSum = 0.f;
-
         for (const auto& sampleOffset : sampleOffsets) {
-            glm::vec2 sampleTile = glm::vec2(modelCenter()) + footprintCenterTile + sampleOffset * halfExtentTile;
+            glm::vec2 sampleTile = footprintCenterTile + sampleOffset * halfExtentTile;
             ProjectedMeters sampleWorld = origin + glm::dvec2(sampleTile) * scale;
 
             bool ok = false;
             float shade = sampleTextureShading(*elevMgr.m_elevationSource, sampleWorld, ok);
-            if (!ok) { return false; } // retry next frame once every sample is available
+            if (!ok) { return false; }
 
             shadeCostSum += ridgeCost(shade);
             if (occupancyGrid) {
                 occupancyCostSum += occupancyGrid->sample(sampleTile);
             }
         }
+        outCost = (shadeCostSum + kOccupancyWeight * occupancyCostSum) / float(kNumSamples);
+        return true;
+    };
 
-        costs[i] = (shadeCostSum + kOccupancyWeight * occupancyCostSum) / float(kNumSamples);
+    std::vector<float> costs(m_options.anchors.count);
+    for (int i = 0; i < m_options.anchors.count; i++) {
+        glm::vec2 dir = LabelProperty::anchorDirection(m_options.anchors.anchor[i]);
+        float offsetPx = iconRadiusPx + glm::length(halfExtentPx);
+        glm::vec2 footprintCenterTile = iconPosTile + (dir * offsetPx) / tileSizePx;
+
+        if (!sampleFootprintCost(footprintCenterTile, costs[i])) {
+            return false; // retry next frame once every candidate is sampleable
+        }
     }
 
-    // Fully re-sort by ascending combined cost -- this only ever runs once per label (see
-    // m_anchorRefined), so there's no per-frame flicker/churn risk to guard against with a
-    // "only switch if meaningfully better" threshold the way an earlier version of this
-    // method did.
-    std::vector<int> order = sortAnchorIndicesByCost(costs);
-    std::array<LabelProperty::Anchor, LabelProperty::max_anchors> sorted;
-    for (size_t i = 0; i < order.size(); i++) {
-        sorted[i] = m_options.anchors.anchor[order[i]];
+    // docs/label-placement-plan.md user feedback 2026-07-16: name and elevation labels
+    // don't have to be adjacent (real topo maps -- and OSM -- routinely have one without
+    // the other), so this is a *preferred fallback*, not a hard link. Score one more
+    // candidate -- sitting just below stackFallbackTarget's current position, aligned to
+    // whichever edge is nearest the icon -- and only take it over the best independent
+    // compass anchor when it isn't meaningfully worse (kStackPreferenceMargin). Reads
+    // stackFallbackTarget's PUBLIC state once, synchronously, right here -- never stored,
+    // never used to change m_relative (which stays the icon throughout, for both the
+    // gap-to-icon math above and the occlusion-cascade "die together" logic) -- so this
+    // introduces no persistent cross-sibling-label pointer.
+    bool haveStack = false;
+    float stackCost = 0.f;
+    glm::vec2 stackOffsetPx(0.f);
+
+    if (m_stackFallbackTarget) {
+        using LabelProperty::Anchor;
+        glm::vec2 targetDim = m_stackFallbackTarget->dimension();
+        Anchor targetAnchor = m_stackFallbackTarget->anchorType();
+        float targetGapScale = m_stackFallbackTarget->options().anchorGapScale;
+        glm::vec2 targetDir = LabelProperty::anchorDirection(targetAnchor);
+
+        // Where the target itself sits relative to the (shared) icon -- mirrors
+        // TextLabel::applyAnchor()'s own formula exactly.
+        glm::vec2 targetOffsetPx = targetDir * (targetDim + iconDim * targetGapScale) * 0.5f;
+
+        // This label, stacked just below the target, in the target's own local frame
+        // (dir=(0,1) = "below" regardless of which way targetDir itself points).
+        const float kStackGapScale = 0.35f; // tune by eye
+        glm::vec2 stackExtraPx = glm::vec2(0.f, 1.f) * (halfExtentPx * 2.f + targetDim * kStackGapScale) * 0.5f;
+
+        // Horizontal alignment: left-align under a right-anchored target (both edges
+        // start from the same left margin, reading like a line break), right-align under
+        // a left-anchored one, stay centered under a centered one.
+        float dx = 0.f;
+        switch (targetAnchor) {
+            case Anchor::right:
+            case Anchor::top_right:
+            case Anchor::bottom_right:
+                dx = -(targetDim.x - dimension().x) * 0.5f;
+                break;
+            case Anchor::left:
+            case Anchor::top_left:
+            case Anchor::bottom_left:
+                dx = (targetDim.x - dimension().x) * 0.5f;
+                break;
+            default:
+                dx = 0.f;
+                break;
+        }
+
+        glm::vec2 candidateOffsetPx = targetOffsetPx + stackExtraPx + glm::vec2(dx, 0.f);
+        glm::vec2 candidateCenterTile = iconPosTile + candidateOffsetPx / tileSizePx;
+
+        if (!sampleFootprintCost(candidateCenterTile, stackCost)) {
+            return false; // retry next frame
+        }
+        stackOffsetPx = candidateOffsetPx;
+        haveStack = true;
     }
-    for (size_t i = 0; i < order.size(); i++) {
-        m_options.anchors.anchor[i] = sorted[i];
+
+    if (haveStack) {
+        float bestCompass = costs.empty() ? std::numeric_limits<float>::max()
+                                           : *std::min_element(costs.begin(), costs.end());
+        const float kStackPreferenceMargin = 0.1f; // tune by eye
+        if (stackCost <= bestCompass + kStackPreferenceMargin) {
+            m_options.anchors = LabelProperty::Anchors(LabelProperty::Anchor::center);
+            m_options.offset = stackOffsetPx;
+            setAnchorIndex(0);
+            return true;
+        }
     }
-    setAnchorIndex(0);
+
+    // Independent placement: fully re-sort the compass anchors by ascending cost -- this
+    // only ever runs once per label (see m_anchorRefined), so there's no per-frame flicker/
+    // churn risk to guard against with a "only switch if meaningfully better" threshold.
+    if (!costs.empty()) {
+        std::vector<int> order = sortAnchorIndicesByCost(costs);
+        std::array<LabelProperty::Anchor, LabelProperty::max_anchors> sorted;
+        for (size_t i = 0; i < order.size(); i++) {
+            sorted[i] = m_options.anchors.anchor[order[i]];
+        }
+        for (size_t i = 0; i < order.size(); i++) {
+            m_options.anchors.anchor[i] = sorted[i];
+        }
+        setAnchorIndex(0);
+    }
 
     return true;
 }

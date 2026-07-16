@@ -661,35 +661,27 @@ bool PointStyleBuilder::addFeature(const Feature& _feat, const DrawRule& _rule) 
         }
 
         // Secondary linked text label (docs/label-placement-plan.md Task 1, redesigned
-        // 2026-07-15 after user feedback that anchoring it independently of the primary
-        // label "made no sense"): a second, independently-styled label (its own font
-        // weight/size via text2_*) that stacks directly under the primary (name) label,
-        // reading like a line break -- left-aligned when the name sits to the icon's
-        // right, right-aligned when it sits to the left, centered when the name is
-        // centered above/below the icon (in which case this label lands between the name
-        // and the icon, or below the name, respectively -- both fall out for free from the
-        // mechanism below, no separate per-anchor-direction cases needed).
-        // Mechanics: this label's OWN `relative` is the PRIMARY LABEL, not the icon (a
-        // genuine change from the original sibling-of-icon design) -- so
-        // TextLabel::applyAnchor()'s existing single-level relative-dimension offset
-        // (offset = m_dim + relative.dimension()*anchorGapScale) naturally stacks this
-        // label just past the primary's OWN footprint, using a single fixed `bottom`
-        // anchor (this label always sits "below" its relative, i.e. the primary label, in
-        // that label's own local frame -- which direction that ends up pointing on screen
-        // follows automatically from wherever the primary itself is anchored). A small
-        // anchorGapScale keeps the stack tight ("just like a line break", not a whole
-        // extra icon-sized gap). The remaining piece -- horizontal alignment matching the
-        // primary's side -- is handled every frame by Label::syncRelativeAnchor()
-        // (setRelative()'s new _trackAnchor=true), since the primary's OWN anchor can
-        // still change later via Label::refineAnchor() (main-thread, runs after tile
-        // build) and this label needs to follow that, not just whatever the primary's
-        // anchor was at tile-build time.
-        // Marked `optional` so that if it can't be placed, only it is dropped -- see
-        // LabelCollider::killOccludedLabels: a required (non-optional) child that can't
-        // fit kills its *relative*, which would otherwise take the primary label down
-        // with it too. Its `relative` being the primary (rather than the icon) also means
-        // it correctly dies if the primary itself ever fails to place, which is the
-        // right dependency now that it's visually part of the primary's own text block.
+        // 2026-07-16 after user review of the previous "always attached under the name"
+        // design): real topo-map practice (and OSM itself) doesn't keep a peak's name and
+        // elevation glued together -- plenty of peaks have one without the other, and even
+        // when both exist, professional cartography places each independently by the same
+        // placement-quality rules (Imhof/Yoeli ranking, modulated by ridge/vector
+        // avoidance), only defaulting to a stacked "name, then elevation right below" look
+        // when that's convenient (not worse than placing them separately). So: this label
+        // is a genuine SIBLING of the icon again (relative = the icon, matching the
+        // primary), gets the SAME Imhof-ordered anchor list and the SAME
+        // salienceOrderedAnchors() tile-build-time pass as the primary, and independently
+        // opts into Label::refineAnchor()'s ridge/vector-aware main-thread refinement
+        // (inherited automatically: applySecondaryTextRule() copies the primary's
+        // Parameters, including refineAnchorWithTextureShading, wholesale). The one
+        // deliberate coupling: setStackFallbackTarget(primary) tells refineAnchor() to
+        // treat "directly under the name" as one more scored candidate (preferred, not
+        // required, over an independent compass anchor -- see refineAnchor()'s own doc
+        // comment for the full mechanism and why this is safe against the primary label
+        // dying independently, unlike an earlier version that made this label's actual
+        // `relative` the primary instead of the icon).
+        // Marked `optional` so a placement failure only drops this label, not the icon+
+        // primary -- see LabelCollider::killOccludedLabels.
         if (havePrimary && _rule.contains(StyleParamKey::text2_source)) {
             TextStyle::Parameters params2 = textStyleBuilder.applySecondaryTextRule(_rule, _feat.props, params);
             TextStyleBuilder::LabelAttributes attrib2;
@@ -698,43 +690,44 @@ bool PointStyleBuilder::addFeature(const Feature& _feat, const DrawRule& _rule) 
                 size_t primaryLabelsCount = textLabels.size() - primaryLabelsStart;
 
                 for (size_t i = 0; i < iconsCount; i++) {
-                    if (i >= primaryLabelsCount) { break; } // no primary label to attach to
                     auto pLabel = static_cast<SpriteLabel*>(m_labels[iconsStart + i].get());
                     glm::vec2 p = pLabel->modelCenter();
-                    Label* primaryLabel = textLabels[primaryLabelsStart + i].get();
 
-                    // Single fixed anchor: always "below" the primary label in its own
-                    // local frame (see this block's comment above for why that's enough
-                    // to cover all four described layouts without per-direction cases).
-                    params2.labelOptions.anchors = LabelProperty::Anchors(LabelProperty::Anchor::bottom);
+                    glm::vec2 iconDim = pLabel->dimension();
+                    float iconRadiusPx = 0.5f * std::max(iconDim.x, iconDim.y);
+                    params2.labelOptions.anchors = textStyleBuilder.salienceOrderedAnchors(
+                        params2.labelOptions.anchors, p, glm::vec2(attrib2.width, attrib2.height), iconRadiusPx);
 
-                    // Tight stack, not a full icon-sized gap -- tune by eye.
-                    params2.labelOptions.anchorGapScale = 0.3f;
+                    // docs/label-placement-plan.md user feedback 2026-07-16 ("elevation
+                    // about 3x too far, should be the same distance as the name"): same
+                    // gap scale as the primary (see below), so an independently-placed
+                    // elevation label sits exactly as close to the icon as the name does.
+                    params2.labelOptions.anchorGapScale = 0.25f;
 
-                    // Real bug found via user report ("elevation number isn't showing at
-                    // all"): applySecondaryTextRule() copies the primary label's Parameters
-                    // wholesale, including its repeatGroup/repeatDistance -- meaning this
-                    // label was inheriting the exact same repeatGroup as the primary name
-                    // label (and every other peak's name label sharing this rule). LabelManager
-                    // ::withinRepeatDistance() checks proximity within a repeatGroup with NO
-                    // exemption for isChild()/relative() (unlike the real per-anchor collision
-                    // loop, which does skip a label's own relative) -- so whenever the primary
-                    // successfully placed nearby (nearly always, since this label sits right
-                    // next to it by construction), this label got occluded outright by the
+                    // Real bug found via an earlier user report ("elevation number isn't
+                    // showing at all"): applySecondaryTextRule() copies the primary
+                    // label's Parameters wholesale, including its repeatGroup/
+                    // repeatDistance -- meaning this label was inheriting the exact same
+                    // repeatGroup as the primary name label (and every other peak's name
+                    // label sharing this rule). LabelManager::withinRepeatDistance()
+                    // checks proximity within a repeatGroup with NO exemption for
+                    // isChild()/relative() (unlike the real per-anchor collision loop,
+                    // which does skip a label's own relative) -- so whenever the primary
+                    // placed successfully nearby, this label got occluded outright by the
                     // repeat-group check, before ever reaching real per-anchor collision
-                    // testing. Disabling repeat-group participation here (0 = opts out, see
-                    // TextStyleBuilder::applyRule's `if (repeatDistance > 0.f)` gate) is
-                    // correct: this label isn't a competing peak candidate that needs
-                    // deduplicating against other same-rule labels, it's a fixed decoration of
-                    // one specific already-chosen peak.
+                    // testing. Disabling repeat-group participation here (0 = opts out,
+                    // see TextStyleBuilder::applyRule's `if (repeatDistance > 0.f)` gate)
+                    // is correct: this label isn't a competing peak candidate that needs
+                    // deduplicating against other same-rule labels.
                     params2.labelOptions.repeatDistance = 0.f;
                     params2.labelOptions.repeatGroup = 0;
 
                     params2.labelOptions.optional = true;
-                    // Reset per-icon: applySecondaryTextRule() copied the primary's offset
-                    // too, which is meaningless here (this label's offset.x is recomputed
-                    // every frame by syncRelativeAnchor(); offset.y is unused since the
-                    // vertical gap comes entirely from anchorGapScale above).
+                    // Reset: applySecondaryTextRule() copied the primary's offset too,
+                    // which is meaningless here -- this label computes its own, either via
+                    // the normal anchor mechanism (independent placement) or via
+                    // refineAnchor()'s stack-fallback path (see setStackFallbackTarget()
+                    // below).
                     params2.labelOptions.offset = glm::vec2(0.f);
 
                     textStyleBuilder.addLabel(Label::Type::point, {{p, p}}, params2, attrib2, _rule);
@@ -742,10 +735,14 @@ bool PointStyleBuilder::addFeature(const Feature& _feat, const DrawRule& _rule) 
                     bool definePriority = !_rule.contains(StyleParamKey::text_priority);
                     bool defineCollide = _rule.contains(StyleParamKey::collide)
                         && !_rule.contains(StyleParamKey::text_collide);
-                    // relative = the PRIMARY label (not the icon) -- see this block's
-                    // top-level comment. _trackAnchor=true keeps horizontal alignment in
-                    // sync every frame via Label::syncRelativeAnchor().
-                    textLabels.back()->setRelative(*primaryLabel, definePriority, defineCollide, true);
+                    // relative = the icon (matching the primary) -- see this block's
+                    // top-level comment for why this label no longer makes the primary
+                    // its `relative`.
+                    textLabels.back()->setRelative(*pLabel, definePriority, defineCollide);
+
+                    if (i < primaryLabelsCount) {
+                        textLabels.back()->setStackFallbackTarget(*textLabels[primaryLabelsStart + i]);
+                    }
                 }
             }
         }
