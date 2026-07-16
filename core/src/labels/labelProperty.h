@@ -1,6 +1,7 @@
 #pragma once
 
 #include "util/util.h"
+#include "log.h"
 
 #include "aabb.h"
 #include "glm/vec2.hpp"
@@ -47,6 +48,16 @@ struct Anchors {
     int count = 0;
 
     LabelProperty::Anchor operator[](size_t _pos) const {
+        // Defensive bounds check: a real SIGSEGV was found here in Phase 6/7 headless
+        // testing (some label reached this with a garbage index, root cause was
+        // Label::nextAnchor() doing `% 0` on a still-default-constructed, empty Anchors --
+        // see its own fix comment). This engine should never crash on a bad anchor index,
+        // even from a future, still-undiscovered path -- fall back to `center` and log
+        // once rather than reading out of bounds.
+        if (_pos >= LabelProperty::max_anchors) {
+            LOGE("Anchors::operator[] out-of-range _pos=%zu count=%d, falling back to center", _pos, count);
+            return LabelProperty::Anchor::center;
+        }
         return anchor[_pos];
     }
 

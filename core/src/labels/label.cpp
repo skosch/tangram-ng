@@ -303,6 +303,16 @@ void Label::print() const {
 }
 
 bool Label::nextAnchor() {
+    // Guard against count == 0 (or negative): `% 0` is undefined behavior, found via a real
+    // crash (SIGSEGV inside Anchors::operator[] with a garbage index) in Phase 6/7 headless
+    // testing -- some label's Options.anchors reached here still default-constructed (count
+    // == 0, LabelProperty::Anchors's default ctor only fills the array, it does not set
+    // count) rather than given at least one anchor. Mirrors the same `count <= 1` guard
+    // refineAnchor() already had. Root cause of which label gets here with count == 0 is a
+    // separate, deeper bug (not yet found) -- this guard just makes it inert instead of a
+    // crash, matching "nothing to cycle to" behavior for any label with 0 or 1 anchors.
+    if (m_options.anchors.count <= 1) { return false; }
+
     int index = m_anchorIndex;
     setAnchorIndex((index + 1) % m_options.anchors.count);
 
