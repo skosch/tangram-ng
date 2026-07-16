@@ -192,6 +192,22 @@ public:
     // PointStyleBuilder::addFeature. Does not affect m_relative/occlusion cascading.
     void setStackFallbackTarget(Label& _target) { m_stackFallbackTarget = &_target; }
 
+    // Real use-after-free bug found during Phase 7 verification (headless launch: garbage
+    // anchor indices, occasionally a full SIGSEGV): a dead label is dropped -- and its
+    // unique_ptr destroyed -- by TextStyleBuilder::build()'s "Add only alive labels" pass,
+    // but nothing invalidated any OTHER label's m_stackFallbackTarget still pointing at it
+    // (there's no cascade between siblings via this pointer -- see setStackFallbackTarget()'s
+    // own comment: "does not affect m_relative/occlusion cascading" -- so a text2/elevation
+    // label with `optional: true` and its own repeatGroup opted out (see stylus-osm.yaml's
+    // peak draw rule) routinely survives a tile-build-time repeat-group/priority cut that
+    // kills its target, the name label, in the very same pass). refineAnchor() then
+    // dereferences the dangling pointer on some LATER frame (whenever the elevation mosaic
+    // finally loads), reading freed/reused memory. Called from build() right before it drops
+    // a dead label -- see build()'s own comment for why an O(n) scan per drop is fine here.
+    void clearStackFallbackTargetIfEquals(const Label* _target) {
+        if (m_stackFallbackTarget == _target) { m_stackFallbackTarget = nullptr; }
+    }
+
     // Pure decision logic factored out of refineAnchor() so it's unit-testable without a
     // real ElevationManager/RasterSource (see tests/unit/labelTests.cpp): given a combined
     // cost per candidate anchor (same indexing as Options::anchors, lower = better), returns

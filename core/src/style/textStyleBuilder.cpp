@@ -128,6 +128,20 @@ std::unique_ptr<StyledMesh> TextStyleBuilder::build() {
         std::vector<GlyphQuad> quads;
         quads.reserve(sumQuads);
 
+        // Before dropping any dead label below (which destroys it), null out any OTHER
+        // label's m_stackFallbackTarget still pointing at it -- see
+        // Label::clearStackFallbackTargetIfEquals()'s doc comment for the real
+        // use-after-free bug this fixes. O(n) scan per dead label is fine: this runs once
+        // per tile build, not per frame, and a tile's peak count is small.
+        for (auto& label : m_labels) {
+            if (label->state() != Label::State::dead) { continue; }
+            for (auto& other : m_labels) {
+                if (other.get() != label.get()) {
+                    other->clearStackFallbackTargetIfEquals(label.get());
+                }
+            }
+        }
+
         // Add only alive labels
         for (auto& label : m_labels) {
             auto* textLabel = static_cast<TextLabel*>(label.get());
