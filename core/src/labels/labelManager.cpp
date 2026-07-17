@@ -27,8 +27,15 @@
 #include "glm/gtx/norm.hpp"
 
 #include <cassert>
+#include <cfloat>
 
 namespace Tangram {
+
+namespace {
+// Tune by eye: how many labels may run Label::refineAnchor()'s ~45-sample one-time cost in a
+// single frame -- see LabelManager::m_anchorRefineBudget's doc comment (labelManager.h).
+constexpr int kMaxAnchorRefinementsPerFrame = 150;
+}
 
 LabelManager::LabelManager()
     : m_needUpdate(false),
@@ -38,7 +45,7 @@ LabelManager::~LabelManager() {}
 
 void LabelManager::processLabelUpdate(const ViewState& _viewState, const LabelSet* _labelSet, Style* _style,
                                 const Tile* _tile, const Marker* _marker, ElevationManager* _elevManager,
-                                float _dt, bool _onlyRender) {
+                                float _dt, bool _onlyRender, float _viewportMaxElev, bool _haveViewportMaxElev) {
 
     assert(_tile || _marker);
     // TODO appropriate buffer to filter out-of-screen labels
@@ -108,11 +115,13 @@ void LabelManager::processLabelUpdate(const ViewState& _viewState, const LabelSe
         if (_elevManager && !label->m_prominenceRefined) {
             if (_tile) {
                 label->m_prominenceRefined =
-                    label->refinePriority(*_elevManager, _tile->getOrigin(), _tile->getScale());
+                    label->refinePriority(*_elevManager, _tile->getOrigin(), _tile->getScale(),
+                                          _viewportMaxElev, _haveViewportMaxElev);
             } else if (_marker) {
                 double scale = _marker->extent();
                 if (scale <= 0) { scale = MapProjection::metersPerTileAtZoom(_marker->builtZoomLevel()); }
-                label->m_prominenceRefined = label->refinePriority(*_elevManager, _marker->origin(), scale);
+                label->m_prominenceRefined = label->refinePriority(*_elevManager, _marker->origin(), scale,
+                                                                    _viewportMaxElev, _haveViewportMaxElev);
             }
         }
 
@@ -121,15 +130,31 @@ void LabelManager::processLabelUpdate(const ViewState& _viewState, const LabelSe
         // tile's AnchorOccupancyGrid), main-thread only -- same retry pattern as
         // refinePriority() above. No-op unless the label opted in
         // (Label::Options::refineAnchorWithTextureShading).
+        //
+        // Round 9: gated on m_anchorRefineBudget (see its doc comment, labelManager.h) -- this
+        // is the expensive one (~45 texture-shading samples per label), so once a frame's
+        // budget is spent, remaining labels simply wait for a later frame rather than all
+        // paying the cost in the same frame.
         if (_elevManager && !label->m_anchorRefined) {
-            if (_tile) {
-                label->m_anchorRefined =
-                    label->refineAnchor(*_elevManager, _tile->getOrigin(), _tile->getScale(),
-                                        _tile->anchorOccupancyGrid().get());
-            } else if (_marker) {
-                double scale = _marker->extent();
-                if (scale <= 0) { scale = MapProjection::metersPerTileAtZoom(_marker->builtZoomLevel()); }
-                label->m_anchorRefined = label->refineAnchor(*_elevManager, _marker->origin(), scale, nullptr);
+            if (m_anchorRefineBudget > 0) {
+                --m_anchorRefineBudget;
+                if (_tile) {
+                    label->m_anchorRefined =
+                        label->refineAnchor(*_elevManager, _tile->getOrigin(), _tile->getScale(),
+                                            _tile->anchorOccupancyGrid().get());
+                } else if (_marker) {
+                    double scale = _marker->extent();
+                    if (scale <= 0) { scale = MapProjection::metersPerTileAtZoom(_marker->builtZoomLevel()); }
+                    label->m_anchorRefined = label->refineAnchor(*_elevManager, _marker->origin(), scale, nullptr);
+                }
+            } else {
+                // Budget exhausted this frame -- make sure the app keeps rendering frames
+                // until this label (and any others still waiting) gets its turn, exactly like
+                // m_needUpdate already does for in-progress fade transitions (see
+                // Scene::update()'s use of LabelManager::needUpdate()). Without this, a session
+                // that stops moving the camera right as the budget runs out could leave labels
+                // permanently stuck unrefined.
+                m_needUpdate = true;
             }
         }
 
@@ -225,8 +250,29 @@ void LabelManager::updateLabels(const ViewState& _viewState, float _dt, const Sc
     m_selectionLabels.clear();
 
     m_needUpdate = false;
+    m_anchorRefineBudget = kMaxAnchorRefinementsPerFrame;
 
     auto* elevManager = _scene.elevationManager();
+
+    // docs/label-placement-plan.md round 7 (corrected): the highest elevation found anywhere
+    // among the tiles already resident for THIS frame's rendering -- i.e. the actual current
+    // viewport, no speculative coarser tile involved (see Label::refinePriority()'s doc
+    // comment for why the original ancestor-climb version never actually found data). Computed
+    // once here, not once per peak; ElevationManager::getMinMaxElev(tileId, 0) with ancestors=0
+    // only ever checks the tile's own already-resident texture, so this is as cheap as it looks
+    // -- no new fetch, no climbing. A tile with no elevation raster attached (flat style,
+    // terrain toggled off, or not yet loaded) is simply skipped, matching
+    // getMinMaxElev()'s own documented "nothing resident" sentinel {0, 9000}.
+    float viewportMaxElev = -FLT_MAX;
+    if (elevManager) {
+        for (const auto& tile : _tiles) {
+            glm::vec2 minMax = elevManager->getMinMaxElev(tile->getID(), 0);
+            if (minMax == glm::vec2(0.f, 9000.f)) { continue; }  // not resident for this tile
+            viewportMaxElev = std::max(viewportMaxElev, minMax.y);
+        }
+    }
+    bool haveViewportMaxElev = viewportMaxElev > -FLT_MAX;
+
     const auto& _styles = _scene.styles();
     for (const auto& tile : _tiles) {
         for (const auto& style : _styles) {
@@ -235,7 +281,7 @@ void LabelManager::updateLabels(const ViewState& _viewState, float _dt, const Sc
             if (!labels) { continue; }
 
             processLabelUpdate(_viewState, labels, style.get(), tile.get(), nullptr,
-                               elevManager, _dt, _onlyRender);
+                               elevManager, _dt, _onlyRender, viewportMaxElev, haveViewportMaxElev);
         }
     }
 
@@ -260,7 +306,7 @@ void LabelManager::updateLabels(const ViewState& _viewState, float _dt, const Sc
         if (!style || !labels) { continue; }
 
         processLabelUpdate(_viewState, labels, style, nullptr, marker.get(),
-                           elevManager, _dt, _onlyRender);
+                           elevManager, _dt, _onlyRender, viewportMaxElev, haveViewportMaxElev);
     }
 
     if (elevManager) { elevManager->setMinZoom(0); }
@@ -421,7 +467,12 @@ bool LabelManager::priorityComparator(const LabelEntry& _a, const LabelEntry& _b
         return l1->hash() < l2->hash();
     }
 
-    return l1 < l2;  // if all else fails, order by memory address!
+    // Deterministic creation-order tiebreak (was `l1 < l2`, comparing raw addresses -- heap
+    // layout/allocation order isn't consistent across builds, e.g. Debug's DEBUG-only debugTag
+    // member changes sizeof(Label) outright, so which same-priority label won here -- and then
+    // kept winning via the occludedLastFrame hysteresis above -- was silently build-dependent.
+    // See Label::id()'s doc comment.
+    return l1->id() < l2->id();
 }
 
 bool LabelManager::zOrderComparator(const LabelEntry& _a, const LabelEntry& _b) {
@@ -668,7 +719,9 @@ void LabelManager::updateLabelSet(const View& _view, float _dt, const Scene& _sc
             }
 
             if (elevManager) { elevManager->setMinZoom(markerMinZ); }
-            processLabelUpdate(_viewState, labels, style, nullptr, alt, elevManager, _dt, false);
+            // Alt markers aren't peak labels and don't opt into refinePriorityWithTextureShading,
+            // so the viewport-max isolation term is irrelevant here -- pass "unavailable".
+            processLabelUpdate(_viewState, labels, style, nullptr, alt, elevManager, _dt, false, 0.f, false);
             if (elevManager) { elevManager->setMinZoom(0); }
             continue;
         }

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 namespace Tangram {
@@ -92,14 +93,58 @@ std::vector<float> boxFilterDownsample(const std::vector<float>& src, int srcSiz
     return dst;
 }
 
-} // namespace
+// A mosaic's decoded level0 buffer plus its box-filter-downsampled levels -- everything
+// sampleTextureShadingAtMosaic() used to rebuild from scratch on every single call, even
+// though none of it depends on the specific sample point (worldPos/tileId), only on the
+// mosaic's own pixel data. Factored out so it can be cached (see sampleTextureShading()
+// below) -- this was the exact "known, unimplemented perf improvement" this file used to
+// flag in a comment rather than fix: refineAnchor() (label.cpp) samples up to ~45 points per
+// peak (5 per candidate anchor x up to 9 anchors) against the SAME mosaic, so rebuilding the
+// whole pyramid per sample rather than per mosaic made anchor refinement cost tens of
+// millions of redundant float ops per peak in cluttered views -- see
+// docs/label-placement-plan.md round 8.
+struct Pyramid {
+    std::vector<std::vector<float>> levels;  // levels[0] = decoded level0, then box-filter downsamples
+    std::vector<int> sizes;                  // sizes[i] = levels[i]'s width/height
+};
 
-float sampleTextureShadingAtMosaic(const Texture& mosaic, TileID tileId, ProjectedMeters worldPos) {
+Pyramid buildPyramid(const Texture& mosaic) {
+    Pyramid p;
     int mosaicW = mosaic.width();
-    if (mosaicW <= 0 || mosaicW != mosaic.height() || (mosaicW % 3) != 0) { return 0.5f; }
-
     const GLubyte* data = mosaic.bufferData();
-    if (!data) { return 0.5f; }
+    const TextureOptions& options = mosaic.getOptions();
+    int bpp = options.bytesPerPixel();
+    bool isFloat = options.pixelFormat == PixelFormat::FLOAT;
+
+    std::vector<float> level0(size_t(mosaicW) * size_t(mosaicW));
+    for (int y = 0; y < mosaicW; y++) {
+        for (int x = 0; x < mosaicW; x++) {
+            const GLubyte* px = data + (size_t(y) * size_t(mosaicW) + size_t(x)) * size_t(bpp);
+            level0[size_t(y) * size_t(mosaicW) + size_t(x)] = float(decodeElevation(px, bpp, isFloat));
+        }
+    }
+    p.levels.push_back(level0);
+    p.sizes.push_back(mosaicW);
+
+    std::vector<float> level = std::move(level0);
+    int levelSize = mosaicW;
+    for (int k = 0; k < kMaxLevels; k++) {
+        int nextSize;
+        std::vector<float> next = boxFilterDownsample(level, levelSize, nextSize);
+        if (nextSize < 2) { break; }  // pyramid bottomed out
+        p.levels.push_back(next);
+        p.sizes.push_back(nextSize);
+        level = std::move(next);
+        levelSize = nextSize;
+    }
+    return p;
+}
+
+// The per-sample-point half of the original function: walk an already-built pyramid at
+// worldPos's mosaic-space uv, difference adjacent levels weighted by Brown's power law, same
+// formula/behavior as before this refactor -- just reading a pyramid instead of building one.
+float sampleFromPyramid(const Pyramid& p, TileID tileId, ProjectedMeters worldPos, int mosaicW) {
+    if (p.levels.empty()) { return 0.5f; }
 
     // Tile-local uv of worldPos within its own tile -- same formula as
     // ElevationManager::elevationLerp(tex, tileId, meters).
@@ -114,24 +159,6 @@ float sampleTextureShadingAtMosaic(const Texture& mosaic, TileID tileId, Project
     // `muv = (uv + 1) / 3`.
     double muvU = (u + 1.0) / 3.0, muvV = (v + 1.0) / 3.0;
 
-    const TextureOptions& options = mosaic.getOptions();
-    int bpp = options.bytesPerPixel();
-    bool isFloat = options.pixelFormat == PixelFormat::FLOAT;
-
-    // Decode the mosaic's own base level to float once. (A per-mosaic cache of the decoded
-    // pyramid would avoid redundant work when several peaks share one tile's mosaic, but
-    // Texture::userData is already used for ElevationMosaicInfo -- see rasterSource.h -- so
-    // that's left as a known, unimplemented perf improvement rather than fighting over that
-    // single slot; this runs at most once per peak in the common case, see refinePriority()
-    // in labelManager.cpp/label.cpp.)
-    std::vector<float> level0(size_t(mosaicW) * size_t(mosaicW));
-    for (int y = 0; y < mosaicW; y++) {
-        for (int x = 0; x < mosaicW; x++) {
-            const GLubyte* p = data + (size_t(y) * size_t(mosaicW) + size_t(x)) * size_t(bpp);
-            level0[size_t(y) * size_t(mosaicW) + size_t(x)] = float(decodeElevation(p, bpp, isFloat));
-        }
-    }
-
     // texelMeters: real ground meters spanned by one mosaic level-0 texel. The center cell is
     // an uncropped 1:1 copy of the tile's own buffer (see rasterSource.cpp's Wp/mosaic-layout
     // comment), so this equals the tile's own texel spacing -- same latitude-corrected formula
@@ -144,28 +171,31 @@ float sampleTextureShadingAtMosaic(const Texture& mosaic, TileID tileId, Project
     double texelMeters = scale * coslat / double(Wp);
     if (!(texelMeters > 0)) { return 0.5f; }
 
-    // Build the pyramid (each level a further 2x2 box-filter downsample of the last) and
-    // difference adjacent levels, weighting band k by pow(2, -k*alpha) -- Brown's power-law
+    // Difference adjacent levels, weighting band k by pow(2, -k*alpha) -- Brown's power-law
     // filter discretization, exactly as pinned in docs/texture-shading-plan.md and mirrored by
     // hillshade.yaml's textureShading().
-    std::vector<float> level = level0;
-    int levelSize = mosaicW;
-    double hPrev = bilinearSample(level, levelSize, muvU * levelSize, muvV * levelSize);
+    double hPrev = bilinearSample(p.levels[0], p.sizes[0], muvU * p.sizes[0], muvV * p.sizes[0]);
     double z = 0.0;
-    for (int k = 0; k < kMaxLevels; k++) {
-        int nextSize;
-        std::vector<float> next = boxFilterDownsample(level, levelSize, nextSize);
-        if (nextSize < 2) { break; }  // pyramid bottomed out
-        double hNext = bilinearSample(next, nextSize, muvU * nextSize, muvV * nextSize);
-        z += (hPrev - hNext) * std::pow(2.0, -double(k) * double(kAlpha));
+    for (size_t k = 1; k < p.levels.size(); k++) {
+        double hNext = bilinearSample(p.levels[k], p.sizes[k], muvU * p.sizes[k], muvV * p.sizes[k]);
+        z += (hPrev - hNext) * std::pow(2.0, -double(k - 1) * double(kAlpha));
         hPrev = hNext;
-        level = std::move(next);
-        levelSize = nextSize;
     }
 
     double az = double(kContrast) * z / texelMeters;
     double shade = az / (2.0 * std::sqrt(1.0 + az * az)) + 0.5;
     return float(shade);
+}
+
+} // namespace
+
+float sampleTextureShadingAtMosaic(const Texture& mosaic, TileID tileId, ProjectedMeters worldPos) {
+    int mosaicW = mosaic.width();
+    if (mosaicW <= 0 || mosaicW != mosaic.height() || (mosaicW % 3) != 0) { return 0.5f; }
+    if (!mosaic.bufferData()) { return 0.5f; }
+
+    Pyramid p = buildPyramid(mosaic);
+    return sampleFromPyramid(p, tileId, worldPos, mosaicW);
 }
 
 float sampleTextureShading(RasterSource& elevationSource, ProjectedMeters worldPos, bool& ok) {
@@ -184,9 +214,30 @@ float sampleTextureShading(RasterSource& elevationSource, ProjectedMeters worldP
     auto mosaic = elevationSource.getExistingMosaic(raster.tileID);
     if (!mosaic || !mosaic->bufferData()) { return 0.5f; }
 
-    float shade = sampleTextureShadingAtMosaic(*mosaic, raster.tileID, worldPos);
+    int mosaicW = mosaic->width();
+    if (mosaicW <= 0 || mosaicW != mosaic->height() || (mosaicW % 3) != 0) { return 0.5f; }
+
+    // Perf (round 8): this is called up to ~45 times per peak from refineAnchor() (5 sample
+    // points x up to 9 anchors) plus once more from refinePriority(), all against the SAME
+    // mosaic for a given peak -- and building the pyramid is a full decode + kMaxLevels
+    // box-filter downsample pass over the whole mosaic buffer, independent of the sample
+    // point. Single-slot cache (weak_ptr-keyed, so a destroyed/replaced mosaic -- e.g. a fresh
+    // stitch, see buildElevationMosaic()'s "always rebuilt as a fresh Texture object" comment
+    // in rasterSource.cpp -- is never mistaken for a live one, unlike a raw-pointer-identity
+    // check) rather than a full per-texture LRU: consecutive calls in one frame overwhelmingly
+    // target the same mosaic (one label's own 46 calls, or several nearby peaks sharing one
+    // tile), so this alone captures the large majority of the redundant work. A peak whose
+    // mosaic differs from the immediately-preceding call just pays the normal one-time
+    // rebuild cost, same as before this change.
+    static std::weak_ptr<Texture> s_cachedMosaic;
+    static Pyramid s_cachedPyramid;
+    if (s_cachedMosaic.lock() != mosaic) {
+        s_cachedPyramid = buildPyramid(*mosaic);
+        s_cachedMosaic = mosaic;
+    }
+
     ok = true;
-    return shade;
+    return sampleFromPyramid(s_cachedPyramid, raster.tileID, worldPos, mosaicW);
 }
 
 }

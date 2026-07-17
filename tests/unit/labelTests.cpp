@@ -319,3 +319,30 @@ TEST_CASE( "Label::sortAnchorIndicesByCost", "[Core][Label]" ) {
         REQUIRE(order == std::vector<int>{0});
     }
 }
+
+// docs/label-placement-plan.md round 7 (corrected): Label::refinePriority()'s "isolation" term
+// compares a peak's own elevation against the current viewport's max elevation (computed once
+// per frame by LabelManager::updateLabels() from already-resident tiles, not derivable here
+// without a real ElevationManager/RasterSource/Scene), turning that comparison into a score via
+// this pure, directly testable function -- same reasoning as sortAnchorIndicesByCost above.
+TEST_CASE( "Label::isolationScore", "[Core][Label]" ) {
+    SECTION( "peak at or above the regional max scores 1.0" ) {
+        REQUIRE(Label::isolationScore(4478.0, 4478.f, 300.f) == 1.f);
+        REQUIRE(Label::isolationScore(4478.0, 4000.f, 300.f) == 1.f);
+    }
+
+    SECTION( "peak well below the regional max scores 0.0" ) {
+        REQUIRE(Label::isolationScore(3000.0, 4478.f, 300.f) == 0.f);
+    }
+
+    SECTION( "ramps linearly across the margin" ) {
+        // 150m below the max, with a 300m margin -> halfway up the ramp.
+        REQUIRE(Label::isolationScore(4328.0, 4478.f, 300.f) == Approx(0.5f));
+    }
+
+    SECTION( "non-positive margin degenerates to a hard step at the regional max" ) {
+        REQUIRE(Label::isolationScore(4478.0, 4478.f, 0.f) == 1.f);
+        REQUIRE(Label::isolationScore(4477.9, 4478.f, 0.f) == 0.f);
+        REQUIRE(Label::isolationScore(4477.9, 4478.f, -10.f) == 0.f);
+    }
+}

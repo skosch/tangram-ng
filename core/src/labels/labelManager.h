@@ -69,7 +69,7 @@ protected:
 
     void processLabelUpdate(const ViewState& _viewState, const LabelSet* _labelSet, Style* _style,
                             const Tile* _tile, const Marker* _marker, ElevationManager* _elevManager,
-                            float _dt, bool _onlyRender);
+                            float _dt, bool _onlyRender, float _viewportMaxElev, bool _haveViewportMaxElev);
 
     bool m_needUpdate;
 
@@ -114,6 +114,22 @@ protected:
     // view state for last label update;
     glm::mat4 m_lastViewProj;
     glm::dvec2 m_lastViewPos;
+
+    // docs/label-placement-plan.md round 9: Label::refineAnchor() samples up to ~45 points per
+    // label (5 per candidate anchor x up to 9 anchors); with thousands of peak candidates newly
+    // eligible in the same frame (e.g. the frame an elevation mosaic first becomes available
+    // over a cluttered view), doing all of them in one frame caused multi-second to (in a Debug
+    // build) multi-minute single-frame stalls even after textureShading.cpp's per-mosaic cache
+    // (round 8) made each individual sample cheap -- the sheer COUNT of one-time refinements
+    // due in a single frame was still too much. Reset to kMaxAnchorRefinementsPerFrame at the
+    // start of every updateLabels() call (see its own comment) and decremented in
+    // processLabelUpdate() each time refineAnchor() actually runs for a label this frame; once
+    // it hits 0, remaining not-yet-refined labels for this frame keep their current
+    // (unrefined/provisional or previously-refined) anchor and are retried next frame, same
+    // "retry every frame until success" idiom m_anchorRefined already uses -- this only spreads
+    // WHEN the one-time refinement happens across a few more frames, it does not change the
+    // final result.
+    int m_anchorRefineBudget = 0;
 };
 
 }

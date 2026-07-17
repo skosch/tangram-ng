@@ -12,6 +12,8 @@
 #include <climits> // needed in aabb.h
 #include "aabb.h"
 #include "obb.h"
+#include <atomic>
+#include <cstdint>
 #include <string>
 #include <limits>
 #include <memory>
@@ -137,7 +139,53 @@ public:
     // frame (like m_elevationSet/setElevation already do) until this returns true, then stop --
     // see LabelManager::processLabelUpdate(). worldPos = origin + modelCenter() * scale, same
     // convention as SpriteLabel::setElevation().
-    bool refinePriority(ElevationManager& elevMgr, glm::dvec2 origin, double scale);
+    //
+    // Round 7 (2026-07-16, user report: Matterhorn -- by far the tallest peak in view --
+    // still losing to neighbors of similar LOCAL curvature): the shade sample above only sees
+    // a few hundred meters of context (the tile's own 3x3 mosaic), so it can't tell "the one
+    // peak that dominates this whole valley" from "one of several similarly jagged
+    // neighbors" -- it has no notion of actual regional height at all. This adds a
+    // **viewport-relative** isolation term: compare this peak's own elevation against
+    // viewportMaxElev, the highest elevation found anywhere in the CURRENT VIEWPORT --
+    // computed once per frame by LabelManager::updateLabels() from tiles already resident for
+    // rendering (see its own comment), not a fixed real-world search radius (which would need
+    // new, unbuilt tile-fetch infrastructure and was rejected as overkill). This naturally
+    // scales with zoom for free: zoomed out, the viewport spans a huge area, so only a truly
+    // regionally-dominant peak scores well; zoomed in, it's a small area and local peaks
+    // compete fairly -- exactly "relevant to current zoom level" without needing to explicitly
+    // grow a search radius.
+    //
+    // Round 7 correction (2026-07-16, same day): the FIRST round-7 implementation instead had
+    // each peak independently climb to a speculative coarser "ancestor" tile via
+    // ElevationManager::getMinMaxElev()'s cache-only ancestor-climb, gambling that something
+    // coarser than the current view's own zoom happened to already be resident. It never was
+    // -- elevation tiles are only ever fetched matching the vector tile's own zoom (confirmed
+    // via the `stopZoomByMaxZoom:elevation` profiler counter), so that ancestor tile was
+    // reliably a 100% cache miss and the whole isolation term was silently a no-op the entire
+    // time (found via temporary instrumentation after the user reported "absurdly slow to
+    // load" led to profiling, which surfaced a real, unrelated, much bigger perf bug --
+    // see textureShading.cpp's sampleTextureShading() pyramid cache -- and, while verifying
+    // that fix, this dead-isolation-term bug too). Passing the already-computed viewport max
+    // in directly, rather than each peak re-deriving its own possibly-nonexistent ancestor,
+    // both fixes this and is cheaper (computed once per frame, not once per peak).
+    //
+    // Best-effort/additive throughout: if haveViewportMaxElev is false (no tile in view has
+    // elevation data -- flat/non-terrain map style) or this peak's own elevation isn't
+    // available, isolation contributes 0 (falls back to today's shade-only behavior) rather
+    // than blocking finalization -- unlike the shade sample above, isolation is never a hard
+    // requirement. Note this term is evaluated once, at whatever the viewport's max elevation
+    // happened to be when refinement first succeeds, and never revisited after -- the same
+    // one-time-snapshot behavior the shade term above already has (see the Frozen Interface
+    // Contract in docs/texture-shading-plan.md: priority must not change as the camera moves).
+    bool refinePriority(ElevationManager& elevMgr, glm::dvec2 origin, double scale,
+                        float viewportMaxElev, bool haveViewportMaxElev);
+
+    // Pure, unit-testable helper backing refinePriority()'s isolation term above. 1.0 when
+    // peakElev is at or above regionMaxElev (this peak IS the highest point found in the
+    // current viewport), ramping linearly down to 0.0 by the time peakElev is marginMeters
+    // below regionMaxElev, and 0.0 beyond that. marginMeters <= 0 degenerates to a hard step
+    // at regionMaxElev.
+    static float isolationScore(double peakElev, float regionMaxElev, float marginMeters);
 
     // docs/label-placement-plan.md Task 4 (revised 2026-07-16 after user review): steer
     // this label's anchor away from both a strong ridge/canyon texture-shading response
@@ -213,6 +261,18 @@ public:
 
     size_t hash() const { return m_options.paramHash; }
 
+    // Deterministic creation-order serial, used as LabelManager::priorityComparator's final
+    // tiebreak instead of comparing `this` pointers directly. Label addresses depend on heap
+    // layout/allocation order, which is not consistent across builds -- e.g. `sizeof(Label)`
+    // itself differs between Debug and Release (the DEBUG-only `debugTag` member below), and
+    // -O0 vs -O2 codegen allocates everything else differently too. Two same-style peak labels
+    // (identical hash()) with tied priority -- the common case before texture-shading refinement
+    // completes, or when the proxy genuinely can't separate two similarly rugged summits, see
+    // docs/label-placement-plan.md's Task 4c Matterhorn analysis -- fell through to that address
+    // compare, so which one won the screen space (and then stayed, via the occludedLastFrame
+    // hysteresis) was silently build-dependent. This serial is independent of both.
+    uint32_t id() const { return m_id; }
+
     glm::vec2 dimension() const { return m_dim; }
 
     // Gets for label options: color and offset
@@ -272,8 +332,19 @@ protected:
 
     virtual void applyAnchor(LabelProperty::Anchor _anchor) = 0;
 
+    // Backs m_id's default member initializer; a plain (not thread_local) atomic counter shared
+    // by every Label subclass, since Labels are constructed from multiple TileWorker threads
+    // concurrently. Only relative order matters, so relaxed ordering is sufficient.
+    static uint32_t nextId() {
+        static std::atomic<uint32_t> s_nextId{0};
+        return s_nextId.fetch_add(1, std::memory_order_relaxed);
+    }
+
     const Type m_type;
     const glm::vec2 m_dim;
+    // Monotonic construction-order serial backing id() above; assigned once here so every
+    // subclass constructor gets one for free.
+    const uint32_t m_id = nextId();
 
     Options m_options;
 

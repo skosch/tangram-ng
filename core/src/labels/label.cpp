@@ -81,7 +81,21 @@ void Label::syncRelativePriority() {
     }
 }
 
-bool Label::refinePriority(ElevationManager& elevMgr, glm::dvec2 origin, double scale) {
+namespace {
+// Tune by eye, like every other constant in this pipeline: how much of the priority
+// fraction's [0, 0.4]-wide band the isolation term is allowed to claim.
+constexpr float kIsolationWeight = 0.15f;
+constexpr float kIsolationMarginMeters = 300.f;
+}
+
+float Label::isolationScore(double peakElev, float regionMaxElev, float marginMeters) {
+    if (marginMeters <= 0.f) { return peakElev >= regionMaxElev ? 1.f : 0.f; }
+    float diff = float(peakElev - regionMaxElev);
+    return clamp01(diff / marginMeters + 1.f);
+}
+
+bool Label::refinePriority(ElevationManager& elevMgr, glm::dvec2 origin, double scale,
+                           float viewportMaxElev, bool haveViewportMaxElev) {
     if (!m_options.refinePriorityWithTextureShading) { return true; }
     if (!elevMgr.m_elevationSource) { return false; }
 
@@ -89,6 +103,20 @@ bool Label::refinePriority(ElevationManager& elevMgr, glm::dvec2 origin, double 
     bool ok = false;
     float shade = sampleTextureShading(*elevMgr.m_elevationSource, worldPos, ok);
     if (!ok) { return false; }
+
+    // Regional isolation term -- see this method's doc comment in label.h. Best-effort: only
+    // contributes if both the current frame's viewport-wide max elevation (computed once by
+    // LabelManager::updateLabels(), from tiles already resident for rendering -- see its own
+    // comment) and this peak's own elevation are available; otherwise 0, same as today's
+    // shade-only behavior.
+    float isolation = 0.f;
+    if (haveViewportMaxElev) {
+        bool elevOk = false;
+        double peakElev = elevMgr.getElevation(worldPos, elevOk);
+        if (elevOk) {
+            isolation = isolationScore(peakElev, viewportMaxElev, kIsolationMarginMeters);
+        }
+    }
 
     // Original priority (computed at tile-build time, see the peak draw rule's `priority:`
     // function in stylus-osm.yaml) is always `<half-tier band> + <fractional in [0, 0.4]>`,
@@ -102,8 +130,11 @@ bool Label::refinePriority(ElevationManager& elevMgr, glm::dvec2 origin, double 
     // recovers the correct HALF-tier band instead, preserving it. Whichever band this
     // started in, replace the fractional part with the texture-shading-derived one -- see
     // docs/label-placement-plan.md Phase 2, design step 3, and Task 3's 2026-07-16 revision.
+    // The isolation term above is added on top (clamped so the combined compression can't
+    // spill past the 0.4-wide band into the next integer tier).
     float bandFloor = std::floor(m_options.priority * 2.f) / 2.f;
-    m_options.priority = bandFloor - compressTextureShading(shade);
+    float compression = std::min(compressTextureShading(shade) + kIsolationWeight * isolation, 0.39f);
+    m_options.priority = bandFloor - compression;
     return true;
 }
 
