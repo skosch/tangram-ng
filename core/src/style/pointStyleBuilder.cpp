@@ -711,7 +711,8 @@ bool PointStyleBuilder::addFeature(const Feature& _feat, const DrawRule& _rule) 
         if (_rule.contains(StyleParamKey::text2_source)) {
             TextStyle::Parameters params2 = textStyleBuilder.applySecondaryTextRule(_rule, _feat.props, params);
             TextStyleBuilder::LabelAttributes attrib2;
-            if (!params2.text.empty() && textStyleBuilder.prepareLabel(params2, Label::Type::point, attrib2)) {
+            bool haveSecondary = !params2.text.empty() && textStyleBuilder.prepareLabel(params2, Label::Type::point, attrib2);
+            if (haveSecondary) {
 
                 for (size_t i = 0; i < iconsCount; i++) {
                     auto pLabel = static_cast<SpriteLabel*>(m_labels[iconsStart + i].get());
@@ -766,6 +767,27 @@ bool PointStyleBuilder::addFeature(const Feature& _feat, const DrawRule& _rule) 
                     // top-level comment for why this label no longer makes the primary
                     // its `relative`.
                     textLabels.back()->setRelative(*pLabel, definePriority, defineCollide);
+                }
+            } else {
+                // Real bug found via targeted instrumentation following up on the
+                // Matterhorn sibling-collision investigation (docs/label-placement-plan.md
+                // Phase 7 round 10): "naked dots" -- an icon showing with no name AND no
+                // elevation -- were observed live. Root cause: a peak candidate can pass
+                // candidacy via a real `wikipedia`/`prominence` tag alone (see this rule's
+                // own candidacy filter) with no `ele` tag at all, in which case text2's
+                // text_source function has nothing to format and produces empty text here
+                // -- so this whole block (including the ONLY place that kills the icon when
+                // its required elevation label fails, see below) never runs at all. The
+                // icon was built unconditionally above, before this point, with no
+                // non-optional child ever created to gate it -- so nothing tells it to
+                // hide, violating this rule's own stated design ("the icon strictly
+                // requires a successfully-placed ELEVATION to show at all"). The existing
+                // cascades (LabelCollider::killOccludedLabels() /
+                // LabelManager::handleOcclusions()) only handle "elevation label was built
+                // but lost a collision" -- not "elevation label was never built in the
+                // first place". Kill the icon(s) directly here to cover that case too.
+                for (size_t i = 0; i < iconsCount; i++) {
+                    m_labels[iconsStart + i]->enterState(Label::State::dead, 0.0f);
                 }
             }
         }

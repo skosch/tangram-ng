@@ -593,9 +593,15 @@ void LabelManager::handleOcclusions(const ViewState& _viewState, bool _hideExtra
                         if (!intersect(obb, m_obbs[other])) {
                             return true;
                         }
-                        // Ignore intersection with relative label
+                        // Ignore intersection with relative label, and with a sibling that
+                        // shares the same relative (e.g. a peak's name and elevation
+                        // sub-label, both relative() == the icon) -- same reasoning as the
+                        // analogous tile-build-time fix in LabelCollider::process(): siblings
+                        // routinely start on the same icon-relative anchor before per-frame
+                        // anchor cycling has separated them, so they shouldn't be treated as
+                        // mutually-exclusive competitors here either.
                         Label* other_label = findLabel(std::begin(m_labels), it, other);
-                        if (l->relative() && l->relative() == other_label) {
+                        if (l->relative() && (l->relative() == other_label || l->relative() == other_label->relative())) {
                             return true;
                         }
                         l->occlude();
