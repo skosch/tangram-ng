@@ -238,8 +238,23 @@ void LabelCollider::process(TileID _tileID, float _tileInverseScale, float _tile
             }
         }
 
-        // Dont let relatives occlude their child
-        if (l1->relative() == l2 || l2->relative() == l1) {
+        // Dont let relatives occlude their child, and dont let two labels that are both
+        // attached to the SAME relative (e.g. a peak's name and elevation sub-label, both
+        // relative() == the icon) occlude each other either: at tile-build time they share
+        // the identical icon-relative anchor formula and haven't been spread apart yet by
+        // Label::refineAnchor() (main-thread only, runs later), so they routinely start out
+        // overlapping on their first-choice anchor. Previously only the direct icon<->child
+        // case was exempted, so this sibling pair fell through to the general OBB collision
+        // resolution below -- which permanently kills (Label::State::dead) whichever sibling
+        // loses the priority tiebreak, before real anchor refinement ever gets a chance to
+        // separate them. Confirmed via targeted instrumentation
+        // (docs/label-placement-v2-spec.md's Matterhorn investigation): the peak's own
+        // "Matterhorn" name label and its own "4478" elevation label were found colliding
+        // with each other here, with the elevation label winning every time (its repeatGroup
+        // is unconditionally 0 -- see pointStyleBuilder.cpp -- which always sorts below the
+        // name's nonzero shared-rule repeatGroup hash in priorityComparator()'s tiebreak).
+        if (l1->relative() == l2 || l2->relative() == l1 ||
+            (l1->relative() && l1->relative() == l2->relative())) {
             continue;
         }
         if (l1->isChild() && l1->relative()->isOccluded()) {
