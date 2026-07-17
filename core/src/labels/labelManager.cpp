@@ -593,15 +593,25 @@ void LabelManager::handleOcclusions(const ViewState& _viewState, bool _hideExtra
                         if (!intersect(obb, m_obbs[other])) {
                             return true;
                         }
-                        // Ignore intersection with relative label, and with a sibling that
-                        // shares the same relative (e.g. a peak's name and elevation
-                        // sub-label, both relative() == the icon) -- same reasoning as the
-                        // analogous tile-build-time fix in LabelCollider::process(): siblings
-                        // routinely start on the same icon-relative anchor before per-frame
-                        // anchor cycling has separated them, so they shouldn't be treated as
-                        // mutually-exclusive competitors here either.
+                        // Ignore intersection with relative label
+                        //
+                        // Deliberately NOT extended to exempt siblings sharing the same
+                        // relative (unlike the analogous fix in LabelCollider::process()):
+                        // round 11 tried that here too and it was wrong. Unlike the
+                        // tile-build-time pass (one-shot, no anchor retry -- exempting
+                        // siblings there is the only way to avoid a permanent kill), THIS
+                        // loop already has a real, graceful resolution mechanism for two
+                        // labels landing on the same anchor: `nextAnchor()` cycling (below),
+                        // driven by exactly this kind of detected intersection. Exempting
+                        // siblings here suppressed that cycling entirely, so a peak's name
+                        // and elevation sub-label -- which do start on the same icon-relative
+                        // anchor before being spread apart -- could sit permanently
+                        // overlapping instead of one of them moving to its next candidate
+                        // anchor. Confirmed via live user report ("name and elevation
+                        // overlapping") after round 11 shipped; see docs/label-placement-
+                        // plan.md's Phase 7 round 12.
                         Label* other_label = findLabel(std::begin(m_labels), it, other);
-                        if (l->relative() && (l->relative() == other_label || l->relative() == other_label->relative())) {
+                        if (l->relative() && l->relative() == other_label) {
                             return true;
                         }
                         l->occlude();
