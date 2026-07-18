@@ -341,6 +341,14 @@ bool Label::update(const glm::mat4& _mvp, const ViewState& _viewState,
     m_occludedLastFrame = m_occluded;
     m_occluded = false;
 
+    // See stableFrames()'s doc comment (label.h) -- tracks a track record of consecutive
+    // wins, not just the single previous frame's outcome.
+    if (m_occludedLastFrame) {
+        m_stableFrames = 0;
+    } else {
+        m_stableFrames++;
+    }
+
     bool valid = updateScreenTransform(_mvp, _viewState, _bounds, _transform);
     if (!valid) {
         enterState(State::sleep, 0.0);

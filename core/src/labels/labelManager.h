@@ -46,6 +46,36 @@ public:
 
     std::pair<Label*, const Tile*> getLabel(uint32_t _selectionColor) const;
 
+    // Public (not just for LabelManager's own internal use) so unit tests can construct
+    // fixed label sets and exercise the deterministic collision-resolution tiebreak
+    // directly -- see docs/label-placement-v2-spec.md's "add a unit test asserting...
+    // handleOcclusions() produces the same winner regardless of frame-history state,"
+    // and tests/unit/labelTests.cpp's priorityComparator determinism test.
+    struct LabelEntry {
+
+        LabelEntry(Label* _label, Style* _style, const Tile* _tile, const Marker* _marker,
+                   bool _proxy, Range _screenTransform)
+            : label(_label),
+              style(_style),
+              tile(_tile),
+              marker(_marker),
+              priority(_label->options().priority),
+              proxy(_proxy),
+              transformRange(_screenTransform) {}
+
+        Label* label;
+        Style* style;
+        const Tile* tile;
+        const Marker* marker;
+        float priority;
+        bool proxy;
+
+        Range transformRange;
+        Range obbsRange;
+    };
+
+    static bool priorityComparator(const LabelEntry& _a, const LabelEntry& _b);
+
 protected:
 
     using AABB = isect2d::AABB<glm::vec2>;
@@ -74,31 +104,6 @@ protected:
     bool m_needUpdate;
 
     isect2d::ISect2D<glm::vec2> m_isect2d;
-
-    struct LabelEntry {
-
-        LabelEntry(Label* _label, Style* _style, const Tile* _tile, const Marker* _marker,
-                   bool _proxy, Range _screenTransform)
-            : label(_label),
-              style(_style),
-              tile(_tile),
-              marker(_marker),
-              priority(_label->options().priority),
-              proxy(_proxy),
-              transformRange(_screenTransform) {}
-
-        Label* label;
-        Style* style;
-        const Tile* tile;
-        const Marker* marker;
-        float priority;
-        bool proxy;
-
-        Range transformRange;
-        Range obbsRange;
-    };
-
-    static bool priorityComparator(const LabelEntry& _a, const LabelEntry& _b);
 
     static bool zOrderComparator(const LabelEntry& _a, const LabelEntry& _b);
 

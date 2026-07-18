@@ -287,6 +287,17 @@ public:
 
     bool occludedLastFrame() const { return m_occludedLastFrame; }
 
+    // docs/label-placement-v2-spec.md's "Deterministic-but-not-jittery collision
+    // resolution", Option A: consecutive frames (as of the end of the last completed
+    // handleOcclusions()) this label has been continuously visible/unoccluded, reset to 0
+    // the instant it's occluded. Unlike occludedLastFrame() alone (which just asks "did I
+    // win the SINGLE previous frame" -- true after winning by chance even once, including
+    // during initial unsettled load), this tracks a track record, so
+    // LabelManager::priorityComparator() can require a label to have actually PROVEN
+    // itself over several consecutive frames before its history gets to outweigh a
+    // competitor's tier/score -- see that function's own comment for the full reasoning.
+    int stableFrames() const { return m_stableFrames; }
+
     Label* relative() const { return m_relative; }
     bool isChild() const { return bool(m_relative); }
     bool isSibling() const { return bool(m_relative) && bool(m_relative->relative()); }
@@ -362,6 +373,7 @@ protected:
 
     bool m_occludedLastFrame;
     bool m_occluded;
+    int m_stableFrames = 0;
 
     glm::vec4 m_screenCenter;
     float m_alpha;

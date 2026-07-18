@@ -35,6 +35,14 @@ namespace {
 // Tune by eye: how many labels may run Label::refineAnchor()'s ~45-sample one-time cost in a
 // single frame -- see LabelManager::m_anchorRefineBudget's doc comment (labelManager.h).
 constexpr int kMaxAnchorRefinementsPerFrame = 150;
+
+// docs/label-placement-v2-spec.md's "Deterministic-but-not-jittery collision resolution"
+// (Option A) -- see LabelManager::priorityComparator()'s own comment for the full
+// reasoning. Tune by eye: frames a label must stay continuously unoccluded before its
+// history is allowed to outweigh a competitor's tier/score. Small enough to settle
+// quickly (a few animation frames), large enough that a single lucky frame during initial
+// tile load can't lock in a permanent winner.
+constexpr int kStableFramesThreshold = 5;
 }
 
 LabelManager::LabelManager()
@@ -408,8 +416,18 @@ bool LabelManager::priorityComparator(const LabelEntry& _a, const LabelEntry& _b
     if (_a.proxy != _b.proxy) {
         return _b.proxy;  // non-proxy over proxy
     }
-    float aprio = std::nearbyint(_a.priority);
-    float bprio = std::nearbyint(_b.priority);
+    // docs/label-placement-v2-spec.md's "nearbyint tier-bucketing risk": priority is
+    // encoded as tier + fraction (e.g. peak = [14.0, 14.9]), and nearbyint() rounds to the
+    // nearest integer using round-half-to-even -- an unnamed peak's band ([14.5, 14.9])
+    // could round UP into 15 (saddle's tier) for any fraction above the .5 tie point,
+    // silently misclassifying it into the wrong coarse category. floor() has no such
+    // edge case: every value in a tier's [N.0, N.9] band floors to exactly N, matching how
+    // Label::refinePriority() already extracts a tier floor for its own half-tier bands
+    // (`std::floor(m_options.priority * 2.f) / 2.f`) -- this is the direct fix, not a
+    // rewrite of the whole priority/tier representation, which the risk write-up also
+    // offers as an equally valid alternative to a full data-model split.
+    float aprio = std::floor(_a.priority);
+    float bprio = std::floor(_b.priority);
     if (aprio != bprio) {
         return aprio < bprio;
     }
@@ -436,10 +454,26 @@ bool LabelManager::priorityComparator(const LabelEntry& _a, const LabelEntry& _b
       if (l1->isChild() != l2->isChild()) { return l2->isChild(); }  // non-child over child
     }
 
-    // Note: This causes non-deterministic placement, i.e. depending on
-    // navigation history.
-    if (l1->occludedLastFrame() != l2->occludedLastFrame()) {
-        return l2->occludedLastFrame();  // non-occluded over occluded
+    // docs/label-placement-v2-spec.md's "Deterministic-but-not-jittery collision
+    // resolution", Option A. This USED to be a raw `occludedLastFrame()` compare -- "did
+    // I win the single previous frame" -- which meant the final settled winner between
+    // two near-tied competitors depended on whichever happened to render first (tile
+    // arrival order, network timing), and then perpetuated itself indefinitely once it
+    // won even one frame by chance: a real, confirmed, non-deterministic-placement risk.
+    // Requiring a label to have stayed unoccluded for kStableFramesThreshold consecutive
+    // frames before its history counts fixes this: for as long as NEITHER competitor is
+    // yet stable (e.g. every frame during initial load), this check is a no-op and the
+    // tiebreak falls through to the fully deterministic (tier, score, hash, id) chain
+    // below, which gives the SAME answer every single frame given fixed inputs -- so
+    // whichever candidate is genuinely better by that chain wins from frame one and
+    // accumulates stability consistently, not incidentally. Once a label DOES reach
+    // stability, this still protects it from flickering out if a competitor's score
+    // later improves (e.g. texture-shading refinement completing) -- the actual
+    // anti-flicker property this check exists for, now decoupled from incidental history.
+    bool l1Stable = l1->stableFrames() >= kStableFramesThreshold;
+    bool l2Stable = l2->stableFrames() >= kStableFramesThreshold;
+    if (l1Stable != l2Stable) {
+        return l1Stable;  // prefer the already-settled label
     }
 
     // marker labels can be very dense since they are not prefiltered by LabelCollider, so to avoid flashing

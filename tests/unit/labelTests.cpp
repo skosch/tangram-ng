@@ -1,6 +1,7 @@
 #include "catch.hpp"
 #include "labels/label.h"
 #include "labels/labelCollider.h"
+#include "labels/labelManager.h"
 #include "labels/screenTransform.h"
 #include "labels/textLabel.h"
 #include "labels/textLabels.h"
@@ -344,5 +345,73 @@ TEST_CASE( "Label::isolationScore", "[Core][Label]" ) {
         REQUIRE(Label::isolationScore(4478.0, 4478.f, 0.f) == 1.f);
         REQUIRE(Label::isolationScore(4477.9, 4478.f, 0.f) == 0.f);
         REQUIRE(Label::isolationScore(4477.9, 4478.f, -10.f) == 0.f);
+    }
+}
+
+// docs/label-placement-v2-spec.md's "Deterministic-but-not-jittery collision resolution":
+// the single most important new test this redesign asks for -- the final winner between
+// two competing labels must not depend on incidental frame-history (which one happened to
+// render, or win a single frame, first during initial tile load), only on a real track
+// record. LabelManager::LabelEntry/priorityComparator are public specifically so this test
+// can construct them directly, matching LabelCollider's own already-public interface used
+// in the repeat-group test above.
+std::unique_ptr<Label> makePriorityLabel(glm::vec2 _pos, float _priority) {
+    Label::Options options;
+    options.offset = {0.0f, 0.0f};
+    options.anchors.anchor[0] = LabelProperty::Anchor::center;
+    options.anchors.count = 1;
+    options.priority = _priority;
+
+    TextRange textRanges;
+
+    return std::make_unique<TextLabel>(TextLabel::Coordinates{{_pos, _pos}}, Label::Type::point,
+                                       options, TextLabel::VertexAttributes{}, glm::vec2(1.f, 1.f),
+                                       dummy, textRanges, TextLabelProperty::Align::none);
+}
+
+TEST_CASE( "LabelManager::priorityComparator is deterministic, not history-dependent", "[Core][LabelManager]" ) {
+    View view = makeView();
+    auto mvp = glm::ortho(0.f, screenSize.x, screenSize.y, 0.f, -1.f, 1.f);
+
+    auto better = makePriorityLabel({100.f, 100.f}, 14.1f); // lower numeric priority wins
+    auto worse = makePriorityLabel({200.f, 200.f}, 14.5f);
+
+    TestTransform tb, tw;
+    better->update(mvp, view.state(), &bounds, tb.transform);
+    worse->update(mvp, view.state(), &bounds, tw.transform);
+
+    LabelManager::LabelEntry eBetter(better.get(), nullptr, nullptr, nullptr, false, {});
+    LabelManager::LabelEntry eWorse(worse.get(), nullptr, nullptr, nullptr, false, {});
+
+    SECTION( "neither label has a track record yet: score decides despite a single lucky frame" ) {
+        // Simulate the exact old bug: "worse" wins a single frame (e.g. it happened to
+        // render first during load) -- occludedLastFrame() alone used to be sufficient to
+        // lock this in, permanently, regardless of score. It shouldn't be anymore:
+        // stableFrames() only reaches the threshold after several CONSECUTIVE wins, so a
+        // single win must not be enough to override score.
+        worse->occlude(false);
+        worse->evalState(0);
+        worse->update(mvp, view.state(), &bounds, tw.transform);
+
+        better->occlude(true);
+        better->evalState(0);
+        better->update(mvp, view.state(), &bounds, tb.transform);
+
+        REQUIRE(worse->stableFrames() < 5);
+        REQUIRE(better->stableFrames() < 5);
+        REQUIRE(LabelManager::priorityComparator(eBetter, eWorse));
+        // Re-running with the SAME fixed inputs must give the SAME answer -- no hidden
+        // state left over from evaluating the comparator itself.
+        REQUIRE(LabelManager::priorityComparator(eBetter, eWorse));
+    }
+
+    SECTION( "a label with a real multi-frame track record keeps winning against a technically-better newcomer" ) {
+        for (int i = 0; i < 6; i++) {
+            worse->occlude(false);
+            worse->evalState(0);
+            worse->update(mvp, view.state(), &bounds, tw.transform);
+        }
+        REQUIRE(worse->stableFrames() >= 5);
+        REQUIRE_FALSE(LabelManager::priorityComparator(eBetter, eWorse));
     }
 }
