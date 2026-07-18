@@ -28,13 +28,17 @@
 
 #include <cassert>
 #include <cfloat>
+#include <chrono>
 
 namespace Tangram {
 
 namespace {
-// Tune by eye: how many labels may run Label::refineAnchor()'s ~45-sample one-time cost in a
-// single frame -- see LabelManager::m_anchorRefineBudget's doc comment (labelManager.h).
-constexpr int kMaxAnchorRefinementsPerFrame = 150;
+// Tune by eye: wall-clock milliseconds per frame that may be spent inside
+// Label::refineAnchor() calls -- see LabelManager::m_anchorRefineTimeUsedMs's doc comment
+// (labelManager.h) for why this replaced a fixed per-frame label COUNT (round 9). A budget
+// in real time, rather than label count, behaves the same in both Debug and Release
+// without needing two separately-tuned constants.
+constexpr double kAnchorRefineBudgetMs = 4.0;
 
 // docs/label-placement-v2-spec.md's "Deterministic-but-not-jittery collision resolution"
 // (Option A) -- see LabelManager::priorityComparator()'s own comment for the full
@@ -139,13 +143,14 @@ void LabelManager::processLabelUpdate(const ViewState& _viewState, const LabelSe
         // refinePriority() above. No-op unless the label opted in
         // (Label::Options::refineAnchorWithTextureShading).
         //
-        // Round 9: gated on m_anchorRefineBudget (see its doc comment, labelManager.h) -- this
-        // is the expensive one (~45 texture-shading samples per label), so once a frame's
-        // budget is spent, remaining labels simply wait for a later frame rather than all
-        // paying the cost in the same frame.
+        // Round 9 / round 15: gated on a measured wall-clock budget (see
+        // m_anchorRefineTimeUsedMs's doc comment, labelManager.h) -- this is the expensive
+        // one (~45 texture-shading samples per label), so once a frame's budget is spent,
+        // remaining labels simply wait for a later frame rather than all paying the cost
+        // in the same frame.
         if (_elevManager && !label->m_anchorRefined) {
-            if (m_anchorRefineBudget > 0) {
-                --m_anchorRefineBudget;
+            if (m_anchorRefineTimeUsedMs < kAnchorRefineBudgetMs) {
+                auto t0 = std::chrono::steady_clock::now();
                 if (_tile) {
                     label->m_anchorRefined =
                         label->refineAnchor(*_elevManager, _tile->getOrigin(), _tile->getScale(),
@@ -155,6 +160,8 @@ void LabelManager::processLabelUpdate(const ViewState& _viewState, const LabelSe
                     if (scale <= 0) { scale = MapProjection::metersPerTileAtZoom(_marker->builtZoomLevel()); }
                     label->m_anchorRefined = label->refineAnchor(*_elevManager, _marker->origin(), scale, nullptr);
                 }
+                auto t1 = std::chrono::steady_clock::now();
+                m_anchorRefineTimeUsedMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
             } else {
                 // Budget exhausted this frame -- make sure the app keeps rendering frames
                 // until this label (and any others still waiting) gets its turn, exactly like
@@ -258,7 +265,7 @@ void LabelManager::updateLabels(const ViewState& _viewState, float _dt, const Sc
     m_selectionLabels.clear();
 
     m_needUpdate = false;
-    m_anchorRefineBudget = kMaxAnchorRefinementsPerFrame;
+    m_anchorRefineTimeUsedMs = 0.0;
 
     auto* elevManager = _scene.elevationManager();
 
