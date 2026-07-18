@@ -134,7 +134,33 @@ bool Label::refinePriority(ElevationManager& elevMgr, glm::dvec2 origin, double 
     // spill past the 0.4-wide band into the next integer tier).
     float bandFloor = std::floor(m_options.priority * 2.f) / 2.f;
     float compression = std::min(compressTextureShading(shade) + kIsolationWeight * isolation, 0.39f);
-    m_options.priority = bandFloor - compression;
+    // Real user report 2026-07-17/18 ("Matterhorn not consistently prioritized... Pic
+    // Tyndall wins over Matterhorn"): this used to be `bandFloor - compression`, placing
+    // EVERY texture-shading-refined peak (no real prominence tag) at or below bandFloor --
+    // e.g. [13.61, 14.0] for the named-peak band. Meanwhile the real-prominence formula
+    // (this peak draw rule's `priority:` function, stylus-osm.yaml) is strictly additive
+    // from the same bandFloor -- `base + badness*0.4`, always >= bandFloor. Since
+    // suppressTextureShadingIfProminent() means a peak with a REAL prominence tag (the
+    // strictly better, authoritative signal) never gets refined at all, this meant a real
+    // hard prominence value was being compared against a proxy guess on two DIFFERENT,
+    // non-overlapping numeric ranges that happened to share a tier -- the proxy always won
+    // unless it was the worst possible reading, a direct inversion of the intended
+    // priority order. Confirmed with real data: Matterhorn (prominence=1038m, fixed
+    // priority 14.1647) vs. Pic Tyndall (a subsidiary shoulder of the Matterhorn massif,
+    // no real prominence tag, ele=4241) -- Pic Tyndall's local texture-shading signal
+    // (steep, spire-like) plus its own isolation term (close to but below Matterhorn's own
+    // elevation) refines it to somewhere around bandFloor - 0.09 to -0.15 under the old
+    // formula, comfortably beating Matterhorn's fixed 14.1647 despite being an objectively
+    // far less prominent peak. Fixed by moving the refined range to `[bandFloor,
+    // bandFloor + 0.39]` -- the same additive-badness direction and overlapping range as
+    // the real-prominence formula -- so a real, hard prominence signal can only lose to a
+    // refined proxy that reads as GENUINELY better (both now compete on the same
+    // increasing-is-worse scale), never merely because one path subtracts and the other
+    // adds. This is a pure constant shift (+0.39) relative to the old formula, so relative
+    // ordering among peaks that ARE ALL refined (no real prominence tag on either side) is
+    // completely unaffected -- only cross-path (real-tag vs. refined-proxy) comparisons
+    // change, which is exactly the bug.
+    m_options.priority = bandFloor + (0.39f - compression);
     return true;
 }
 
