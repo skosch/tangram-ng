@@ -40,6 +40,48 @@ varying float v_sdf_pixel;
 
 #pragma tangram: global
 
+// TEMP DIAGNOSTIC (docs/label-halo-stroke-alignment-investigation.md): visualizes fill-vs-
+// stroke SDF alignment for investigating the reported peak-label halo "shadow above/below
+// the font" artifact. 0 = fully original behavior, bit-for-bit unchanged (this is the only
+// line that needs editing to enable it; nothing else in this file's normal code path is
+// touched). Set to 1 and rebuild to enable. Safe/reversible: a single manually-edited
+// compile-time constant, no new uniforms, no YAML/C++ changes, no effect on the default
+// (0) build.
+#define TANGRAM_DEBUG_HALO_ALIGN 0
+
+// TEMP DIAGNOSTIC (round 2, same doc): live report from Sebastian ruled out a positional
+//  mismatch (TANGRAM_DEBUG_HALO_ALIGN's red/cyan test showed a concentric ring, not an
+//  offset one) but described the ring's own COVERAGE varying wildly and anisotropically
+//  with sub-pixel pan (flooding in on one side, nearly vanishing on another, direction
+//  flipping with a 1px pan). Leading suspect: the stroke-only `pow(signed_distance,
+//  1/(2*signed_distance))` transform just below is numerically explosive for small
+//  signed_distance (the exponent approaches infinity as signed_distance -> 0, which is
+//  exactly the regime the stroke pass samples in, since it deliberately reads further
+//  from the glyph's core outline than the fill pass does) - an ordinary sub-pixel shift
+//  in the bilinear-filtered SDF texture read is enough of a change in the "base" to swing
+//  a pow() with a huge exponent wildly. Set to 1 and rebuild to bypass ONLY this transform
+//  (falls back to the same plain smoothstep(signed_distance) the fill pass already uses),
+//  keeping everything else (background-adaptive halo, real colors) intact, to see the
+//  actual visual result rather than a red/cyan debug view. ANSWERED: bypassing pow() made no
+//  difference (corruption persisted) - back to 0 (real pow() path) for round 3 below.
+#define TANGRAM_DEBUG_SKIP_STROKE_POW 0
+
+// TEMP DIAGNOSTIC (round 3, same doc): rounds 1-2 ruled out a positional mismatch and the
+//  stroke-only pow() transform. Since fill (u_pass==0) stays rock solid while stroke (u_pass==1)
+//  corrupts, and both read the exact same texture at the exact same v_texcoords, the remaining
+//  question is whether the raw SDF TEXTURE DATA itself is unstable at the stroke's sampling
+//  depth, or whether the data is fine and something downstream (e.g. adjacent glyphs' stroke
+//  quads - expanded past their tight fill bbox by fonsSetBlur's quad padding - overlapping and
+//  alpha-double-blending) is the real source. Set to 1 to recolor the final pixel by the raw
+//  signed_distance sample, tagged by pass (stroke -> red channel, fill -> green channel), while
+//  leaving the REAL alpha computation (threshold, pow, background halo, v_alpha) completely
+//  untouched - unlike round 3's first attempt (which forced alpha=1.0 and, since fill/stroke
+//  share the exact same quad geometry and fill draws strictly after stroke, made fill always
+//  fully overdraw stroke everywhere - explaining why NO red was ever visible, only a green-to-
+//  black gradient where neighboring glyphs' quads overlap in draw order). Preserving the real
+//  alpha lets stroke actually show through wherever production rendering would show it.
+#define TANGRAM_DEBUG_RAW_SDF 0
+
 void main(void) {
 
     vec4 color = v_color;
@@ -73,9 +115,13 @@ void main(void) {
     if (u_pass == 0) {
         alpha = smoothstep(start, end, signed_distance);
     } else {
+#if TANGRAM_DEBUG_SKIP_STROKE_POW
+        float smooth_signed_distance = signed_distance;
+#else
         // smooth the signed distance for outlines
         float signed_distance_1_over_2 = 1.0 / (2.0 * signed_distance);
         float smooth_signed_distance = pow(signed_distance, signed_distance_1_over_2);
+#endif
 
         alpha = smoothstep(start, end, smooth_signed_distance);
 
@@ -92,6 +138,29 @@ void main(void) {
         float halo_visibility = 1.0 - smoothstep(u_halo_luminance_dark, u_halo_luminance_light, bg_luminance);
         alpha *= halo_visibility;
     }
+
+#if TANGRAM_DEBUG_HALO_ALIGN
+    // TEMP DIAGNOSTIC: bypass the background-halo multiply, the label fade (v_alpha), and
+    // the #pragma color/filter blocks entirely, so the only thing left on screen is each
+    // pass's own alpha test result at full opacity - fill in solid red, stroke in solid
+    // cyan. Take a frozen screenshot over a settled (non-fading, non-loading) peak label
+    // and zoom in: if the cyan ring's inner boundary doesn't hug the red glyph's edge
+    // symmetrically top-to-bottom (e.g. a visible gap on one side, overlap on the other),
+    // that is a real, directly-visible geometric mismatch. If instead the cyan ring looks
+    // concentric with the red glyph but merely uneven/jagged in thickness top vs bottom,
+    // that supports this doc's leading hypothesis (SDF peripheral-sampling asymmetry made
+    // visible by the ring's thinness) over an actual position bug.
+    if (u_pass == 0) {
+        gl_FragColor = vec4(1.0, 0.0, 0.0, alpha);
+    } else {
+        gl_FragColor = vec4(0.0, 1.0, 1.0, alpha);
+    }
+    return;
+#endif
+
+#if TANGRAM_DEBUG_RAW_SDF
+    color = (u_pass == 0) ? vec4(0.0, signed_distance, 0.0, 1.0) : vec4(signed_distance, 0.0, 0.0, 1.0);
+#endif
 
     color.a *= v_alpha * alpha;
 

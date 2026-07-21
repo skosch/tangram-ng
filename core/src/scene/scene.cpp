@@ -697,6 +697,33 @@ Scene::UpdateState Scene::update(RenderState& _rs, View& _view, float _dt) {
 
     m_labelManager->updateLabelSet(_view, _dt, *this, tiles, markers, !changed);
 
+    // TEMP DIAGNOSTIC (2026-07-20, docs/rock-texture-label-halo-flicker-investigation.md):
+    // log wall-clock duration of each tile-loading burst. The background-adaptive text halo
+    // (sdf.fs u_pass==1, fed by TextStyle::onBeginDrawFrame's per-frame framebuffer blit,
+    // scene.cpp's own render() below) re-samples the live background every single frame with
+    // no dependency on label state at all -- so comparing this loading-burst duration against
+    // how long Sebastian visually perceives the halo "settling" directly tests whether the
+    // halo's continued per-frame recompute against still-populating hillshade/texture-shading
+    // content (rather than label priority/anchor churn, already investigated separately) is
+    // what's actually being seen. Logging only -- no rendering/behavior change. Safe to remove.
+    {
+        bool nowLoadingTiles = m_tileManager->numLoadingTiles() > 0;
+        if (nowLoadingTiles && !m_diagWasLoadingTiles) {
+            m_diagLoadingSince = m_time;
+            LOGD("TEMP DIAGNOSTIC (rock-texture-label-halo-flicker-investigation.md): "
+                 "tile loading STARTED (numLoadingTiles=%d)", m_tileManager->numLoadingTiles());
+        } else if (!nowLoadingTiles && m_diagWasLoadingTiles) {
+            LOGD("TEMP DIAGNOSTIC (rock-texture-label-halo-flicker-investigation.md): "
+                 "tile loading FINISHED after %.2fs -- if the reported halo flicker keeps going "
+                 "noticeably past this point, look elsewhere (e.g. label churn, already covered "
+                 "by docs/rock-texture-label-flicker-investigation.md); if it stops at/near this "
+                 "point, the background-adaptive halo's per-frame recompute against settling "
+                 "hillshade/texture-shading content is the likely cause",
+                 m_time - m_diagLoadingSince);
+        }
+        m_diagWasLoadingTiles = nowLoadingTiles;
+    }
+
     return { m_tileManager->numLoadingTiles() > 0, m_labelManager->needUpdate(), markersState.easing };
 }
 

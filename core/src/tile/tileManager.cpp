@@ -50,6 +50,16 @@ struct TileManager::TileEntry {
     // set if tile has failed raster subtasks
     int32_t numMissingRasters = -1;
 
+    // TEMP DIAGNOSTIC (2026-07-20, docs/rock-texture-elevation-shelf-investigation.md): tracks
+    // how long this entry's raster attachment(s) have been continuously stuck (fully missing OR
+    // pinned to a coarser ancestor) -- see the logging block in updateTileSet() below.
+    // Distinguishes an ordinary transient gap (heals within a frame or two) from a genuinely
+    // permanent stuck state (the suspected cause of the rarely-reported "elevation shelf" bug).
+    // Safe to remove: read/written only by that logging block, never affects rendering,
+    // fetching, or caching behavior.
+    double pinStuckSince = 0.0;      // 0 == not currently stuck
+    double pinStuckLastLogged = 0.0; // last time the "stuck" LOGW fired for this entry
+
     // is tile in TileSet.visibleTiles?
     bool m_visible = false;
 
@@ -648,6 +658,54 @@ void TileManager::updateTileSet(TileSet& _tileSet, const ViewState& _view) {
                                 break;  // numMissingRasters stays counted: still awaiting exact
                             }
                         } while (id.z > 13 || (id.z > 0 && id.z + 2 >= tileId.z));
+                    }
+
+                    {
+                        // TEMP DIAGNOSTIC (2026-07-20, docs/rock-texture-elevation-shelf-
+                        // investigation.md): detect a raster attachment that has been
+                        // continuously stuck -- either still fully missing (emptyTexture) or
+                        // pinned to a coarser ancestor -- for longer than any ordinary
+                        // load/evict gap should ever take, to distinguish a genuinely PERMANENT
+                        // stuck state (the suspected "elevation shelf" bug) from a transient one
+                        // that heals within a frame or two. Recomputes the same intended-zoom
+                        // arithmetic as the loop above (cheap: a handful of raster sources) to
+                        // read the POST-healing-attempt state without touching the healing logic
+                        // itself. Safe to remove entirely -- logging only, no side effects.
+                        bool anyStuck = false;
+                        int32_t worstDz = 0;
+                        for (size_t ii = 0; ii < srcs.size(); ++ii) {
+                            Raster& raster = rasters[ii + offset];
+                            int32_t zoomDiff = srcs[ii]->zoomBias() - _tileSet.source->zoomBias();
+                            TileID intended = (zoomDiff > 0)
+                                    ? tileId.zoomBiasAdjusted(zoomDiff).withMaxSourceZoom(srcs[ii]->maxZoom())
+                                    : tileId.withMaxSourceZoom(srcs[ii]->maxZoom());
+                            bool stillMissing = raster.texture == srcs[ii]->emptyTexture();
+                            bool pinned = !stillMissing && raster.tileID.z < intended.z;
+                            if (stillMissing || pinned) {
+                                anyStuck = true;
+                                worstDz = std::max(worstDz, intended.z - raster.tileID.z);
+                            }
+                        }
+                        double now = nowSeconds();
+                        if (anyStuck) {
+                            if (entry.pinStuckSince == 0.0) { entry.pinStuckSince = now; }
+                            const double kStuckThresholdSeconds = 3.0;
+                            const double kStuckRelogSeconds = 15.0;
+                            double stuckFor = now - entry.pinStuckSince;
+                            if (stuckFor > kStuckThresholdSeconds &&
+                                (now - entry.pinStuckLastLogged) > kStuckRelogSeconds) {
+                                entry.pinStuckLastLogged = now;
+                                LOGW("TEMP DIAGNOSTIC (rock-texture-elevation-shelf-investigation.md): "
+                                     "'%s' tile %s elevation raster stuck missing/pinned (worst %d "
+                                     "zoom level(s) coarser than intended) for %.1fs -- persistent, "
+                                     "not transient",
+                                     _tileSet.source->name().c_str(), tileId.toString().c_str(),
+                                     worstDz, stuckFor);
+                            }
+                        } else {
+                            entry.pinStuckSince = 0.0;
+                            entry.pinStuckLastLogged = 0.0;
+                        }
                     }
                 }
             } else if (entry.isInProgress()) {

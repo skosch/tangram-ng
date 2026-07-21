@@ -2,6 +2,7 @@
 
 #include "log.h"
 #include "platform.h"
+#include <algorithm>
 #include <memory>
 #ifdef FONS_WPATH
 #include <codecvt>
@@ -53,7 +54,20 @@ FontContext::~FontContext() {
 }
 
 void FontContext::setPixelScale(float _scale) {
-    m_sdfRadius = SDF_WIDTH * _scale;
+    // The fontstash atlas's own SDF encoding (params.sdfPadding / params.sdfPixelDist, set once
+    //  in the constructor above) is fixed at construction time, hardcoded assuming pixel scale =
+    //  2.0 - it's never rebuilt for the actual runtime scale, which is only known later (via
+    //  MapsApp::setDpi, called after Map/Scene/FontContext already exist - see
+    //  docs/label-halo-stroke-alignment-investigation.md). Confirmed on this machine: real scale
+    //  is 2.432, which would make m_sdfRadius (== u_max_stroke_width in sdf.fs) exceed the
+    //  atlas's actual reserved padding (12px) - telling the shader's stroke pass to trust
+    //  distance data past the edge of what the atlas really computed, producing the chaotic,
+    //  sub-pixel-pan-sensitive halo corruption Sebastian reported (fill pass unaffected since
+    //  its threshold sits at the stable midpoint, not this outer edge). Clamp to the atlas's
+    //  real fixed capacity so the shader never over-reads, on any device; configured halo
+    //  widths (2-4px, stylus-osm.yaml) sit far below this ceiling so the clamp itself should be
+    //  visually invisible.
+    m_sdfRadius = std::min(SDF_WIDTH * _scale, float(SDF_WIDTH * 2));
 }
 
 void FontContext::loadFonts(const std::vector<FontSourceHandle>& fallbacks) {

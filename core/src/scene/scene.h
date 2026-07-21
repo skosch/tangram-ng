@@ -321,6 +321,19 @@ protected:
     float m_pixelScale = 1.0f;
     float m_time = 0.0;
 
+    // TEMP DIAGNOSTIC (2026-07-20, docs/rock-texture-label-halo-flicker-investigation.md):
+    // tracks wall-clock tile-loading start/stop transitions so their duration can be logged
+    // and compared against how long the background-adaptive text halo (sdf.fs's u_pass==1
+    // branch, driven by TextStyle::onBeginDrawFrame's u_background_tex) visibly keeps
+    // changing -- that halo pass re-samples the live framebuffer every single frame,
+    // unconditional on any label's own settled state, so it can keep looking like it's
+    // "still flickering" after a label's own position/priority has long since stopped
+    // moving, for as long as the background underneath (hillshade/texture-shading) is still
+    // populating. Read/written only by the logging block in Scene::update(); never affects
+    // rendering, fetching, or caching behavior. Safe to remove entirely.
+    bool m_diagWasLoadingTiles = false;
+    double m_diagLoadingSince = 0.0;
+
     /// Set true when all resources for TileBuilder are available
     bool m_readyToBuildTiles = false;
 
