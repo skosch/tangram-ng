@@ -218,6 +218,13 @@ public:
 
     StyleType type() { return m_type; }
 
+    // True for a style that internally owns and draws its own companion TextStyle instance
+    // (e.g. PointStyle's per-label icon+text), as opposed to being itself a StyleType::text
+    // style. See Scene::render()'s use of this for why it matters: the background-halo blit
+    // must run before ANY style that will sample u_background_tex this frame, not just styles
+    // whose own type() is StyleType::text.
+    virtual bool hasLinkedTextStyle() const { return false; }
+
     static bool compare(std::unique_ptr<Style>& a, std::unique_ptr<Style>& b) {
 
         const auto& modeA = a->blendMode();

@@ -166,6 +166,13 @@ public:
     //  since last update
     bool update();
 
+    // Non-destructive peek at whether the camera has been mutated (translate/zoom/rotate/etc.)
+    //  since the last update() call, WITHOUT consuming/resetting that state the way update() does.
+    //  Lets a caller force a real update() before rendering when a render can otherwise be
+    //  triggered independently of update() (e.g. a GUI-only redraw) while the camera has moved via
+    //  a direct mutator call in between.
+    bool isDirty() const { return m_dirtyMatrices || m_dirtyTiles; }
+
     // Get the position of the view in projection units (z is the effective 'height' determined from zoom).
     const glm::dvec3& getPosition() const { return m_pos; }
 

@@ -246,6 +246,10 @@ void Map::setViewport(int _newX, int _newY, int _newWidth, int _newHeight) {
     impl->backgroundBuffer = std::make_unique<FrameBuffer>(_newWidth, _newHeight, false);
 }
 
+bool Map::isViewDirty() const {
+    return impl->view.isDirty();
+}
+
 MapState Map::update(float _dt) {
 
     FrameInfo::beginUpdate();

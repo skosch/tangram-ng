@@ -232,6 +232,15 @@ public:
     // Return MapState with flags set to determine whether the view is complete or changing.
     MapState update(float _dt);
 
+    // Non-destructive peek at whether the camera has been mutated (e.g. handlePanGesture,
+    // handlePinchGesture, setCameraPosition) since the last update() call. Callers that can
+    // trigger render() independently of update() (e.g. a GUI-only redraw) should check this
+    // first and call update() anyway if true - otherwise render() draws the scene/terrain with
+    // the camera's live position while labels (whose screen positions are only recomputed
+    // inside update()) are drawn at a stale position, for however many renders happen before
+    // the next real update().
+    bool isViewDirty() const;
+
     // Render a new frame of the map view (if needed)
     void render();
 

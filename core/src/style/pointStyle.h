@@ -60,6 +60,10 @@ public:
     TextStyle& textStyle() const { return *m_textStyle; }
     virtual void setPixelScale(float _pixelScale) override;
 
+    // onBeginDrawFrame() below always draws m_textStyle's own labels every frame this style
+    // draws, regardless of this style's own (non-text) StyleType.
+    virtual bool hasLinkedTextStyle() const override { return true; }
+
     SpriteVertex* pushQuad(Texture* texture) const;
 
 protected:

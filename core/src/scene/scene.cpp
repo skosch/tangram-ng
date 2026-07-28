@@ -249,10 +249,12 @@ bool Scene::load() {
         }
     }
 
-    if (m_options.debugStyles) {
-        m_styles.emplace_back(new DebugTextStyle("debugtext", true));
-        m_styles.emplace_back(new DebugStyle("debug"));
-    }
+    // Always add debug styles (like ContourDebugStyle below): DebugStyleBuilder::build() and
+    // DebugTextStyleBuilder::setup()/build() already check getDebugFlag(tile_bounds) live, per
+    // tile, at build time, so gating their *construction* on a scene-load-time snapshot only
+    // prevented the debug-menu checkbox from taking effect after the scene had already loaded.
+    m_styles.emplace_back(new DebugTextStyle("debugtext", true));
+    m_styles.emplace_back(new DebugStyle("debug"));
     /// Styles that are opaque must be ordered first in the scene so that
     /// they are rendered 'under' styles that require blending
     std::sort(m_styles.begin(), m_styles.end(), Style::compare);
@@ -697,33 +699,6 @@ Scene::UpdateState Scene::update(RenderState& _rs, View& _view, float _dt) {
 
     m_labelManager->updateLabelSet(_view, _dt, *this, tiles, markers, !changed);
 
-    // TEMP DIAGNOSTIC (2026-07-20, docs/rock-texture-label-halo-flicker-investigation.md):
-    // log wall-clock duration of each tile-loading burst. The background-adaptive text halo
-    // (sdf.fs u_pass==1, fed by TextStyle::onBeginDrawFrame's per-frame framebuffer blit,
-    // scene.cpp's own render() below) re-samples the live background every single frame with
-    // no dependency on label state at all -- so comparing this loading-burst duration against
-    // how long Sebastian visually perceives the halo "settling" directly tests whether the
-    // halo's continued per-frame recompute against still-populating hillshade/texture-shading
-    // content (rather than label priority/anchor churn, already investigated separately) is
-    // what's actually being seen. Logging only -- no rendering/behavior change. Safe to remove.
-    {
-        bool nowLoadingTiles = m_tileManager->numLoadingTiles() > 0;
-        if (nowLoadingTiles && !m_diagWasLoadingTiles) {
-            m_diagLoadingSince = m_time;
-            LOGD("TEMP DIAGNOSTIC (rock-texture-label-halo-flicker-investigation.md): "
-                 "tile loading STARTED (numLoadingTiles=%d)", m_tileManager->numLoadingTiles());
-        } else if (!nowLoadingTiles && m_diagWasLoadingTiles) {
-            LOGD("TEMP DIAGNOSTIC (rock-texture-label-halo-flicker-investigation.md): "
-                 "tile loading FINISHED after %.2fs -- if the reported halo flicker keeps going "
-                 "noticeably past this point, look elsewhere (e.g. label churn, already covered "
-                 "by docs/rock-texture-label-flicker-investigation.md); if it stops at/near this "
-                 "point, the background-adaptive halo's per-frame recompute against settling "
-                 "hillshade/texture-shading content is the likely cause",
-                 m_time - m_diagLoadingSince);
-        }
-        m_diagWasLoadingTiles = nowLoadingTiles;
-    }
-
     return { m_tileManager->numLoadingTiles() > 0, m_labelManager->needUpdate(), markersState.easing };
 }
 
@@ -751,15 +726,19 @@ bool Scene::render(RenderState& _rs, View& _view, FrameBuffer* _backgroundBuffer
 
         // Background-adaptive halo (docs/label-placement-plan.md Phase 4): snapshot the
         // default framebuffer's color contents (everything drawn so far this frame) right
-        // before the first text-type style draws. m_styles is sorted by Style::compare
-        // (style.h) such that all non-opaque styles with default blend_order sort by
-        // ascending Blending enum value, and TextStyle/ContourTextStyle/DebugTextStyle all
-        // default to Blending::overlay - the highest value - so text styles are guaranteed
-        // to be the last group drawn each frame (confirmed: no draw group in stylus-osm.yaml
-        // sets blend_order high enough to reorder past them). If a scene ever adds a style
-        // with a higher blend_order that also isn't text, that style would be blitted "into
-        // the future" as background for halos, which is a visual nit, not a correctness bug.
-        if (_backgroundBuffer && !blittedBackground && style->type() == StyleType::text) {
+        // before the first style that will sample u_background_tex this frame draws -- either
+        // a real StyleType::text style, or a style like PointStyle that internally owns and
+        // unconditionally draws its own companion TextStyle every frame (see
+        // Style::hasLinkedTextStyle()). Checking only `type() == StyleType::text` used to miss
+        // the latter case: PointStyle's own type is StyleType::point, so its linked labels
+        // (e.g. peak icon+name+elevation, drawn via the built-in "points" style since that
+        // draw rule never overrides `style:`) sampled the *previous* frame's composited image
+        // whenever "points" happened to sort before "text" in m_styles (both default to
+        // Blending::overlay, so Style::compare()'s final tiebreak - alphabetical name - decided
+        // it, not draw-order intent) - a permanent one-frame-stale halo background for those
+        // labels specifically, worst during panning.
+        if (_backgroundBuffer && !blittedBackground &&
+            (style->type() == StyleType::text || style->hasLinkedTextStyle())) {
             PROFILE_GPU("BackgroundHaloBlit");
             _backgroundBuffer->blitColorFrom(_rs, _rs.defaultFrameBuffer(),
                                              _view.getWidth(), _view.getHeight());

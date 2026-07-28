@@ -47,9 +47,6 @@ public:
     /// Set the view to the position provided by the scene
     bool useScenePosition = true;
 
-    /// Add styles toggled by DebugFlags
-    bool debugStyles = false;
-
     /// Start loading tiles as soon as possible
     bool prefetchTiles = true;
 
