@@ -22,15 +22,20 @@ public:
 
 private:
     std::string m_tileID;
+    int m_tileZ = 0;
 
 };
 
 void DebugTextStyleBuilder::setup(const Tile& _tile) {
-    if (!Tangram::getDebugFlag(Tangram::DebugFlags::tile_bounds)) {
+    // zoom_labels (big data-zoom number, e.g. to spot LOD-selection jumps under tilt) takes
+    // precedence over tile_bounds' detailed x/y/z/s string when both are on - see build() below.
+    if (!Tangram::getDebugFlag(Tangram::DebugFlags::tile_bounds) &&
+        !Tangram::getDebugFlag(Tangram::DebugFlags::zoom_labels)) {
         return;
     }
 
     m_tileID = _tile.getID().toString();
+    m_tileZ = _tile.getID().z;
 
     TextStyleBuilder::setup(_tile);
 }
@@ -46,15 +51,28 @@ void DebugTextStyleBuilder::setup(const Marker& _marker, int zoom) {
 }
 
 std::unique_ptr<StyledMesh> DebugTextStyleBuilder::build() {
-    if (!Tangram::getDebugFlag(Tangram::DebugFlags::tile_bounds)) {
+    bool zoomLabels = Tangram::getDebugFlag(Tangram::DebugFlags::zoom_labels);
+    if (!zoomLabels && !Tangram::getDebugFlag(Tangram::DebugFlags::tile_bounds)) {
         return nullptr;
     }
 
     TextStyle::Parameters params;
     params.wordWrap = false;
-    params.text = m_tileID;
-    params.fontSize = 30.f;
-    params.font = m_style.context()->getFont("sans-serif", "regular", "400", 32 * m_style.pixelScale());
+    if (zoomLabels) {
+        // Big, high-contrast data-zoom number (just TileID.z, not the full x/y/z/s string) meant
+        // to be legible over hillshade/terrain at any tilt, to spot LOD-selection resolution
+        // jumps by eye - see DebugFlags::zoom_labels' doc comment (map.h).
+        params.text = std::to_string(m_tileZ);
+        params.fontSize = 80.f;
+        params.fill = 0xff00ffff;    // opaque yellow (ABGR)
+        params.strokeColor = 0xff000000;  // opaque black outline
+        params.strokeWidth = 4.f;
+        params.font = m_style.context()->getFont("sans-serif", "regular", "700", 64 * m_style.pixelScale());
+    } else {
+        params.text = m_tileID;
+        params.fontSize = 30.f;
+        params.font = m_style.context()->getFont("sans-serif", "regular", "400", 32 * m_style.pixelScale());
+    }
 
     TextStyleBuilder::LabelAttributes attrib;
     if (!prepareLabel(params, Label::Type::debug, attrib)) {

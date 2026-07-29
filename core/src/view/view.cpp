@@ -6,6 +6,7 @@
 
 #include "glm/gtc/matrix_transform.hpp"
 #include "glm/gtx/rotate_vector.hpp"
+#include <algorithm>
 #include <cmath>
 
 #define MAX_LOD 6
@@ -622,14 +623,20 @@ float View::getTileScreenArea(TileID tile) const {
     if (dx > hc) { tc.x -= 1 << tc.z; }
     else if (dx < -hc) { tc.x += 1 << tc.z; }
 
-    // doesn't seem to significantly reduce number of tiles visible, so hold off for now (also need to do memcheck!)
-    //glm::vec2 elevlims = m_elevationManager && tile.z + 4 > int(m_zoom) ?
-    //    m_elevationManager->getMinMaxElev(tile, 3) : glm::vec2(0, 9000);
-
     // use elevation at center of screen (used to calc m_zoom) for tile bottom
     // 1 - 2^(base_z - z) gives normalized distance along pos -> eye vector of terrain intersection, so
     //  multiplying by eye elev gives terrain elev (similar triangles)
     float elev0 = m_elevationManager ? m_eye.z * (1 - std::exp2(m_baseZoom - m_zoom)) : 0;
+
+    // Tile's real elevation range (cheap/cached - getMinMaxElev, elevationManager.cpp), used both
+    // for elevation-aware culling below and for the steepness correction further down.
+    float elevLo = elev0, elevHi = elev0;
+    if (m_elevationManager) {
+        glm::vec2 elevRange = m_elevationManager->getMinMaxElev(tile, 3);
+        elevLo = std::min(elev0, elevRange.x);
+        elevHi = std::max(elev0, elevRange.y);
+    }
+
     auto a00 = tileCoordsToClipSpace(tc, elev0);
     auto a01 = tileCoordsToClipSpace({tc.x, tc.y + 1, tc.z}, elev0);
     auto a10 = tileCoordsToClipSpace({tc.x + 1, tc.y, tc.z}, elev0);
@@ -638,15 +645,12 @@ float View::getTileScreenArea(TileID tile) const {
     auto wa = glm::abs(a[3]);
 
     if (m_elevationManager) {  //&& m_pitch != 0) {
-        glm::dvec3 eye(m_pos.x + m_eye.x, m_pos.y + m_eye.y, m_eye.z);
-        double dist = glm::distance(eye, glm::dvec3(MapProjection::tileCenter(tile), 0.));
-        //if(dist - std::abs(bounds.max.x - bounds.min.x)/M_SQRT2 > maxTileDistance) { return; } ... only covers ~30% of tiles
-        float elev1 = (dist < m_pos.z) ? std::min(9000.f, m_eye.z) : 0;  // Mt. Everest
-
-        auto b00 = tileCoordsToClipSpace(tc, elev1);
-        auto b01 = tileCoordsToClipSpace({tc.x, tc.y + 1, tc.z}, 0);  //elev1);
-        auto b10 = tileCoordsToClipSpace({tc.x + 1, tc.y, tc.z}, 0);  //elev1);
-        auto b11 = tileCoordsToClipSpace({tc.x + 1, tc.y + 1, tc.z}, elev1);
+        // Elevation-aware culling using the tile's own real min/max range (elevLo/elevHi above)
+        // instead of a fixed worst-case constant.
+        auto b00 = tileCoordsToClipSpace(tc, elevHi);
+        auto b01 = tileCoordsToClipSpace({tc.x, tc.y + 1, tc.z}, elevLo);
+        auto b10 = tileCoordsToClipSpace({tc.x + 1, tc.y, tc.z}, elevLo);
+        auto b11 = tileCoordsToClipSpace({tc.x + 1, tc.y + 1, tc.z}, elevHi);
         auto b = glm::transpose(glm::mat4(b00, b01, b10, b11));
         auto wb = glm::abs(b[3]);
 
@@ -662,7 +666,15 @@ float View::getTileScreenArea(TileID tile) const {
         if (allLess(a[2], -wa) || allGreater(a[2], wa)) { return 0; }
     }
 
-    if (m_pitch == 0 || !allGreater(a[3], glm::vec4(0))) return FLT_MAX;
+    // Zenith-consistency fix: this used to also return FLT_MAX unconditionally at m_pitch == 0
+    // ("always subdivide maximally, straight down") - a completely separate code path from every
+    // other pitch, which used the real computed area below. That's exactly why resolution could
+    // disagree between zenithal and tilted views (e.g. after raising lodAreaBias to compensate
+    // for grazing tilt, zenith would revert to whatever the flat integer-zoom ceiling gives,
+    // while tilted views - now using real area - could exceed it): two different mechanisms
+    // governing the same decision. Only the near-camera-plane safety check remains; the real
+    // area computed below now applies uniformly across every pitch, including 0.
+    if (!allGreater(a[3], glm::vec4(0))) return FLT_MAX;
 
     glm::vec2 screenSize(m_vpWidth, m_vpHeight);
     auto r00 = ndcToScreenSpace(clipSpaceToNdc(a00), screenSize);
@@ -670,7 +682,92 @@ float View::getTileScreenArea(TileID tile) const {
     auto r10 = ndcToScreenSpace(clipSpaceToNdc(a10), screenSize);
     auto r11 = ndcToScreenSpace(clipSpaceToNdc(a11), screenSize);
     auto pts = {r00, r01, r11, r10};
-    return std::abs(signedArea(pts.begin(), pts.end()));
+    float area = std::abs(signedArea(pts.begin(), pts.end()));
+
+    // Grazing-tilt resolution fix, rigorous version: a flat quad's projected area already
+    // correctly foreshortens by cos(theta) where theta is the angle between the GROUND normal
+    // (vertical) and the view direction - that's exactly what perspective-projecting a flat,
+    // horizontal quad computes. The bug was applying that same flat-ground foreshortening to
+    // terrain that isn't flat: resolution demand for a real surface scales with cos(theta) using
+    // the SURFACE'S OWN normal, not the ground's. A slope tilted toward the camera has a much
+    // smaller theta (more face-on) than flat ground does at the same camera pitch, so it needs
+    // correspondingly MORE resolution - "it gets shorter with the cosine as it flattens" is
+    // exactly right, just about the surface's own tilt, not the camera pitch alone.
+    //
+    // Sample the LOCAL surface normal directly from real elevation data a fixed, small,
+    // physically-meaningful distance apart, rather than inferring a "worst-case" slope from this
+    // tile's own min/max relief over its (zoom-dependent) width - that earlier approach
+    // systematically undershot true steepness for anything but the smallest/highest-zoom tiles,
+    // because a real steep slope is steep over tens of meters, not over a multi-km tile; averaging
+    // relief across the whole tile washes it out. A fixed real-world sample offset doesn't have
+    // that problem.
+    if (m_elevationManager) {
+        double correction = steepnessCorrection(tile);
+        area *= float(correction);
+    }
+
+    return area;
+}
+
+// Ratio between a surface's real local foreshortening and flat ground's, for use as a
+// multiplier on a flat-quad area (see getTileScreenArea).
+//
+// Samples the local gradient at several locations spread across the tile (quarter-points), not
+// just its center - a single center sample can land on a locally-gentle patch (e.g. a shoulder
+// or saddle) even when the tile clearly contains a much steeper face elsewhere. Takes whichever
+// sampled location gives the steepest (most camera-facing) result, per this project's established
+// fidelity-over-cost preference for terrain LOD (docs/terrain-drape-resolution-plan.md).
+double View::steepnessCorrection(TileID tile) const {
+    if (!m_elevationManager) { return 1.0; }
+
+    glm::dvec3 eye(m_pos.x + m_eye.x, m_pos.y + m_eye.y, m_eye.z);
+    const double kSampleOffset = 100.0;  // meters - real-world scale a mountain slope is actually steep over
+
+    double bestCorrection = 1.0;
+    // Quarter-points, not corners/center: corners are shared with neighboring tiles (biases
+    // toward whatever's already being sampled there) and a single center point can miss a real
+    // steep feature elsewhere in the tile.
+    for (double fx : {0.25, 0.75}) {
+        for (double fy : {0.25, 0.75}) {
+            TileCoordinates tc = {double(tile.x) + fx, double(tile.y) + fy, tile.z};
+            glm::dvec2 sampleMeters = MapProjection::tileCoordinatesToProjectedMeters(tc);
+
+            bool okC = false, okX = false, okY = false;
+            double eC = m_elevationManager->getElevation(sampleMeters, okC);
+            double eX = m_elevationManager->getElevation(sampleMeters + glm::dvec2(kSampleOffset, 0.), okX);
+            double eY = m_elevationManager->getElevation(sampleMeters + glm::dvec2(0., kSampleOffset), okY);
+            if (!okC || !okX || !okY) { continue; }
+
+            // Standard height-field normal from the sampled gradient.
+            glm::dvec3 normal = glm::normalize(glm::dvec3(-(eX - eC) / kSampleOffset, -(eY - eC) / kSampleOffset, 1.0));
+
+            glm::dvec3 surfacePos(sampleMeters, eC);
+            double dist = glm::distance(eye, surfacePos);
+            if (dist <= 1e-3) { continue; }
+
+            glm::dvec3 viewDir = (eye - surfacePos) / dist;  // surface -> eye
+            double cosFlat = glm::clamp(viewDir.z, 0.0, 1.0);                       // flat ground's foreshortening (already baked into the caller's flat-quad area)
+            double cosSlope = glm::clamp(glm::dot(normal, viewDir), 0.0, 1.0);      // this surface's actual foreshortening
+            if (cosFlat <= 1e-4) { continue; }
+
+            // Ratio converts the quad area's flat-ground foreshortening into this surface's
+            // real one. Never reduce below the flat estimate (only ever raises resolution).
+            double correction = std::max(1.0, cosSlope / cosFlat);
+            bestCorrection = std::max(bestCorrection, correction);
+        }
+    }
+    return bestCorrection;
+}
+
+float View::getTileDistanceZoomBound(TileID tile) const {
+    // Same distance->zoom relationship as updateMatrices()'s m_zoom = clamp(-log2(viewZ /
+    // worldToCameraHeight), baseZoom, maxZoom), just algebraically reduced using
+    // worldToCameraHeight = m_pos.z * exp2(m_baseZoom) (from m_pos.z's own definition a few lines
+    // above that) and evaluated at this tile's distance instead of the screen-center depth.
+    glm::dvec3 eye(m_pos.x + m_eye.x, m_pos.y + m_eye.y, m_eye.z);
+    double dist = glm::distance(eye, glm::dvec3(MapProjection::tileCenter(tile), 0.));
+    if (!(dist > 0) || !(m_pos.z > 0)) { return m_maxZoom; }
+    return glm::clamp(m_baseZoom - float(log2(dist / m_pos.z)), m_baseZoom, m_maxZoom);
 }
 
 }

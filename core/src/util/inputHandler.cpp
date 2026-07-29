@@ -172,7 +172,9 @@ void InputHandler::handleShoveGesture(float _distance) {
         auto viewPos = m_view.getPosition();
 
         float dl = elev*(1/std::cos(pitch1) - 1/std::cos(pitch0));
-        m_view.setBaseZoom(m_view.getBaseZoom() - std::log2(1 + dl/viewPos.z));
+        // Not a real zoom action - a visual correction to keep the point under screen center
+        // fixed as pitch changes (see applyPivotZoomCompensation's doc comment, view.h).
+        m_view.applyPivotZoomCompensation(std::log2(1 + dl/viewPos.z));
 
         float dpos = elev*(std::tan(pitch1) - std::tan(pitch0));
         m_view.translate(glm::rotate(glm::vec2(0.f, dpos), m_view.getYaw()));

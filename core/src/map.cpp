@@ -110,7 +110,7 @@ public:
 };
 
 
-static std::bitset<9> g_flags = 0;
+static std::bitset<10> g_flags = 0;
 
 Map::Map(std::unique_ptr<Platform> _platform) : platform(std::move(_platform)) {
     LOGTOInit();

@@ -130,6 +130,18 @@ public:
     void setZoom(float _z, bool setBaseZoom = false);
     void setBaseZoom(float _z) { setZoom(_z, true); }
 
+    // Apply a baseZoom adjustment that exists purely to keep a point's screen position fixed
+    // while tilting over non-zero elevation (InputHandler::handleShoveGesture's elev-aware pivot
+    // correction) - NOT a real user zoom action. _zoomReduction is the amount to SUBTRACT from
+    // baseZoom (matching handleShoveGesture's own sign convention; may be negative e.g. when
+    // tilting back toward zenithal, which un-does the correction). Tracked separately in
+    // m_zoomPivotDrift so getIntegerLodZoom() can report what the zoom would be without this
+    // specific adjustment - see its doc comment for why that matters.
+    void applyPivotZoomCompensation(float _zoomReduction) {
+        setBaseZoom(m_baseZoom - _zoomReduction);
+        m_zoomPivotDrift += _zoomReduction;
+    }
+
     // Set the roll angle of the view in radians. Default is 0.
     void setYaw(float _rad);
 
@@ -155,6 +167,16 @@ public:
 
     // Get the current zoom truncated to an integer. This is the zoom used to determine visible tiles.
     int getIntegerZoom() const { return static_cast<int>(m_zoom); }
+
+    // Like getIntegerZoom(), but with any accumulated applyPivotZoomCompensation() adjustment
+    // added back - i.e. "what integer zoom would this frame report if the tilt gesture's
+    // elev-aware pivot correction had never touched baseZoom." TileManager uses this (not
+    // getIntegerZoom()) as its per-tile resolution ceiling: without this, dragging tilt over
+    // elevated terrain silently walks baseZoom down (see applyPivotZoomCompensation's doc
+    // comment), and every tile pinned at the old integer ceiling drops to the next-coarser zoom
+    // in lockstep the instant the (otherwise-unrelated-to-any-real-zoom-action) drift crosses an
+    // integer boundary - a visible "pop" with no zoom gesture behind it.
+    int getIntegerLodZoom() const { return static_cast<int>(m_zoom + m_zoomPivotDrift); }
 
     // Get the current yaw angle in radians.
     float getYaw() const { return m_yaw; }
@@ -236,6 +258,22 @@ public:
     //void getVisibleTiles(const std::function<void(TileID)>& _tileCb, int zoomBias, TileID tile = TileID(0,0,0)) const;
     float getTileScreenArea(TileID tile) const;
 
+    // Ratio between a tile's real local foreshortening (from a sampled elevation gradient) and
+    // flat ground's - see view.cpp doc comment (getTileScreenArea).
+    double steepnessCorrection(TileID tile) const;
+
+    // Zoom level implied by this tile's own distance from the camera eye, generalizing the same
+    // distance->zoom relationship updateMatrices() uses for m_zoom (which is derived from the
+    // depth at screen center only, i.e. the look-at point) to an arbitrary tile. m_zoom/
+    // getIntegerZoom() is a single value for the whole frame because the eye orbits the look-at
+    // point at a constant radius (m_pos.z) regardless of pitch - so under a grazing tilt, where
+    // real per-tile camera distance fans out hugely (near-camera foreground much closer, horizon
+    // much farther), getIntegerZoom() stays roughly flat while nearby tiles' true proximity would
+    // justify much finer resolution. Callers that use getIntegerZoom() as a resolution ceiling
+    // should take max(getIntegerZoom(), this) per tile instead, to let near-camera tiles under
+    // tilt earn the resolution their distance actually justifies (see TileManager::updateTileSets).
+    float getTileDistanceZoomBound(TileID tile) const;
+
     const glm::mat4& getOrthoViewportMatrix() const { return m_orthoViewport; };
 
     float pixelScale() const { return m_pixelScale; }
@@ -279,6 +317,10 @@ protected:
     float m_worldBoundsMinZoom = 0.f;
 
     float m_baseZoom = 0.f;  // zoom referenced to elevation = 0
+
+    // Cumulative amount applyPivotZoomCompensation() has subtracted from m_baseZoom so far - see
+    // that method's and getIntegerLodZoom()'s doc comments.
+    float m_zoomPivotDrift = 0.f;
 
     float m_width;
     float m_height;

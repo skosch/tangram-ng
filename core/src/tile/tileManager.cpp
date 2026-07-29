@@ -274,9 +274,18 @@ bool TileManager::updateTileSets(const View& _view) {
         using TileSetMask = std::bitset<MAX_TILE_SETS>;
         // enable recursion by passing lambda ref to itself; auto type creates a generic (i.e. templated) lambda
         auto getVisibleTiles = [&](auto&& self, TileID tileId, TileSetMask active){
-            // if pitch == 0, this will only return 0 or FLT_MAX
             float area = _view.getTileScreenArea(tileId);
             if (area <= 0) { return; }  // offscreen
+
+            // Perf/UX (grazing-tilt resolution fix): _view.getIntegerLodZoom() (not
+            // getIntegerZoom() - see both doc comments, view.h) is a single value for the whole
+            // frame (screen-center distance only), so under a grazing tilt it under-serves
+            // near-camera tiles whose true distance justifies much finer resolution than the
+            // look-at point's. Never LOWER the ceiling below today's getIntegerLodZoom() (that
+            // stays the right cap for the common non-tilted/near-look-at case, and for far tiles
+            // the area threshold below already stops subdivision earlier on its own) - only raise
+            // it when this specific tile's own distance justifies more.
+            int viewZoomCap = std::max(_view.getIntegerLodZoom(), int(_view.getTileDistanceZoomBound(tileId)));
 
             TileSetMask nextActive = active;
             for (size_t ii = 0; ii < m_tileSets.size(); ++ii) {
@@ -297,16 +306,16 @@ bool TileManager::updateTileSets(const View& _view) {
                 float effMaxArea = maxArea / (lodAreaBias * lodAreaBias);
                 // substantial redesign needed for something like this to work:
                 //for (auto& rs : tileSet.source->rasterSources()) { maxZoom = std::max(maxZoom, rs->maxZoom()); }
-                int maxZoom = std::min(tileSet.source->maxZoom(), _view.getIntegerZoom() - zoomBias);
+                int maxZoom = std::min(tileSet.source->maxZoom(), viewZoomCap - zoomBias);
                 bool stoppedByMaxZoom = tileId.z >= maxZoom;
                 if (stoppedByMaxZoom || area < effMaxArea*std::exp2(2*float(zoomBias))) {
                     // Perf/UX diagnosis (2026-07-11): lodAreaBias (the "resolution retention"
                     // sliders) only ever loosens the AREA half of this OR - it can never push a
-                    // tile past `maxZoom`, which is a single value for the WHOLE view
-                    // (_view.getIntegerZoom(), not per-tile/per-distance). If distant tiles are
-                    // stopping here because of maxZoom rather than the area threshold, no amount
-                    // of lodAreaBias will ever change their resolution - these counters make that
-                    // distinguishable instead of guessed at.
+                    // tile past `maxZoom`. Distant tiles stopping here because of maxZoom rather
+                    // than the area threshold are unaffected by lodAreaBias - these counters make
+                    // that distinguishable instead of guessed at. (maxZoom is now per-tile-distance
+                    // aware via viewZoomCap above, so this no longer applies to near-camera tiles
+                    // under tilt - just to genuinely distant ones, where it's expected.)
                     if (Profiler::isCapturing()) {
                         const char* srcName = tileSet.source->name().c_str();
                         if (stoppedByMaxZoom) {
@@ -330,7 +339,7 @@ bool TileManager::updateTileSets(const View& _view) {
                         // further apart in distance/zoom, see ZoomOptions::overzoomStepExponent.
                         float stepExponent = tileSet.source->overzoomStepExponent();
                         int s = tileId.z + std::max(0, int(std::ceil(std::log2(area/effMaxArea)/stepExponent)));
-                        visId.s = std::max(std::min(s, _view.getIntegerZoom()), visId.z + zoomBias);
+                        visId.s = std::max(std::min(s, viewZoomCap), visId.z + zoomBias);
                     }
                     tileSet.visibleTiles.insert(visId);
                     nextActive.reset(ii);

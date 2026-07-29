@@ -508,6 +508,7 @@ enum DebugFlags {
     tangram_stats,      // Tangram frame graph stats
     selection_buffer,   // Render selection framebuffer
     depth_buffer,   // Render depth framebuffer
+    zoom_labels,        // Big number at each tile's center showing its data zoom (TileID.z)
 };
 
 // Set debug features on or off using a boolean (see debug.h)
