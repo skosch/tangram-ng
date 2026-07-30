@@ -1,6 +1,9 @@
 #include "catch.hpp"
 
+#include "data/rasterSource.h"
 #include "data/tileSource.h"
+#include "gl/hardware.h"
+#include "gl/texture.h"
 #include "mockPlatform.h"
 #include "tile/tileManager.h"
 #include "tile/tileWorker.h"
@@ -11,6 +14,43 @@
 #include <deque>
 
 using namespace Tangram;
+
+namespace {
+// See rasterMosaicTests.cpp's identical helper: outside a real GL context,
+// Hardware::loadCapabilities() never runs, so force the NPOT support flag every real target
+// (GL3+/GLES3) always has in practice.
+struct ForceNPOTSupport2 {
+    ForceNPOTSupport2() { Hardware::supportsTextureNPOT = true; }
+} forceNPOTSupport2;
+
+TextureOptions rasterHealTestOptions() {
+    TextureOptions options;
+    options.pixelFormat = PixelFormat::ALPHA;  // 1 byte/pixel -- simplest to reason about
+    return options;
+}
+
+std::unique_ptr<Texture> makeConstTextureForCache(int W, uint8_t value) {
+    auto tex = std::make_unique<Texture>(rasterHealTestOptions());
+    std::vector<GLubyte> data(size_t(W) * size_t(W), value);
+    tex->setPixelData(W, W, 1, data.data(), data.size());
+    return tex;
+}
+
+// RasterSource::cacheTexture() is protected (friended only to RasterTileTask/TileSource/
+// FrameInfo). This test needs to drive it directly to simulate a finer descendant elevation
+// tile landing in the cache moments after a vector tile's own (coarser) attachment was built --
+// same idiom as TestTileManager below, which does the same for TileManager's own protected
+// members.
+struct TestRasterSource : public RasterSource {
+    TestRasterSource()
+        : RasterSource("elevation", nullptr, rasterHealTestOptions(), TileSource::ZoomOptions(-1, -1, 16, 0)) {}
+    using RasterSource::cacheTexture;
+};
+
+uint8_t compositePixel(const Texture& composite, int row, int col) {
+    return composite.bufferData()[size_t(row) * size_t(composite.width()) + size_t(col)];
+}
+} // namespace
 
 ViewState viewState { glm::vec2(0), 1, 0, 1.f, glm::vec2(0), 256.f };
 
@@ -136,6 +176,14 @@ public:
         // Remove duplicates: Proxy tiles could have been added more than once
         m_tiles.erase(std::unique(m_tiles.begin(), m_tiles.end()), m_tiles.end());
 
+    }
+
+    // Exercise upgradeAttachedRasters() directly for a hand-built Tile, bypassing the full
+    // updateTileSet() pipeline -- lets a test drive TileManager's protected raster-repair pass
+    // in isolation for a known tile / proxy-state combination.
+    void testUpgradeAttachedRasters(std::shared_ptr<TileSource> vectorSource, Tile& tile, const TileID& liveId) {
+        TileSet ts(vectorSource);
+        upgradeAttachedRasters(ts, tile, liveId);
     }
 };
 
@@ -309,4 +357,94 @@ TEST_CASE( "Use proxy Tile - circular proxies", "[TileManager][updateTileSets]" 
     REQUIRE(tileManager.getVisibleTiles()[0]->isProxy() == false);
     REQUIRE(tileManager.getVisibleTiles()[0]->getID() == TileID(0,0,0));
 
+}
+
+// --- Reproduction: does a PROXY vector tile's overzoom-elevation composite ever get upgraded as
+// finer descendant elevation data becomes available, the way an ordinary (non-proxy) tile's
+// does? ---
+//
+// This is the mechanism behind the live "landcover floating over the valley, fine on the
+// mountain" report: the Zoom-labels debug overlay showed one stale (coarser-zoom) proxy tile
+// sitting amid three already-updated finer neighbors. TileManager::upgradeAttachedRasters
+// (tileManager.cpp:945) is the pass meant to swap in a better elevation composite as finer data
+// streams in, but it early-returns for any tile still serving as a proxy
+// (tileManager.cpp:976, "Skip tiles currently serving as proxies... They get upgraded the
+// moment they are visible again") -- and RasterTileTask::addRaster() (rasterSource.cpp:617)
+// also only does a cache-only lookup (never an active stitch) for a proxy at build time. If
+// nothing else independently registers the composite in the meantime, a tile that entered view
+// as a proxy can stay attached to its coarse plain elevation texture for as long as it remains
+// a proxy, even once the exact finer descendant tiles it needs are sitting in cache.
+TEST_CASE("upgradeAttachedRasters - a proxy tile's elevation composite is skipped even once "
+          "finer descendant data is cached, while an ordinary tile's is upgraded",
+          "[TileManager][RasterMosaic]") {
+    const int W = 4;
+    TestTileWorker worker;
+    MockPlatform platform;
+    TestTileManager tileManager(platform, worker);
+
+    auto elevation = std::make_shared<TestRasterSource>();
+    elevation->m_keepTextureData = true;  // required by buildOverzoomElevationMosaic
+
+    auto vectorSource = std::make_shared<TestTileSource>();
+    vectorSource->addRasterSource(elevation);
+
+    // A vector tile whose own native data zoom is 10, but is being DISPLAYED at zoom 12 (a
+    // typical overzoom situation: its own source has no z12 data, but the elevation source
+    // does, up to maxZoom 16) -- zt = min(16, 12) capped at z+kOverzoomCompositeMaxLevels(2) =
+    // 12, so this genuinely is overzoomed and upgradeAttachedRasters' overzoom-only gate
+    // (tileManager.cpp:1051) does not skip it.
+    TileID liveId(50, 50, 10, 12);
+
+    auto ownTex = elevation->cacheTexture(TileID(50, 50, 10), makeConstTextureForCache(W, 100));
+
+    auto runScenario = [&](bool isProxy) {
+        Tile tile(TileID(50, 50, 10), vectorSource->id(), vectorSource->generation());
+        tile.setProxyDepth(isProxy ? 1 : 0);
+        // Simulates the state right after RasterTileTask::addRaster() ran with nothing finer
+        // than the plain texture available yet -- the coarse fallback every overzoomed tile
+        // starts from.
+        tile.rasters().emplace_back(TileID(50, 50, 10), ownTex);
+
+        // Baseline pass: still nothing finer cached anywhere.
+        tileManager.testUpgradeAttachedRasters(vectorSource, tile, liveId);
+        auto beforeTex = tile.rasters()[0].texture;
+
+        // A finer z12 descendant covering this tile's (row=0, col=0) grid cell finishes loading
+        // moments later -- e.g. because terrain-ground's own traversal needed it, exactly the
+        // ordinary case during panning. m_textures only holds a WEAK ref (mirroring production:
+        // a Tile elsewhere is what keeps a real tile's texture alive), so the returned
+        // shared_ptr must be kept alive here or it's evicted before the next lookup.
+        auto descendantTex = elevation->cacheTexture(TileID(200, 200, 12), makeConstTextureForCache(W, 222));
+
+        tileManager.testUpgradeAttachedRasters(vectorSource, tile, liveId);
+        return std::make_pair(beforeTex, tile.rasters()[0].texture);
+    };
+
+    SECTION("ordinary (non-proxy) tile: composite is upgraded to reflect the new real cell") {
+        auto [beforeTex, afterTex] = runScenario(false);
+        REQUIRE(afterTex != nullptr);
+        REQUIRE(afterTex != ownTex);
+        // The upgrade must actually have happened (not just returned the same stale object).
+        REQUIRE(afterTex != beforeTex);
+        // Grid cell (row=0 [north], col=0 [west]) of the composite must now hold the REAL
+        // descendant's value, not an upsampled placeholder derived from the coarse own texture
+        // (100). Composite buffer rows run south->north (see stitchElevationOverzoomMosaic's
+        // doc comment and the "Overzoom mosaic - dimensions and real children land in the
+        // correct grid cell" test), so grid row=0 (north) lands in the TOP pixel band
+        // [(N-1)*W, N*W) -- here N=4, W=4, so rows [12, 16).
+        for (int r = 0; r < W; r++) {
+            for (int c = 0; c < W; c++) {
+                REQUIRE(compositePixel(*afterTex, 3 * W + r, c) == 222);
+            }
+        }
+    }
+
+    SECTION("proxy tile: composite is never attempted, stays on the coarse plain texture") {
+        auto [beforeTex, afterTex] = runScenario(true);
+        REQUIRE(beforeTex == ownTex);
+        // Even after the exact finer descendant it needs is cached, a proxy tile's attachment
+        // is untouched: upgradeAttachedRasters returns immediately at isProxy(), never calling
+        // buildOverzoomElevationMosaic/buildElevationMosaic at all.
+        REQUIRE(afterTex == ownTex);
+    }
 }

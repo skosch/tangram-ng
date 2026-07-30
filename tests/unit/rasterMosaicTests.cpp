@@ -57,6 +57,26 @@ uint8_t mosaicPixel(const Texture& mosaic, int row, int col) {
     return mosaic.bufferData()[size_t(row) * size_t(mosaic.width()) + size_t(col)];
 }
 
+// Same as makeConstTexture, but returns a unique_ptr: RasterSource::cacheTexture() takes
+// ownership of a freshly-decoded tile texture, matching how RasterTileTask actually feeds it
+// (see rasterSource.cpp:765).
+std::unique_ptr<Texture> makeConstTextureUnique(int W, uint8_t value) {
+    auto tex = std::make_unique<Texture>(testOptions());
+    std::vector<GLubyte> data(size_t(W) * size_t(W), value);
+    tex->setPixelData(W, W, 1, data.data(), data.size());
+    return tex;
+}
+
+// RasterSource::cacheTexture() is protected (only RasterTileTask/TileSource/FrameInfo are
+// friended) since production code only ever reaches it through the real tile-task pipeline. For
+// this test we need to drive it directly to simulate a tile's own raster subtask completing
+// before its neighbors' do -- the same pattern TestTileManager (tileManagerTests.cpp) already
+// uses to reach TileManager's own protected members.
+struct TestRasterSource : public RasterSource {
+    TestRasterSource() : RasterSource("test-elevation", nullptr, testOptions(), TileSource::ZoomOptions{}) {}
+    using RasterSource::cacheTexture;
+};
+
 } // namespace
 
 TEST_CASE("Elevation mosaic - dimensions and center cell placement", "[RasterMosaic]") {
@@ -260,6 +280,88 @@ TEST_CASE("Elevation mosaic - refuses to build without CPU buffer data or a squa
 
     SECTION("null own texture") {
         REQUIRE(stitchElevationMosaic(nullptr, neighbors) == nullptr);
+    }
+}
+
+// --- Reproduction: does a tile's neighbor-ring mosaic, stitched incomplete because it raced
+// ahead of its own neighbor tiles, ever get completed once those neighbors are cached? ---
+//
+// docs/rock-texture-elevation-shelf-investigation.md and the live "landcover floating over the
+// valley, fine on the mountain" report both point at this race (tileManager.cpp:936-940's own
+// comment names it as the motivating case for TileManager::upgradeAttachedRasters). This test
+// drives RasterSource's real production methods (buildElevationMosaic, cacheTexture ->
+// patchNeighborMosaics, flushDirtyMosaics) directly, for one specific, known TileID, to check
+// whether the CPU-side self-heal path alone is sufficient -- i.e. whether the bug (if real) must
+// be somewhere else, e.g. the TileManager::upgradeAttachedRasters overzoom-only gate that this
+// test does NOT exercise (no TileManager involved here at all).
+TEST_CASE("Elevation mosaic - a tile that races ahead of its neighbors keeps an incomplete "
+          "mosaic until they're cached, then self-heals via patchNeighborMosaics + "
+          "flushDirtyMosaics", "[RasterMosaic][TileManager]") {
+    const int W = 4;
+    TestRasterSource rs;
+    rs.m_buildElevationMosaic = true;
+    rs.resetUploadBudget(20);
+
+    // A known, non-overzoomed tile (s == z): the ordinary case for a vector landcover tile
+    // draped at its own native zoom, which is exactly what TileManager::upgradeAttachedRasters'
+    // overzoom-only early-exit (tileManager.cpp:1051) skips re-checking.
+    TileID center(100, 100, 14, 14);
+
+    // Simulate this tile's own raster subtask completing FIRST, before any of its 8 same-zoom
+    // neighbors are cached -- RasterTileTask::addRaster() does exactly this: cache the tile's
+    // own texture, then stitch a mosaic from whatever neighbors happen to be cached already
+    // (here: none).
+    auto ownShared = rs.cacheTexture(TileID(center.x, center.y, center.z), makeConstTextureUnique(W, 100));
+
+    auto mosaic = rs.buildElevationMosaic(center, ownShared, nullptr);
+    REQUIRE(mosaic != nullptr);
+    REQUIRE(mosaic->userData != nullptr);
+    auto* info = static_cast<ElevationMosaicInfo*>(mosaic->userData.get());
+
+    // Confirm the setup is realistic: freshly built with zero neighbors cached, every cell is
+    // mirror-extrapolated, none real yet.
+    REQUIRE(info->neighborMask == 0);
+
+    // Now simulate the 8 same-zoom neighbor tiles finishing loading moments later -- e.g. via
+    // terrain-ground's own traversal or neighbor prefetch, which happens continuously during
+    // ordinary panning.
+    int value = 1;
+    std::array<uint8_t, 9> expectedNeighbor{};
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) { continue; }
+            uint8_t v = uint8_t(200 + value);
+            expectedNeighbor[gridIndex(dx, dy)] = v;
+            rs.cacheTexture(TileID(center.x + dx, center.y + dy, center.z), makeConstTextureUnique(W, v));
+            value++;
+        }
+    }
+
+    // A subsequent TileManager update cycle calls RasterSource::flushDirtyMosaics() once
+    // (tileManager.cpp:392) to push any patched cells to the GPU.
+    rs.flushDirtyMosaics();
+
+    // If patchNeighborMosaics()/flushDirtyMosaics() are doing their job, the SAME mosaic object
+    // -- already attached to whatever Tile referenced it, no swap needed -- should now show
+    // every neighbor cell as real data, and the flush should have cleared its dirty flag.
+    REQUIRE(info->neighborMask == kAllRealNeighborsMask);
+    REQUIRE(info->firstDirtyTime == 0.0);
+
+    // ...and the actual pixel content for every previously-missing cell should be the REAL
+    // neighbor's value, not the old mirror-extrapolated placeholder.
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) { continue; }
+            int rowOff = (1 - dy) * W;
+            int colOff = (dx + 1) * W;
+            uint8_t expect = expectedNeighbor[gridIndex(dx, dy)];
+            INFO("dx=" << dx << " dy=" << dy);
+            for (int r = 0; r < W; r++) {
+                for (int c = 0; c < W; c++) {
+                    REQUIRE(mosaicPixel(*mosaic, rowOff + r, colOff + c) == expect);
+                }
+            }
+        }
     }
 }
 

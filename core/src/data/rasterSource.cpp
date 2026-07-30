@@ -629,6 +629,26 @@ public:
             std::shared_ptr<Texture> mosaicTex;
             if (isProxy() || !source->tryConsumeStitchBudget()) {
                 mosaicTex = source->getExistingMosaic(m_tileId);
+                if (!mosaicTex) {
+                    // Correctness fallback, not just a perf one: whenever m_buildElevationMosaic
+                    // is set, the shader's ELEVATION_MOSAIC path (elevation.yaml) is a scene-wide
+                    // compile flag - it unconditionally treats EVERY bound elevation texture as a
+                    // 3Wx3W neighbor-ring mosaic and remaps tile-local UV into its center ninth
+                    // (elevationMosaicUV()), with no per-texture way to know otherwise. Falling
+                    // through below to attach the plain per-tile texture in that case (as this
+                    // used to do) hands the shader a texture 1/3 the width it assumes: every
+                    // vertex's UV collapses into a narrow, roughly-constant band near the
+                    // texture's center regardless of true position, producing a flat, floating
+                    // drape sitting on top of the (correctly-elevated) terrain-ground mesh
+                    // underneath - confirmed live as the "landcover floating over the valley"
+                    // report. A real stitch here is a bounded, one-time cost (stitchElevation
+                    // Mosaic() mirror-extrapolates any missing neighbor, so it never fails given
+                    // a valid own texture); skipping it for a proxy/budget-exhausted tile with
+                    // nothing cached yet was trading a rare perf hit for a correctness bug -
+                    // worth paying for here specifically because "wrong layout" (not just
+                    // "coarser than ideal") is the failure mode.
+                    mosaicTex = source->buildElevationMosaic(m_tileId, raster->texture);
+                }
             } else {
                 mosaicTex = source->buildElevationMosaic(m_tileId, raster->texture);
             }
@@ -636,8 +656,8 @@ public:
                 _tile.rasters().emplace_back(raster->tileID, mosaicTex);
                 return;
             }
-            // Fall through to the plain texture if no mosaic is available yet (e.g. no other
-            // tile in the area has stitched one, or the CPU-side buffer wasn't retained).
+            // Only reachable if buildElevationMosaic() itself returned null (e.g. the plain
+            // texture has no CPU-side buffer data to stitch from) - see its own doc comment.
         }
         _tile.rasters().emplace_back(raster->tileID, raster->texture);
     }
