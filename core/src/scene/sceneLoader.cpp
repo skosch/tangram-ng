@@ -459,6 +459,12 @@ void SceneLoader::loadTexture(std::pair<const Node&, const Node&> _node, SceneTe
         }
     }
 
+    if (const Node& wrap = textureConfig["wrap"]) {
+        if (!parseTexWrap(wrap, options)) {
+            LOGW("Invalid texture wrap: %s", Dump(wrap).c_str());
+        }
+    }
+
     if (const Node& density = textureConfig["density"]) {
         options.displayScale = 1.f / YamlUtil::getFloatOrDefault(density, 1.f);
     }
@@ -511,6 +517,32 @@ bool SceneLoader::parseTexFiltering(const Node& _filteringNode, TextureOptions& 
     } else if (filteringString == "nearest") {
         _options.minFilter = TextureMinFilter::NEAREST;
         _options.magFilter = TextureMagFilter::NEAREST;
+        return true;
+    }
+    return false;
+}
+
+// Previously no way to request GL_REPEAT from scene YAML at all (TextureOptions
+//  defaults to CLAMP_TO_EDGE, fine for icon/sprite textures but wrong for a texture
+//  meant to tile across world-space UVs many times over - see rock-texture-v2-plan.md
+//  round 7/8: a shader working around this by manually fract()-wrapping the UV instead
+//  breaks the GPU's automatic mip-level derivative computation at every tile seam
+//  (fract() is a hard discontinuity, so dFdx/dFdy spike to garbage right at the wrap),
+//  which is what native GL_REPEAT wrapping exists to avoid - the hardware wraps only
+//  the integer part during the texel fetch itself, so derivatives computed on the
+//  continuous pre-wrap coordinate stay correct across tile boundaries).
+bool SceneLoader::parseTexWrap(const Node& _wrapNode, TextureOptions& _options) {
+    if (!_wrapNode.IsScalar()) {
+        return false;
+    }
+    const std::string& wrapString = _wrapNode.Scalar();
+    if (wrapString == "repeat") {
+        _options.wrapS = TextureWrap::REPEAT;
+        _options.wrapT = TextureWrap::REPEAT;
+        return true;
+    } else if (wrapString == "clamp") {
+        _options.wrapS = TextureWrap::CLAMP_TO_EDGE;
+        _options.wrapT = TextureWrap::CLAMP_TO_EDGE;
         return true;
     }
     return false;

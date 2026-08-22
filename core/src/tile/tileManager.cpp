@@ -974,6 +974,33 @@ void TileManager::upgradeAttachedRasters(TileSet& _tileSet, Tile& _tile, const T
     // exactly the frames that are already busiest (pan/zoom churn). They get upgraded the
     // moment they are visible again.
     if (_tile.isProxy()) { return; }
+
+    // TEMP DIAGNOSTIC (docs/terrain-drape-cellcaps-investigation.md's "gridRes coordination"
+    //  open question - round 16 of the rock-texture-v2 effort, added after the round-15
+    //  elevation-composite fix was confirmed working (its own diagnostic went quiet) but
+    //  tearing PERSISTED in the same spots, meaning a second, separate mechanism is in play).
+    //  PolygonBuilder::gridRes (mesh tessellation density, polygonStyle.cpp) is fixed once at
+    //  tile BUILD time from _tile.getID().s - a snapshot of whatever the view's styling zoom
+    //  was back then - and never re-evaluated, unlike _liveId.s (this function's own
+    //  parameter, which DOES track the live view - see its doc comment above, "visTileId
+    //  carries the LIVE styling zoom"). A tile built while zoomed out (low s, coarse ~64-cell
+    //  mesh per kTerrainMeshGridRes, builders.h) that's later viewed at a much higher
+    //  effective zoom (e.g. tilting into a close, steep view of already-cached terrain) keeps
+    //  its coarse mesh forever until the tile happens to be rebuilt for an unrelated reason -
+    //  a large enough triangle can "chord across" real terrain relief and fail the depth test
+    //  against terrain-ground in patches, which would look exactly like torn triangles
+    //  showing the plain gray surface through. The round-15 fix only touches the DATA the
+    //  shader samples, not mesh density - a deliberate, documented scope limit at the time.
+    //  Logs whenever the live target is finer than what the tile's own mesh was built for.
+    //  Remove once this investigation concludes either way.
+    {
+        int32_t builtS = int32_t(_tile.getID().s);
+        if (int32_t(_liveId.s) > builtS) {
+            LOGD("Tile mesh built coarser than live view: tile %s builtS=%d liveS=%d",
+                 _liveId.toString().c_str(), builtS, int32_t(_liveId.s));
+        }
+    }
+
     auto& sources = _tileSet.source->rasterSources();
     auto& rasters = _tile.rasters();
     if (sources.empty() || rasters.size() < sources.size()) { return; }
@@ -1036,61 +1063,16 @@ void TileManager::upgradeAttachedRasters(TileSet& _tileSet, Tile& _tile, const T
         Raster& raster = rasters[i + offset];
         if (!rs || !raster.texture) { continue; }
 
-        // Target everything below at the LIVE, NEIGHBOR-AWARE styling zoom (effectiveS above),
-        // not the s frozen into raster.tileID when the attachment was first built: the composite
-        // target zoom must track the CURRENT view (both finer AND coarser than at build time), or
-        // a cached tile re-entering view keeps draping at its build-time zoom forever -- see the
-        // doc comment on this function in tileManager.h. raster.tileID's x/y/z are kept as-is
-        // (they name the attachment's actual footprint, including the parent-fallback case).
-        TileID livePrimary(raster.tileID.x, raster.tileID.y, raster.tileID.z,
-                           std::max<int32_t>(effectiveS, raster.tileID.z));
-
-        // Not overzoomed enough for a composite to apply at all (the ordinary, non-draped-vector
-        // case) -- nothing for this function to do. Cheap: skips straight past the common case
-        // without ever touching m_textures.
-        if (rs->overzoomTargetZoom(livePrimary) <= int(livePrimary.z)) { continue; }
-
-        // 3-arg TileID (s = z) to match the texture cache's normalized keys. raster.tileID may
-        // be a lower-zoom PARENT of the tile's own id (the missing-raster proxy pass in
-        // updateTileSet() substitutes one when the exact fetch failed) -- everything below
-        // handles that transparently, since all lookups key off raster.tileID itself.
-        TileID texId(raster.tileID.x, raster.tileID.y, raster.tileID.z);
-        auto plainTex = rs->getTexture(texId);
-
-        ElevationMosaicInfo* info = raster.texture->userData
-                ? static_cast<ElevationMosaicInfo*>(raster.texture->userData.get()) : nullptr;
-        bool holdsPlain = plainTex && raster.texture == plainTex;
-        // Textures that are neither the plain texture nor carry mosaic/composite info (the
-        // empty texture, parent-proxy fill-ins whose own cache entry expired) are left alone.
-        if (!holdsPlain && !info) { continue; }
-
-        // The plain texture is the required base for (re)building composites (stitch dimension
-        // reference + ultimate per-cell fallback); reach it through the attached info's
-        // plainTexture when the weak cache entry has already expired.
-        std::shared_ptr<Texture> plainBase = plainTex;
-        if (!plainBase && info) { plainBase = info->plainTexture; }
-        if (!plainBase) { continue; }
-
-        // Per-cell displayed-terrain zoom caps (see buildOverzoomElevationMosaic's doc comment
-        // in rasterSource.h): the composite must reproduce the surface the elevation tileset
-        // is RENDERING under this tile right now, not the finest data that happens to be
-        // cached -- panning fills the cache with fine tiles while the terrain's screen-area
-        // LOD keeps displaying coarser ones over the far parts of a footprint, and a
-        // "finest cached" composite then disagrees with the rendered terrain by the full
-        // inter-zoom DEM delta, permanently (2026-07 live diagnosis: the persistent unshaded
-        // "white patch" land-cover mode occurred exclusively on composite-attached tiles).
-        // Cap each composite cell at the zoom of the traversal-target tile covering it; cells
-        // not covered by any target tile (offscreen parts of the footprint) stay uncapped.
-        int zt = rs->overzoomTargetZoom(livePrimary);
-        int levels = zt - int(livePrimary.z);
-        int N = 1 << levels;
-        std::vector<uint8_t> cellCaps;
-
         // Perf (2026-07 profiling): the elevSet lookup and the rendered/ready sets built from it
         // below are identical for every raster attachment on every tile processed against this
         // `rs` within one updateTileSets() pass (elevSet's own visibleTiles/tiles are constant
         // for the rest of the pass once it's reached this call - see m_upgradeRasterCache's doc
         // comment in tileManager.h), so compute them at most once per pass and reuse afterward.
+        // ROUND 14 (docs/terrain-drape-cellcaps-investigation.md): moved ahead of livePrimary/zt
+        // below (was originally built after both) - the composite-target fix just below needs
+        // `rendered` to compute livePrimary itself now, not only for the per-cell caps further
+        // down, and this block doesn't reference livePrimary/zt at all, so hoisting it here is a
+        // pure reordering with no behavior change to the block itself.
         auto cacheIt = m_upgradeRasterCache.find(rs);
         if (cacheIt == m_upgradeRasterCache.end()) {
             TileSet* elevSet = nullptr;
@@ -1162,6 +1144,131 @@ void TileManager::upgradeAttachedRasters(TileSet& _tileSet, Tile& _tile, const T
         }
         const std::set<TileID>& rendered = cacheIt->second.first;
         const std::set<TileID>& ready = cacheIt->second.second;
+
+        // ROUND 14 fix (docs/terrain-drape-cellcaps-investigation.md's leading hypothesis,
+        //  confirmed live via the doc's own section-7.1-prescribed diagnostic, 2026-08-01:
+        //  persistent "Drape ceiling below displayed terrain" firings exactly where torn/
+        //  textureless triangles were reported, tilted views near the Matterhorn).
+        //  effectiveS (a whole-tile aggregate-screen-area heuristic, computed above) can
+        //  systematically underestimate how fine the elevation tileset is ACTUALLY DISPLAYING
+        //  under the screen-area-concentrated part of a tilted view - the composite's target
+        //  zoom was hard-capped at effectiveS regardless, so cells covered by genuinely finer
+        //  displayed terrain fell into the per-cell cap loop's "leave at zt" branch below with
+        //  no way to ever pick up that finer data. Reusing `rendered` (just computed above -
+        //  no new tileset walk), find the finest elevation zoom actually displayed anywhere
+        //  under THIS tile's own (x,y) footprint - independent of s/zt, which don't exist yet
+        //  at this point - and fold it into livePrimary's target zoom below, alongside
+        //  effectiveS. This only ever RAISES the target (matching the investigation doc's
+        //  "errs only in the direction of more fidelity" framing): the per-cell cap loop
+        //  further down still independently clamps any cell that ISN'T actually covered by
+        //  finer displayed data back down to whatever real data covers it, so this can't
+        //  fabricate detail, only stop discarding real data that was already there.
+        //  NOTE: deliberately does NOT touch PolygonBuilder::gridRes (mesh tessellation
+        //  density, polygonStyle.cpp) - that's fixed at tile BUILD time from a different `s`
+        //  and would need a full tile rebuild to also raise, out of scope for this fix per the
+        //  investigation doc's own explicit "gridRes coordination" open question - resolved
+        //  here as "accept bounded chording" rather than triggering rebuilds (terrain_grid is
+        //  already generous, and the reported symptom was wrong/missing composite DATA, not a
+        //  geometric hole).
+        int32_t finestDisplayedUnderFootprint = int32_t(raster.tileID.z);
+        for (const TileID& r : rendered) {
+            if (r.z <= finestDisplayedUnderFootprint) { continue; }
+            int ddl = r.z - int(raster.tileID.z);
+            if (ddl < 0) { continue; }  // shouldn't happen; guard against UB from a negative shift
+            if ((r.x >> ddl) == raster.tileID.x && (r.y >> ddl) == raster.tileID.y) {
+                finestDisplayedUnderFootprint = r.z;
+            }
+        }
+
+        // Target everything below at the LIVE, NEIGHBOR-AWARE styling zoom (effectiveS above)
+        // OR the finest elevation zoom actually displayed under this tile's footprint
+        // (finestDisplayedUnderFootprint above), whichever is finer - not the s frozen into
+        // raster.tileID when the attachment was first built: the composite target zoom must
+        // track the CURRENT view (both finer AND coarser than at build time), or a cached tile
+        // re-entering view keeps draping at its build-time zoom forever -- see the doc comment
+        // on this function in tileManager.h. raster.tileID's x/y/z are kept as-is (they name
+        // the attachment's actual footprint, including the parent-fallback case).
+        // ROUND 19: re-enabled after round 18's loop investigation confirmed (with this
+        //  disabled, per the "still doing the same thing, looping like crazy" report) that
+        //  this contribution was NOT the cause of the tile-rebuild/cache-thrashing loop - the
+        //  loop's real cause is the tile cache running essentially always-full (~185MB live
+        //  limit, not the ~512MB expected from config), unrelated to this line. Disabling
+        //  this only re-exposed the round-14/15 composite-mismatch bug ("Drape ceiling below
+        //  displayed terrain" firing heavily again, confirmed live). Restored to the round-15
+        //  formula.
+        TileID livePrimary(raster.tileID.x, raster.tileID.y, raster.tileID.z,
+                           std::max({effectiveS, int32_t(raster.tileID.z), finestDisplayedUnderFootprint}));
+
+        // Not overzoomed enough for a composite to apply at all (the ordinary, non-draped-vector
+        // case) -- nothing for this function to do. Cheap: skips straight past the common case
+        // without ever touching m_textures.
+        if (rs->overzoomTargetZoom(livePrimary) <= int(livePrimary.z)) { continue; }
+
+        // 3-arg TileID (s = z) to match the texture cache's normalized keys. raster.tileID may
+        // be a lower-zoom PARENT of the tile's own id (the missing-raster proxy pass in
+        // updateTileSet() substitutes one when the exact fetch failed) -- everything below
+        // handles that transparently, since all lookups key off raster.tileID itself.
+        TileID texId(raster.tileID.x, raster.tileID.y, raster.tileID.z);
+        auto plainTex = rs->getTexture(texId);
+
+        ElevationMosaicInfo* info = raster.texture->userData
+                ? static_cast<ElevationMosaicInfo*>(raster.texture->userData.get()) : nullptr;
+        bool holdsPlain = plainTex && raster.texture == plainTex;
+        // Textures that are neither the plain texture nor carry mosaic/composite info (the
+        // empty texture, parent-proxy fill-ins whose own cache entry expired) are left alone.
+        if (!holdsPlain && !info) { continue; }
+
+        // The plain texture is the required base for (re)building composites (stitch dimension
+        // reference + ultimate per-cell fallback); reach it through the attached info's
+        // plainTexture when the weak cache entry has already expired.
+        std::shared_ptr<Texture> plainBase = plainTex;
+        if (!plainBase && info) { plainBase = info->plainTexture; }
+        if (!plainBase) { continue; }
+
+        // Per-cell displayed-terrain zoom caps (see buildOverzoomElevationMosaic's doc comment
+        // in rasterSource.h): the composite must reproduce the surface the elevation tileset
+        // is RENDERING under this tile right now, not the finest data that happens to be
+        // cached -- panning fills the cache with fine tiles while the terrain's screen-area
+        // LOD keeps displaying coarser ones over the far parts of a footprint, and a
+        // "finest cached" composite then disagrees with the rendered terrain by the full
+        // inter-zoom DEM delta, permanently (2026-07 live diagnosis: the persistent unshaded
+        // "white patch" land-cover mode occurred exclusively on composite-attached tiles).
+        // Cap each composite cell at the zoom of the traversal-target tile covering it; cells
+        // not covered by any target tile (offscreen parts of the footprint) stay uncapped.
+        int zt = rs->overzoomTargetZoom(livePrimary);
+        int levels = zt - int(livePrimary.z);
+        int N = 1 << levels;
+        std::vector<uint8_t> cellCaps;
+
+        // rendered/ready (used by the per-cell cap loop below) were already computed above,
+        // ahead of livePrimary - see that block's comment for why (round 14 fix needed them
+        // earlier than they used to be built).
+
+        // TEMP DIAGNOSTIC (docs/terrain-drape-cellcaps-investigation.md section 7.1, round 8's
+        //  leading hypothesis - added to confirm/refute it against a live 2026-08-01 "torn
+        //  forest and rock-texture triangles under tilt near the Matterhorn" report, per
+        //  that doc's own explicit "no fix without sign-off" recommendation - this is
+        //  diagnostics only, not a fix). Fires whenever the elevation tileset is DISPLAYING
+        //  tiles finer than this drape composite's own target zoom zt under this tile's
+        //  footprint - the one regime the cap machinery below cannot represent (its walk starts
+        //  at zt and only goes coarser; finer-displayed cells fall into the zTarget < 0 "leave
+        //  at zt" branch with no trace). Remove once the investigation concludes either way.
+        {
+            int finestDisplayed = -1;
+            for (const TileID& r : rendered) {
+                if (r.z <= zt) { continue; }
+                int ddl = r.z - int(livePrimary.z);
+                if (ddl < 0) { continue; }  // shouldn't happen; guard against UB from a negative shift
+                if ((r.x >> ddl) == livePrimary.x && (r.y >> ddl) == livePrimary.y) {
+                    finestDisplayed = std::max(finestDisplayed, int(r.z));
+                }
+            }
+            if (finestDisplayed > zt) {
+                LOGD("Drape ceiling below displayed terrain: tile %s zt=%d displayed=z%d (liveS=%d effectiveS=%d)",
+                     _liveId.toString().c_str(), zt, finestDisplayed, int(_liveId.s), int(effectiveS));
+            }
+        }
+
         if (!rendered.empty()) {
             cellCaps.assign(size_t(N) * size_t(N), uint8_t(zt));
             int32_t baseX = int32_t(livePrimary.x) << levels;
@@ -1231,6 +1338,18 @@ bool TileManager::addTile(TileSet& _tileSet, const TileID& _tileID) {
 
     auto tile = m_tileCache->get(_tileSet.source->id(), _tileID);
 
+    // TEMP DIAGNOSTIC (rock-texture-v2 round 19, "absurdly slow"/repeated-rebuild investigation,
+    //  2026-08-03): addTile() is only reached when a tile transitions into visibleTiles without
+    //  an already-tracked TileEntry (updateTileSet's diff loop, curTileId > visTileId branch) -
+    //  a cache MISS here (tile == nullptr, or a stale-generation tile getting reset() just
+    //  below) forces a full network/cache-backed refetch + rebuild via a fresh TileTask, not a
+    //  cheap reattach. Logging cache occupancy alongside every call distinguishes "genuinely
+    //  undersized cache, evicting tiles before they're ever revisited" from some other cause of
+    //  the repeated setup() calls already confirmed in polygonStyle.cpp.
+    LOGD("TileManager::addTile source=%d tile=%s hit=%d cacheUsage=%zu/%zu",
+         _tileSet.source->id(), _tileID.toString().c_str(), tile != nullptr,
+         m_tileCache->getMemoryUsage(), m_tileCache->cacheSizeLimit());
+
     if (tile) {
         if (tile->sourceGeneration() == _tileSet.source->generation()) {
             // Reset tile on potential internal dynamic data set
@@ -1281,10 +1400,23 @@ void TileManager::updateProxyTiles(TileSet& _tileSet, const TileID& _tileID, Til
 }
 
 void TileManager::setCacheSize(size_t _cacheSize) {
+    // ROUND 19 (rock-texture-v2 "absurdly slow"/rebuild-loop investigation, 2026-08-03): the
+    //  old `if (m_tileCache->cacheSizeLimit() > _cacheSize)` guard here meant limitCacheSize()
+    //  -- the ONLY function that actually updates TileCache::m_cacheMaxUsage -- was skipped
+    //  whenever the caller was RAISING the limit (the common case: mapsapp.cpp calls this once
+    //  at startup with cfg()["tile_cache_limit"], default 512MB, while TileCache is
+    //  constructed at DEFAULT_CACHE_SIZE = 32MB). The limit could therefore only ever shrink
+    //  from its 32MB construction-time default, never actually reach the intended ~512MB
+    //  budget. Live-diagnosed via a temporary TileManager::addTile() log showing cacheUsage
+    //  pinned at its cap (~185MB, not 512MB) while panning at zoom 16+ over dense bare_rock/
+    //  scree terrain - meshes were being evicted and rebuilt from scratch almost as fast as
+    //  they were added, which is what "absurdly slow"/the repeated identical
+    //  PolygonStyleBuilder::setup() calls for the same tile turned out to be. Unconditional
+    //  call is correct in both directions: shrinking evicts down to the new limit (unchanged
+    //  behavior), growing just raises the limit with nothing to evict (the while loop in
+    //  limitCacheSize() is a no-op when usage is already under the new, larger limit).
     m_maxCacheLimit = _cacheSize;
-    if (m_tileCache->cacheSizeLimit() > _cacheSize) {
-        m_tileCache->limitCacheSize(_cacheSize);
-    }
+    m_tileCache->limitCacheSize(_cacheSize);
 }
 
 int TileManager::numTotalTiles() const {

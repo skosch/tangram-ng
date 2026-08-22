@@ -54,6 +54,7 @@ struct SceneLoader {
     static void applyTextures(const Node& texturesNode, SceneTextures& textures);
     static void loadTexture(std::pair<const Node&, const Node&> texture, SceneTextures& textures);
     static bool parseTexFiltering(const Node& filteringNode, TextureOptions& options);
+    static bool parseTexWrap(const Node& wrapNode, TextureOptions& options);
 
     /// Fonts
     static void applyFonts(const Node& fontsNode, SceneFonts& fonts);

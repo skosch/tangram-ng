@@ -122,9 +122,34 @@ public:
         //  (rasterStyle.cpp) instead of needlessly tessellating finer than the ground it sits on.
         //  Never exceeds the configured ceiling, so the worst-case tiles are unaffected.
         int overzoomLevels = std::max(0, int(id.s) - int(id.z));
-        m_builder.gridRes = m_style.activeTerrainGrid() > 0
-            ? std::min(m_style.activeTerrainGrid(), kTerrainMeshGridRes << overzoomLevels)
-            : 0;
+        // TEMP (rock-texture-v2 round 20, forced-density test): bypass the overzoomLevels
+        //  scale-down entirely and always use the full configured ceiling, to test whether
+        //  mesh density (as opposed to composite data, already ruled out in round 19) is the
+        //  cause of tearing that survives at low/no overzoom. Revert to the commented formula
+        //  below once confirmed either way.
+        m_builder.gridRes = m_style.activeTerrainGrid();
+        // int overzoomLevels = std::max(0, int(id.s) - int(id.z));
+        // m_builder.gridRes = m_style.activeTerrainGrid() > 0
+        //     ? std::min(m_style.activeTerrainGrid(), kTerrainMeshGridRes << overzoomLevels)
+        //     : 0;
+        // TEMP DIAGNOSTIC (rock-texture-v2 round 18, "torn holes while panning at zoom 16+,
+        //  angle-dependent" investigation): rounds 14-17 refuted the composite-data-mismatch,
+        //  gridRes-staleness, elevation-shelf-pinning, and OSM-coverage-gap hypotheses in
+        //  turn. This tests the one mesh-density angle only reasoned about abstractly so far,
+        //  not measured: whether gridRes actually reaches the "256, hand-verified sufficient"
+        //  value during ORDINARY (not deeply overzoomed) zoom-16 panning at tilt 0, or is
+        //  landing lower (64/128) because overzoomLevels (id.s - id.z, THIS tile's own
+        //  build-time styling zoom) undercounts the true resolution gap - id.s reflects the
+        //  vector tile's own screen-area heuristic, not what the elevation tileset
+        //  independently ends up displaying under this same footprint (the same divergence
+        //  round 14/15 fixed for composite DATA, but never for mesh geometry - see
+        //  docs/rock-texture-v2-plan.md round 15's "accept bounded chording" deferral).
+        //  Fires once per tile build (not per-frame), so LOGD is fine at that frequency.
+        if (m_style.activeTerrainGrid() > 0) {
+            LOGD("PolygonStyleBuilder::setup gridRes: tile %s overzoomLevels=%d gridRes=%d (ceiling=%d) sourceID=%d sourceGen=%lld style=%s",
+                 id.toString().c_str(), overzoomLevels, m_builder.gridRes, m_style.activeTerrainGrid(),
+                 _tile.sourceID(), (long long)_tile.sourceGeneration(), m_style.getName().c_str());
+        }
     }
 
     void setup(const Marker& _marker, int zoom) override {

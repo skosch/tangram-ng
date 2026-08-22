@@ -40,6 +40,14 @@ namespace {
 // without needing two separately-tuned constants.
 constexpr double kAnchorRefineBudgetMs = 4.0;
 
+// Round 16: same idiom as kAnchorRefineBudgetMs above, for Label::refinePriority() - see
+// LabelManager::m_priorityRefineTimeUsedMs's doc comment (labelManager.h) for why this was
+// missing entirely until now. A single sampleTextureShading() call is cheap once its
+// mosaic's pyramid is cached, but a fresh pyramid build is not, and refinePriority() (unlike
+// refineAnchor()) was never gated at all - one call per not-yet-refined label, every frame,
+// no ceiling.
+constexpr double kPriorityRefineBudgetMs = 4.0;
+
 // docs/label-placement-v2-spec.md's "Deterministic-but-not-jittery collision resolution"
 // (Option A) -- see LabelManager::priorityComparator()'s own comment for the full
 // reasoning. Tune by eye: frames a label must stay continuously unoccluded before its
@@ -124,16 +132,31 @@ void LabelManager::processLabelUpdate(const ViewState& _viewState, const LabelSe
         // label opted in (Label::Options::refinePriorityWithTextureShading); retried every
         // frame, like m_elevationSet/setElevation above, until the elevation mosaic becomes
         // available at this label's position.
+        //
+        // Round 16: budget-gated the same way refineAnchor() below already is (see
+        // m_priorityRefineTimeUsedMs's doc comment, labelManager.h) -- this was previously
+        // unbounded, one call per not-yet-refined label every frame with no ceiling, despite
+        // calling into the same sampleTextureShading() whose per-mosaic pyramid cache can miss
+        // (and pay a real rebuild) on the first peak of every newly-streamed-in tile.
         if (_elevManager && !label->m_prominenceRefined) {
-            if (_tile) {
-                label->m_prominenceRefined =
-                    label->refinePriority(*_elevManager, _tile->getOrigin(), _tile->getScale(),
-                                          _viewportMaxElev, _haveViewportMaxElev);
-            } else if (_marker) {
-                double scale = _marker->extent();
-                if (scale <= 0) { scale = MapProjection::metersPerTileAtZoom(_marker->builtZoomLevel()); }
-                label->m_prominenceRefined = label->refinePriority(*_elevManager, _marker->origin(), scale,
-                                                                    _viewportMaxElev, _haveViewportMaxElev);
+            if (m_priorityRefineTimeUsedMs < kPriorityRefineBudgetMs) {
+                auto t0 = std::chrono::steady_clock::now();
+                if (_tile) {
+                    label->m_prominenceRefined =
+                        label->refinePriority(*_elevManager, _tile->getOrigin(), _tile->getScale(),
+                                              _viewportMaxElev, _haveViewportMaxElev);
+                } else if (_marker) {
+                    double scale = _marker->extent();
+                    if (scale <= 0) { scale = MapProjection::metersPerTileAtZoom(_marker->builtZoomLevel()); }
+                    label->m_prominenceRefined = label->refinePriority(*_elevManager, _marker->origin(), scale,
+                                                                        _viewportMaxElev, _haveViewportMaxElev);
+                }
+                auto t1 = std::chrono::steady_clock::now();
+                m_priorityRefineTimeUsedMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            } else {
+                // Budget exhausted this frame - same "keep rendering until it gets its
+                // turn" reasoning as refineAnchor()'s budget-exhausted branch below.
+                m_needUpdate = true;
             }
         }
 
@@ -266,6 +289,7 @@ void LabelManager::updateLabels(const ViewState& _viewState, float _dt, const Sc
 
     m_needUpdate = false;
     m_anchorRefineTimeUsedMs = 0.0;
+    m_priorityRefineTimeUsedMs = 0.0;
 
     auto* elevManager = _scene.elevationManager();
 

@@ -143,6 +143,21 @@ protected:
     // frames, it does not change the final result. The same tuned millisecond value now
     // behaves sanely in both Debug and Release without separate constants.
     double m_anchorRefineTimeUsedMs = 0.0;
+
+    // Round 16 (Sebastian, real trace: LabelsCollect spiking to 1.79s single-frame stalls,
+    // zoom 12 over a peak-dense Alps view): refinePriority() had NO budget at all, unlike
+    // refineAnchor() above - despite calling into the exact same sampleTextureShading(),
+    // whose own single-slot per-mosaic cache (textureShading.cpp round 8) assumes
+    // consecutive calls mostly target the same tile's mosaic. That holds within one tile's
+    // labels (processLabelUpdate() is called per-tile), but the frame that newly streams in
+    // many tiles at once (a big pan/zoom, or first load) forces one full pyramid rebuild
+    // (~600K-element decode + kMaxLevels box-filter passes) per tile, for every one of
+    // potentially 1000+ peak candidates in a cluttered alpine view, every single frame until
+    // each succeeds - exactly the "thousands of candidates newly eligible in the same frame"
+    // scenario the comment above already documents refineAnchor needing protection from.
+    // Same measured-wall-clock-budget idiom, not a fixed count, for the same
+    // Debug-vs-Release reason.
+    double m_priorityRefineTimeUsedMs = 0.0;
 };
 
 }
