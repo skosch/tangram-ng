@@ -1,4 +1,7 @@
 #include "scene/scene.h"
+#include <cmath>
+#include <algorithm>
+#include <cstdlib>
 
 #include "data/tileSource.h"
 #include "data/rasterSource.h"
@@ -309,6 +312,11 @@ bool Scene::load() {
     if (elevMosaic) {
         terrainSrc->m_prefetchNeighbors = true;
         terrainSrc->m_buildElevationMosaic = true;
+        // Upgrades of attached mosaics/composites stitch on a background thread (see
+        // RasterSource::requestElevationMosaic); ASCEND_ASYNC_STITCH=0 restores the old
+        // fully-synchronous behavior for A/B comparison.
+        const char* asyncEnv = std::getenv("ASCEND_ASYNC_STITCH");
+        terrainSrc->setAsyncStitching(!(asyncEnv && asyncEnv[0] == '0'));
     }
     LOGTO("<<< elevationManager");
 
@@ -671,9 +679,17 @@ Scene::UpdateState Scene::update(RenderState& _rs, View& _view, float _dt) {
 
     m_time += _dt;
 
-    bool viewChanged = _view.update();
+    bool viewChanged;
+    {
+        PROFILE_SCOPE("ViewUpdate");
+        viewChanged = _view.update();
+    }
 
-    auto markersState = m_markerManager->update(_view, _dt);
+    MarkerManager::UpdateState markersState;
+    {
+        PROFILE_SCOPE("MarkerUpdate");
+        markersState = m_markerManager->update(_view, _dt);
+    }
 
     bool tilesChanged = m_tileManager->updateTileSets(_view);
 
@@ -684,8 +700,64 @@ Scene::UpdateState Scene::update(RenderState& _rs, View& _view, float _dt) {
     auto& tiles = m_tileManager->getVisibleTiles();
     auto& markers = m_markerManager->markers();
 
+    static unsigned lodDiagFrame = 0;
+    if (m_elevationManager && Profiler::isCapturing() && (lodDiagFrame++ % 8) == 0) {
+        // (sampled 1-in-8 frames: it cost 6 ms/frame in trace 071056)
+        // Phase 0/1 of docs/dem-saliency-lod-plan.md: how do the CURRENT area-rule LOD decisions
+        // compare to a screen-space-error criterion? For each visible elevation leaf, predicted
+        // residual height error one level finer (1.1 x tile Laplacian RMS, see
+        // ElevationManager::TerrainDetail) projected to pixels at the tile's distance. Diagnostic
+        // only - nothing here feeds back into LOD selection.
+        PROFILE_SCOPE("LodDiagnostic");
+        const int32_t elevId = m_elevationManager->elevationSourceId();
+        int leaves = 0, noDesc = 0, wasted = 0;
+        int bucket[6] = {0, 0, 0, 0, 0, 0};  // <0.25, <0.5, <1, <2, <4, >=4 px
+        int nearBucket[6] = {0, 0, 0, 0, 0, 0};  // same, at the tile's NEAREST point (worst case in-tile)
+        int nearGe4ByZ[3] = {0, 0, 0};  // tiles with >=4px near-edge error: z<=10, z11-12, z>=13
+        for (const auto& tile : tiles) {
+            if (tile->sourceID() != elevId) { continue; }
+            TileID id = tile->getID();
+            auto d = m_elevationManager->getTerrainDetail(id);
+            if (!d.valid) { ++noDesc; continue; }
+            ++leaves;
+            float P = _view.pixelsPerMeterAtDistance(_view.getTileDistance(id));
+            float ePx = 1.1f * d.lapRms * P;
+            int b = ePx < 0.25f ? 0 : ePx < 0.5f ? 1 : ePx < 1.f ? 2 : ePx < 2.f ? 3 : ePx < 4.f ? 4 : 5;
+            ++bucket[b];
+            // near-box height = the tile's real max elevation
+            glm::vec2 mm = m_elevationManager->getMinMaxElev(id, 0);
+            float Pn = _view.pixelsPerMeterAtDistance(_view.getTileNearDistance(id, mm.y));
+            float eNear = 1.1f * d.lapRms * Pn;
+            int bn = eNear < 0.25f ? 0 : eNear < 0.5f ? 1 : eNear < 1.f ? 2 : eNear < 2.f ? 3 : eNear < 4.f ? 4 : 5;
+            ++nearBucket[bn];
+            if (bn == 5) { ++nearGe4ByZ[id.z <= 10 ? 0 : id.z <= 12 ? 1 : 2]; }
+            if (id.z > 0) {
+                auto pd = m_elevationManager->getTerrainDetail(id.getParent());
+                if (pd.valid && 1.1f * pd.lapRms * P < 0.5f) { ++wasted; }
+            }
+        }
+        Profiler::counter("lodElevLeaves", leaves);
+        Profiler::counter("lodElevNoDescriptor", noDesc);
+        Profiler::counter("lodElevWastedRefine", wasted);  // parent already <0.5px: this level added nothing visible
+        Profiler::counter("lodElevErrLt0.25px", bucket[0]);
+        Profiler::counter("lodElevErrLt0.5px", bucket[1]);
+        Profiler::counter("lodElevErrLt1px", bucket[2]);
+        Profiler::counter("lodElevErrLt2px", bucket[3]);
+        Profiler::counter("lodElevErrLt4px", bucket[4]);
+        Profiler::counter("lodElevErrGe4px", bucket[5]);  // too coarse for this view
+        Profiler::counter("lodElevNearLt0.5px", nearBucket[0] + nearBucket[1]);
+        Profiler::counter("lodElevNearLt1px", nearBucket[2]);
+        Profiler::counter("lodElevNearLt2px", nearBucket[3]);
+        Profiler::counter("lodElevNearLt4px", nearBucket[4]);
+        Profiler::counter("lodElevNearGe4px", nearBucket[5]);
+        Profiler::counter("lodElevNearGe4px_zLe10", nearGe4ByZ[0]);
+        Profiler::counter("lodElevNearGe4px_z11_12", nearGe4ByZ[1]);
+        Profiler::counter("lodElevNearGe4px_zGe13", nearGe4ByZ[2]);
+    }
+
     bool changed = viewChanged || tilesChanged || markersState.dirty;
     if (changed) {
+        PROFILE_SCOPE("TilesUpdate");
         for (const auto& tile : tiles) {
             tile->update(_view, _dt);
         }
@@ -740,8 +812,11 @@ bool Scene::render(RenderState& _rs, View& _view, FrameBuffer* _backgroundBuffer
         if (_backgroundBuffer && !blittedBackground &&
             (style->type() == StyleType::text || style->hasLinkedTextStyle())) {
             PROFILE_GPU("BackgroundHaloBlit");
-            _backgroundBuffer->blitColorFrom(_rs, _rs.defaultFrameBuffer(),
-                                             _view.getWidth(), _view.getHeight());
+            // the scene may be rendering into a scaled offscreen target (dynamic resolution)
+            float rscale = _rs.renderScale();
+            int srcW = rscale < 0.999f ? std::max(1, int(std::lround(_view.getWidth() * rscale))) : int(_view.getWidth());
+            int srcH = rscale < 0.999f ? std::max(1, int(std::lround(_view.getHeight() * rscale))) : int(_view.getHeight());
+            _backgroundBuffer->blitColorFrom(_rs, _rs.defaultFrameBuffer(), srcW, srcH);
             _rs.backgroundTexture = _backgroundBuffer->getTextureHandle();
             blittedBackground = true;
         }

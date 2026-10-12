@@ -184,3 +184,62 @@ TEST_CASE("Texture shading sampler - integrates with RasterSource::buildElevatio
     // still exactly neutral.
     REQUIRE(shade == Approx(0.5f).margin(1e-5f));
 }
+
+TEST_CASE("Texture shading sampler - cropped pyramid matches a full-mosaic reference", "[TextureShading]") {
+    // buildPyramid() crops to the center cell + an aligned margin (perf). Samples must be
+    // identical to a straightforward full-mosaic box-filter pyramid, including for a Wp that
+    // is not a multiple of the crop alignment.
+    const int Wp = 100, W = 3 * Wp;
+    auto field = [](int x, int y) {
+        return 1500.0f + 80.0f * std::sin(x * 0.11f) * std::cos(y * 0.07f) +
+               25.0f * std::sin(x * 0.53f + y * 0.31f) + 0.01f * float((x * 7919 + y * 104729) % 97);
+    };
+    auto mosaic = makeMosaic(W, field);
+
+    // reference: full pyramid, same formula (kAlpha 0.6, kContrast 1, 4 levels)
+    std::vector<std::vector<float>> lv(1, std::vector<float>(size_t(W) * W));
+    for (int y = 0; y < W; y++) for (int x = 0; x < W; x++) lv[0][size_t(y) * W + x] = field(x, y);
+    std::vector<int> sz(1, W);
+    for (int k = 0; k < 4; k++) {
+        int s = sz.back(), n = std::max(1, s / 2);
+        if (n < 2) break;
+        std::vector<float> d(size_t(n) * n);
+        for (int y = 0; y < n; y++) for (int x = 0; x < n; x++) {
+            auto at = [&](int xx, int yy) { return lv.back()[size_t(std::min(s - 1, yy)) * s + size_t(std::min(s - 1, xx))]; };
+            d[size_t(y) * n + x] = 0.25f * (at(2 * x, 2 * y) + at(2 * x + 1, 2 * y) + at(2 * x, 2 * y + 1) + at(2 * x + 1, 2 * y + 1));
+        }
+        lv.push_back(d); sz.push_back(n);
+    }
+    auto bil = [&](size_t k, double x, double y) {
+        int s = sz[k]; double px = x - 0.5, py = y - 0.5;
+        int ix0 = std::max(0, int(std::floor(px))), iy0 = std::max(0, int(std::floor(py)));
+        int ix1 = std::min(int(std::ceil(px)), s - 1), iy1 = std::min(int(std::ceil(py)), s - 1);
+        double fx = px - ix0, fy = py - iy0;
+        auto g = [&](int xx, int yy) { return double(lv[k][size_t(yy) * s + size_t(xx)]); };
+        double a = g(ix0, iy0) + fx * (g(ix1, iy0) - g(ix0, iy0));
+        double b = g(ix0, iy1) + fx * (g(ix1, iy1) - g(ix0, iy1));
+        return a + fy * (b - a);
+    };
+
+    TileID tileId(5, 7, 4);
+    double scale = MapProjection::metersPerTileAtZoom(tileId.z);
+    double unproj = std::exp(MapProjection::tileCenter(tileId).y / MapProjection::EARTH_RADIUS_METERS);
+    double coslat = 2.0 / (unproj + 1.0 / unproj);
+    double texelMeters = scale * coslat / double(Wp);
+
+    for (double u : {0.01, 0.07, 0.5, 0.93, 0.99}) {
+        for (double v : {0.01, 0.31, 0.5, 0.77, 0.99}) {
+            double muvU = (u + 1.0) / 3.0, muvV = (v + 1.0) / 3.0;
+            double hPrev = bil(0, muvU * sz[0], muvV * sz[0]), z = 0;
+            for (size_t k = 1; k < lv.size(); k++) {
+                double hNext = bil(k, muvU * sz[k], muvV * sz[k]);
+                z += (hPrev - hNext) * std::pow(2.0, -double(k - 1) * 0.6);
+                hPrev = hNext;
+            }
+            double az = z / texelMeters;
+            float expected = float(az / (2.0 * std::sqrt(1.0 + az * az)) + 0.5);
+            float got = sampleTextureShadingAtMosaic(*mosaic, tileId, worldPosAt(tileId, u, v));
+            REQUIRE(got == Approx(expected).margin(1e-6f));
+        }
+    }
+}

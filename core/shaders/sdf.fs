@@ -13,6 +13,8 @@ uniform sampler2D u_tex;
 uniform vec3 u_map_position;
 uniform vec4 u_tile_origin;
 uniform vec2 u_resolution;
+// dynamic resolution: scene is rasterized at u_render_scale * u_resolution (see Map::render)
+uniform float u_render_scale;
 uniform float u_time;
 uniform float u_meters_per_pixel;
 uniform float u_device_pixel_ratio;
@@ -87,7 +89,7 @@ void main(void) {
         // / u_halo_luminance_light are gui_variables-tunable (stylus-osm.yaml, same pattern as
         // hillshade's u_texture_shading_* - see docs/label-placement-plan.md Phase 4) rather
         // than hardcoded, since the exact falloff is a human visual-tuning call.
-        vec3 bg = texture2D(u_background_tex, gl_FragCoord.xy / u_resolution).rgb;
+        vec3 bg = texture2D(u_background_tex, gl_FragCoord.xy / (u_resolution * u_render_scale)).rgb;
         float bg_luminance = dot(bg, vec3(0.299, 0.587, 0.114));
         float halo_visibility = 1.0 - smoothstep(u_halo_luminance_dark, u_halo_luminance_light, bg_luminance);
         alpha *= halo_visibility;

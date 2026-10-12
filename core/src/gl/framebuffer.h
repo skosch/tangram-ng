@@ -17,7 +17,8 @@ class FrameBuffer {
 
 public:
 
-    FrameBuffer(int _width, int _height, bool _colorRenderBuffer = true, GLenum _pixelFormat = GL_RGBA8);
+    FrameBuffer(int _width, int _height, bool _colorRenderBuffer = true, GLenum _pixelFormat = GL_RGBA8,
+                GLenum _depthFormat = GL_DEPTH_COMPONENT16, bool _linearFilter = false);
 
     ~FrameBuffer();
 
@@ -51,6 +52,11 @@ public:
 
     void drawDebug(RenderState& _rs, glm::vec2 _dim);
 
+    // Draw this (texture-backed) buffer's color as a filled quad of _dim pixels at the origin of the
+    // current render target / viewport. Unlike glBlitFramebuffer this works when the destination is
+    // the multisampled window framebuffer, and scales with the texture's own filter.
+    void drawFullscreen(RenderState& _rs, glm::vec2 _dim);
+
     GLuint getHandle() const { return m_glFrameBufferHandle; }
     GLuint getTextureHandle() const;
 
@@ -69,6 +75,10 @@ private:
     GLuint m_glColorRenderBufferHandle;
 
     GLenum m_pixelFormat;
+
+    GLenum m_depthFormat;
+
+    bool m_linearFilter;
 
     bool m_valid;
 

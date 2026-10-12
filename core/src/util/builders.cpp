@@ -6,6 +6,10 @@
 #include "glm/gtx/norm.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 
@@ -72,6 +76,32 @@ void clipConvexAxis(const Tangram::Line& _in, Tangram::Line& _out, int _axis, fl
             glm::vec2 p = a + t * (b - a);
             p[_axis] = _bound;
             _out.push_back(p);
+        }
+    }
+    if (_out.size() < 3) { _out.clear(); }
+}
+
+// Same, against the cell's anti-diagonal (x - x0) + (y - y0) = _cell - the diagonal the terrain
+//  mesh splits every lattice cell on (rasterStyle.cpp). Splitting partial pieces on it makes every
+//  emitted triangle lie inside ONE terrain triangle, so a draped vertex-evaluated surface matches
+//  the terrain exactly instead of chording across a steep bump within a cell (the residual
+//  "gap at the bump" on near-vertical faces: pieces cut by polygon edges / earcut edges were
+//  fan-triangulated with arbitrary diagonals, unlike the full cells).
+void clipConvexDiag(const Tangram::Line& _in, Tangram::Line& _out, float _x0, float _y0, float _cell,
+                    bool _keepBelow) {
+    _out.clear();
+    size_t n = _in.size();
+    auto f = [&](const glm::vec2& p) { return (p.x - _x0) + (p.y - _y0) - _cell; };
+    for (size_t i = 0; i < n; i++) {
+        glm::vec2 a = _in[i];
+        glm::vec2 b = _in[(i + 1) % n];
+        float fa = f(a), fb = f(b);
+        bool ina = _keepBelow ? fa <= 0.f : fa >= 0.f;
+        bool inb = _keepBelow ? fb <= 0.f : fb >= 0.f;
+        if (ina) { _out.push_back(a); }
+        if (ina != inb) {
+            float t = fa / (fa - fb);
+            _out.push_back(a + t * (b - a));
         }
     }
     if (_out.size() < 3) { _out.clear(); }
@@ -154,6 +184,24 @@ static void buildPolygonGrid(const Polygon& _polygon, float _height, glm::vec2 _
         _ctx.indices.push_back(emitVertex(c));
     };
 
+    // Emit a convex piece lying inside grid cell (gx, gy), split on the cell's terrain-mesh
+    //  diagonal so no emitted triangle straddles two terrain triangles (see clipConvexDiag).
+    Line diagLo, diagHi;
+    auto emitCellPiece = [&](const Line& pc, int gx, int gy) {
+        float x0f = gx / res, y0f = gy / res, cell = 1.f / res;
+        clipConvexDiag(pc, diagLo, x0f, y0f, cell, true);
+        clipConvexDiag(pc, diagHi, x0f, y0f, cell, false);
+        if (diagLo.empty() && diagHi.empty()) {
+            for (size_t k = 1; k + 1 < pc.size(); k++) { emitTriangle(pc[0], pc[k], pc[k + 1]); }
+            return;
+        }
+        for (const Line* part : { &diagLo, &diagHi }) {
+            for (size_t k = 1; k + 1 < part->size(); k++) {
+                emitTriangle((*part)[0], (*part)[k], (*part)[k + 1]);
+            }
+        }
+    };
+
     // Fast path for interior lattice-corner vertices (tile-pipeline-perf-plan.md R1.1): the
     //  full-cell case below emits the SAME 4 grid corners for every cell, each shared by up to
     //  4 neighboring cells, so routing every corner reference through vertMap's hash costs 3
@@ -206,7 +254,8 @@ static void buildPolygonGrid(const Polygon& _polygon, float _height, glm::vec2 _
         int ty0 = int(std::floor(lo.y * res)), ty1 = int(std::ceil(hi.y * res));
         if (tx1 - tx0 <= 1 && ty1 - ty0 <= 1) {  // triangle already fits in a single cell
             flushChunkIfNeeded();
-            emitTriangle(A, B, C);
+            tri = { A, B, C };
+            emitCellPiece(tri, tx0, ty0);
             continue;
         }
         // winding of this triangle, for the fixed-diagonal full-cell case below
@@ -258,10 +307,9 @@ static void buildPolygonGrid(const Polygon& _polygon, float _height, glm::vec2 _
                     }
                     continue;
                 }
-                // convex piece: fan triangulation, winding preserved by the clipping
-                for (size_t k = 1; k + 1 < piece.size(); k++) {
-                    emitTriangle(piece[0], piece[k], piece[k + 1]);
-                }
+                // convex partial piece: split on the terrain diagonal, fan-triangulate each part
+                //  (winding preserved by the clipping)
+                emitCellPiece(piece, gx, gy);
             }
         }
     }
@@ -704,6 +752,44 @@ void Builders::buildQuadAtPoint(const glm::vec2& _screenPosition, const glm::vec
 
     _ctx.numVerts += 4;
 
+}
+
+
+int terrainMeshZoomBias() {
+    static const int bias = [] {
+        const char* e = std::getenv("ASCEND_TERRAIN_ZBIAS");
+        return e ? std::atoi(e) : 100;
+    }();
+    return bias;
+}
+
+int terrainMeshMaxBoost() {
+    static const int b = [] {
+        const char* e = std::getenv("ASCEND_TERRAIN_BOOST");
+        int v = e ? std::atoi(e) : 1;
+        return v < 0 ? 0 : (v > 1 ? 1 : v);
+    }();
+    return b;
+}
+
+static std::atomic<int> s_terrainMeshBoost{0};
+int terrainMeshBoost() { return s_terrainMeshBoost.load(std::memory_order_relaxed); }
+void setTerrainMeshBoost(int boost) { s_terrainMeshBoost.store(boost, std::memory_order_relaxed); }
+
+static std::atomic<int> s_terrainMeshRefZoom{100};
+
+int terrainMeshRefZoom() { return s_terrainMeshRefZoom.load(std::memory_order_relaxed); }
+
+void updateTerrainMeshRefZoom(double viewZoom) {
+    // round(viewZoom) + bias, with HYSTERESIS: the (elevation-aware) view zoom jitters as DEM
+    //  upgrades land, and a plain round() flips the reference zoom - and with it every tile's
+    //  lattice, composite signature and drape - back and forth whenever the zoom sits near x.5.
+    //  The shader reads this value through u_terrain_ref_zoom (never recomputes it from the zoom).
+    constexpr double kHysteresis = 0.2;
+    static int s_base = INT32_MIN;
+    const int cand = int(std::floor(viewZoom + 0.5));
+    if (s_base == INT32_MIN || std::fabs(viewZoom - double(s_base)) > 0.5 + kHysteresis) { s_base = cand; }
+    s_terrainMeshRefZoom.store(s_base + terrainMeshZoomBias(), std::memory_order_relaxed);
 }
 
 }

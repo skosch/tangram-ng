@@ -83,6 +83,11 @@ public:
     // Sets texture pixel data
     bool setPixelData(int _width, int _height, int _bytesPerPixel, const GLubyte* _data, size_t _length);
 
+    // Same as setPixelData() but takes ownership of `_mallocBuffer` (allocated with std::malloc,
+    // `_length` bytes) instead of copying it: saves a full pass over multi-MB elevation mosaics.
+    // The buffer is freed on failure. No GL calls, so safe to build on any thread.
+    bool adoptPixelData(int _width, int _height, int _bytesPerPixel, GLubyte* _mallocBuffer, size_t _length);
+
     // Binds texture to texture unit _unit and uploads new texture data when it has changed.
     // Returns false when no data has been set or when the requested size is greater than
     // supported by the driver.

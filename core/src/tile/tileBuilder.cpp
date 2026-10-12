@@ -1,4 +1,5 @@
 #include "tile/tileBuilder.h"
+#include <chrono>
 
 #include "debug/profiler.h"
 #include "data/properties.h"
@@ -47,7 +48,17 @@ StyleBuilder* TileBuilder::getStyleBuilder(const std::string& _name) {
 void TileBuilder::applyStyling(const Feature& _feature, const SceneLayer& _layer) {
 
     // If no rules matched the feature, return immediately
-    if (!m_ruleSet.match(_feature, _layer, *m_styleContext)) { return; }
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point t0;
+    if (m_profOn) { t0 = Clock::now(); ++m_profFeatures; }
+    bool matched = m_ruleSet.match(_feature, _layer, *m_styleContext);
+    if (m_profOn) { m_profMatchMs += std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); }
+    if (!matched) { return; }
+    if (m_profOn) { ++m_profMatched; t0 = Clock::now(); }
+    struct AddTimer {
+        bool on; double& acc; Clock::time_point t;
+        ~AddTimer() { if (on) { acc += std::chrono::duration<double, std::milli>(Clock::now() - t).count(); } }
+    } addTimer{m_profOn, m_profAddMs, t0};
 
     uint32_t selectionColor = 0;
     bool added = false;
@@ -135,7 +146,13 @@ void TileBuilder::build(Tile& tile, const TileData& _tileData, const TileSource&
     }
 
     {
-        PROFILE_SCOPE(Profiler::intern("applyStyling:" + _source.name()));
+        // Per-zoom zone names (z0..z20 -> a bounded interned set) so traces can attribute build
+        // cost to the tile's zoom level, i.e. what the LOD selector actually chose.
+        m_profOn = Profiler::isCapturing();
+        m_profFeatures = m_profMatched = 0;
+        m_profMatchMs = m_profAddMs = 0;
+        PROFILE_SCOPE(Profiler::intern("applyStyling:" + _source.name() + ":z" +
+                                       std::to_string(tile.getID().z)));
         for (const auto& datalayer : m_scene.layers()) {
 
             if (datalayer.source() != _source.name() || !datalayer.enabled()) { continue; }
@@ -157,7 +174,15 @@ void TileBuilder::build(Tile& tile, const TileData& _tileData, const TileSource&
         }
     }
 
-    PROFILE_SCOPE(Profiler::intern("buildMesh:" + _source.name()));
+    if (m_profOn) {
+        // per-zoom attribution of where applyStyling's time goes (see applyStyling())
+        std::string z = ":z" + std::to_string(tile.getID().z);
+        Profiler::counter(Profiler::intern("tileFeatures" + z), double(m_profFeatures));
+        Profiler::counter(Profiler::intern("tileFeaturesMatched" + z), double(m_profMatched));
+        Profiler::counter(Profiler::intern("tileRuleMatchMs" + z), m_profMatchMs);
+        Profiler::counter(Profiler::intern("tileAddFeatureMs" + z), m_profAddMs);
+    }
+    PROFILE_SCOPE(Profiler::intern("buildMesh:" + _source.name() + ":z" + std::to_string(tile.getID().z)));
 
     for (auto& builder : m_styleBuilder) {
 

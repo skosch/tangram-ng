@@ -32,6 +32,43 @@ JoinTypes JoinTypeFromString(const std::string& str);
 //  Shared by both files so their grid densities can never drift apart.
 constexpr int kTerrainMeshGridRes = 64;
 
+// Adaptive terrain mesh density (2026-10-11 perf work: a fixed 64x64 cells per tile put a z16
+//  leaf that covers ~16 px on screen at 8192 triangles, and the heavy hillshade fragment shader
+//  paid for 2x2-quad overshading of sub-pixel triangles - hillshade GPU 80 -> 34 ms in the
+//  ASCEND_TERRAIN_GRID probe). A terrain tile of zoom z is drawn with
+//      cells(z) = max(kTerrainMeshMinCells, 64 >> max(0, z - refZoom))
+//  cells per edge, refZoom = round(view zoom) + bias. So every tile at or finer than refZoom has
+//  the SAME world-space cell size (tile width(refZoom) / 64; ~4 px * 2^-bias on screen), and
+//  coarser tiles keep 64. World cell size is therefore non-increasing with zoom and each coarser
+//  lattice is a power-of-two multiple of every finer one, which is the nesting property the drape
+//  lattice (getTerrainMeshElevation, elevation.yaml) and the triangle-PL composite upsampling
+//  (rasterSource.cpp) rely on. The shader recomputes the identical formula from u_map_position.z
+//  and the TERRAIN_MESH_ZBIAS define, so CPU and GPU must keep this definition in sync.
+constexpr int kTerrainMeshMinCells = 4;
+// `boost` (0 or 1, terrainMeshBoost()) doubles every tile's cell count while the camera is at
+//  rest (settle-time refinement): world cell size stays a power-of-two ladder, so the finer
+//  lattice nests exactly inside the coarser one (composites built at boost 0 stay valid: their
+//  texels hold the coarse PL surface, which the finer lattice reproduces node for node).
+inline int terrainMeshCellsAt(int tileZ, int refZoom, int boost = 0) {
+    int d = tileZ - refZoom;
+    if (d < 0) { d = 0; }
+    if (d > 6) { d = 6; }
+    int c = (kTerrainMeshGridRes << boost) >> d;
+    return c < kTerrainMeshMinCells ? kTerrainMeshMinCells : c;
+}
+// bias from ASCEND_TERRAIN_ZBIAS (read once; default 100 = adaptive density off, i.e. always 64;
+//  the app sets 1). Must equal global.terrain_mesh_zbias pushed to the scene.
+int terrainMeshZoomBias();
+// Current reference zoom (atomic; written once per frame by TileManager::updateTileSets).
+int terrainMeshRefZoom();
+void updateTerrainMeshRefZoom(double viewZoom);
+// Settle-time density boost (ASCEND_TERRAIN_BOOST = max boost, default 1, 0 = off). The current
+//  boost is written by Map::update (0 while moving, max once the camera has been still) and read
+//  by the terrain mesh selection and, via u_terrain_mesh_boost, by the drape lattice shader.
+int terrainMeshMaxBoost();
+int terrainMeshBoost();
+void setTerrainMeshBoost(int boost);
+
 /* Callback function for PolygonBuilder:
  *
  * @coord  tesselated output coordinate

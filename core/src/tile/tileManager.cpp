@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "tile/tileManager.h"
 
 #include "debug/profiler.h"
@@ -7,12 +8,14 @@
 #include "platform.h"
 #include "tile/tile.h"
 #include "tile/tileCache.h"
+#include "util/builders.h"
 #include "util/mapProjection.h"
 #include "view/view.h"
 
 #include "glm/gtx/norm.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <bitset>
 #include <chrono>
 
@@ -240,7 +243,41 @@ void TileManager::clearTileSet(int32_t _sourceId) {
     m_tileSetChanged = true;
 }
 
+namespace {
+// Experimental saliency-driven DEM LOD (docs/dem-saliency-lod-plan.md, Phase 2). Off unless
+// ASCEND_DEM_LOD=1, so default behavior is unchanged. Read once.
+struct DemLodConfig {
+    bool enabled = false;
+    float tau = 0.25f;          // per-texel slope change (|laplacian|/texel size) that counts as unresolved detail (see View::demSaliencyWantsChildren)
+    float massFrac = 0.08f;     // fraction of a tile's texels that must be salient + visible + under-resolved to refine; the budget controller scales this
+    int maxNewPerFrame = 6;     // not-yet-resident salient promotions allowed per frame
+    float boost = 0.5f;         // levels of oversampling past pixel Nyquist allowed on salient terrain
+    int leafBudget = 160;       // soft cap on elevation leaves; tau scales to hold it
+    DemLodConfig() {
+        if (const char* e = getenv("ASCEND_DEM_LOD")) { enabled = atoi(e) != 0; }
+        if (const char* e = getenv("ASCEND_DEM_TAU")) { tau = float(atof(e)); }
+        if (const char* e = getenv("ASCEND_DEM_MASS")) { massFrac = float(atof(e)); }
+        if (const char* e = getenv("ASCEND_DEM_BOOST")) { boost = float(atof(e)); }
+        if (const char* e = getenv("ASCEND_DEM_LEAF_BUDGET")) { leafBudget = atoi(e); }
+        if (const char* e = getenv("ASCEND_DEM_MAX_NEW")) { maxNewPerFrame = atoi(e); }
+    }
+};
+const DemLodConfig& demLodConfig() { static DemLodConfig c; return c; }
+}  // namespace
+
 bool TileManager::updateTileSets(const View& _view) {
+    PROFILE_SCOPE("UpdateTileSets");
+
+    // adaptive terrain mesh density: reference zoom for this frame (draw, stitcher and shader all
+    //  derive their per-tile cell counts from it - see terrainMeshCellsAt, util/builders.h)
+    updateTerrainMeshRefZoom(_view.getZoom());
+    {
+        // previous frame's terrain mesh draws (all styles) and total grid cells drawn
+        extern std::atomic<long> g_terrainMeshDraws, g_terrainMeshCells;
+        Profiler::counter("terrainMeshDraws", double(g_terrainMeshDraws.exchange(0)));
+        Profiler::counter("terrainMeshCells", double(g_terrainMeshCells.exchange(0)));
+        Profiler::counter("terrainRefZoom", double(terrainMeshRefZoom()));
+    }
 
     m_tiles.clear();
     m_tilesInProgress = 0;
@@ -268,6 +305,7 @@ bool TileManager::updateTileSets(const View& _view) {
 
     if (!getDebugFlag(DebugFlags::freeze_tiles)) {
 
+        const DemLodConfig& demCfg = demLodConfig();
         float maxEdge = 2 * _view.pixelScale() * float(MapProjection::tileSize());
         float maxArea = maxEdge*maxEdge;
 
@@ -308,7 +346,33 @@ bool TileManager::updateTileSets(const View& _view) {
                 //for (auto& rs : tileSet.source->rasterSources()) { maxZoom = std::max(maxZoom, rs->maxZoom()); }
                 int maxZoom = std::min(tileSet.source->maxZoom(), viewZoomCap - zoomBias);
                 bool stoppedByMaxZoom = tileId.z >= maxZoom;
-                if (stoppedByMaxZoom || area < effMaxArea*std::exp2(2*float(zoomBias))) {
+                bool stop = stoppedByMaxZoom || area < effMaxArea*std::exp2(2*float(zoomBias));
+                // Saliency override (elevation raster source only): salient terrain keeps
+                //  subdividing past what the area rule / distance cap would allow, up to pixel
+                //  Nyquist at the tile's nearest point. Never removes refinement.
+                if (stop && demCfg.enabled && tileSet.source->isRaster() &&
+                    tileSet.source->name() == "elevation" && tileId.z < tileSet.source->maxZoom()) {
+                    TileID demKey(tileId.x, tileId.y, tileId.z);
+                    bool demWas = m_demRefinedPrev.count(demKey) != 0;
+                    if (_view.demSaliencyWantsChildren(tileId, demCfg.tau, demCfg.boost,
+                                                       tileSet.source->maxZoom(),
+                                                       demCfg.massFrac * m_demTauScale * (demWas ? 0.5f : 1.f))) {
+                        // Churn limit: every NEW salient level means a fetch + decode + 3x3
+                        //  mosaic stitch on the main thread. Allow only a few not-yet-resident
+                        //  promotions per frame (nearest-first is approximated by walk order);
+                        //  already-resident refinements are free to keep.
+                        bool resident = _view.demChildrenResident(tileId);
+                        if (resident || m_demNewThisFrame < demCfg.maxNewPerFrame) {
+                            if (!resident) { ++m_demNewThisFrame; }
+                            stop = false;
+                            ++m_demSalientRefines;
+                            m_demRefinedCur.insert(demKey);
+                        } else {
+                            m_demDeferred = true;  // cap hit: ask for another frame to continue
+                        }
+                    }
+                }
+                if (stop) {
                     // Perf/UX diagnosis (2026-07-11): lodAreaBias (the "resolution retention"
                     // sliders) only ever loosens the AREA half of this OR - it can never push a
                     // tile past `maxZoom`. Distant tiles stopping here because of maxZoom rather
@@ -342,6 +406,9 @@ bool TileManager::updateTileSets(const View& _view) {
                         visId.s = std::max(std::min(s, viewZoomCap), visId.z + zoomBias);
                     }
                     tileSet.visibleTiles.insert(visId);
+                    if (demCfg.enabled && tileSet.source->isRaster() && tileSet.source->name() == "elevation") {
+                        ++m_demLeaves;
+                    }
                     nextActive.reset(ii);
                 }
             }
@@ -356,9 +423,35 @@ bool TileManager::updateTileSets(const View& _view) {
         for (auto& tileSet : m_tileSets) {
             tileSet.visibleTiles.clear();
         }
+        m_demLeaves = 0;
+        m_demSalientRefines = 0;
+        m_demNewThisFrame = 0;
+        m_demDeferred = false;
+        m_demRefinedCur.clear();
 
         TileSetMask allActive = (1 << m_tileSets.size()) - 1;
         getVisibleTiles(getVisibleTiles, TileID(0,0,0), allActive);
+
+        if (demCfg.enabled) {
+            // Budget controller: hold the elevation leaf count near the budget by scaling tau,
+            //  slowly (low-pass) so the LOD does not strobe. Looser when under budget.
+            m_demRefinedPrev.swap(m_demRefinedCur);
+            float ratio = float(m_demLeaves) / float(std::max(1, demCfg.leafBudget));
+            if (ratio > 1.f) { m_demTauScale = std::min(64.f, m_demTauScale * (1.f + 0.05f * std::min(1.f, ratio - 1.f) + 0.005f)); }
+            else if (ratio < 0.8f) { m_demTauScale = std::max(0.25f, m_demTauScale * 0.99f); }
+            if (Profiler::isCapturing()) {
+                Profiler::counter("demLeaves", m_demLeaves);
+                Profiler::counter("demSalientRefines", m_demSalientRefines);
+                Profiler::counter("demTauScale", m_demTauScale);
+                const auto& st = _view.m_demStats;
+                Profiler::counter("demSelEvaluated", st.evaluated);
+                Profiler::counter("demSelNoData", st.noData);
+                Profiler::counter("demSelOccluded", st.occluded);
+                Profiler::counter("demSelBelowMass", st.belowMass);
+                Profiler::counter("demSelAccepted", st.accepted);
+            }
+            _view.m_demStats = View::DemSelectorStats();
+        }
     }
 
     // R4 (tile-pipeline-perf-plan.md): grant every raster source a fresh main-thread stitch
@@ -371,11 +464,36 @@ bool TileManager::updateTileSets(const View& _view) {
     // flushDirtyMosaics()'s GPU re-upload (see RasterSource::m_uploadBudget) - reset alongside
     // the stitch budget, before any tileSet (and so any flushDirtyMosaics() call) runs this cycle.
     const int kUploadBudgetPerUpdate = 12;
+    // Bytes of freshly stitched mosaic texture made visible (and so uploaded at next bind) per
+    // update by the background stitcher; one oversize mosaic per update is always allowed.
+    constexpr size_t kAsyncPublishBytesPerUpdate = 12u * 1024u * 1024u;
+    m_upgradeSpentMs = 0.0;
+    // The predictive budget check below only ever updates the EMA on calls that really stitched
+    //  (> 0.5 ms), so once one outlier pushed it above the budget it could never come back down:
+    //  every call after the first of each pass was then skipped forever (2026-10-12 trace:
+    //  upgBudgetSkip == upgCalls - 1 every frame), starving ALL attachment upgrades - draped
+    //  vector tiles kept their build-time elevation raster, which is the Matterhorn "tan holes"
+    //  drape mismatch. Decay it every pass (and cap it) so it always recovers.
+    m_upgradeCallEmaMs = std::min(m_upgradeCallEmaMs * 0.9, 12.0);
+    m_upgradeCallsThisPass = 0;
+    m_upgradesDeferred = false;
+    m_stitchesPending = false;
     for (auto& tileSet : m_tileSets) {
         if (tileSet.source->isRaster()) {
             auto* rasterSource = static_cast<RasterSource*>(tileSet.source.get());
             rasterSource->resetStitchBudget(kStitchBudgetPerUpdate);
             rasterSource->resetUploadBudget(kUploadBudgetPerUpdate);
+            if (rasterSource->asyncStitching()) {
+                rasterSource->pumpStitchResults(kAsyncPublishBytesPerUpdate);
+            }
+        }
+    }
+    for (auto& tileSet : m_auxTileSets) {
+        if (tileSet.source->isRaster()) {
+            auto* rasterSource = static_cast<RasterSource*>(tileSet.source.get());
+            if (rasterSource->asyncStitching()) {
+                rasterSource->pumpStitchResults(kAsyncPublishBytesPerUpdate);
+            }
         }
     }
 
@@ -389,7 +507,9 @@ bool TileManager::updateTileSets(const View& _view) {
         // regardless of this source's own active/visible state above (a mosaic can still be
         // live and rendered via other tiles' attachments even if this pass skipped it).
         if (tileSet.source->isRaster()) {
-            static_cast<RasterSource*>(tileSet.source.get())->flushDirtyMosaics();
+            auto* rs = static_cast<RasterSource*>(tileSet.source.get());
+            rs->flushDirtyMosaics();
+            if (rs->asyncStitching() && rs->hasPendingStitches()) { m_stitchesPending = true; }
         }
     }
 
@@ -944,6 +1064,38 @@ void TileManager::loadTiles() {
 // contract (texture-shading mosaic vs. opportunistic overzoom composite).
 void TileManager::upgradeAttachedRasters(TileSet& _tileSet, Tile& _tile, const TileID& _liveId) {
     PROFILE_SCOPE("UpgradeAttachedRasters");
+    // DRAPE DIAGNOSTIC (2026-10-11): which exit each call takes (per-frame sums)
+    Profiler::counterAdd("upgCalls", 1);
+
+    // Wall-clock budget for the whole upgrade pass, see m_upgradeSpentMs (tileManager.h). The
+    // first call each update always runs (spent starts at 0), so progress is guaranteed.
+    constexpr double kUpgradeBudgetMs = 6.0;
+    // Predictive check (trace 071056: at z15/z16 a single stitch costs 5-60 ms, so an
+    //  entry-only check overshot the 6 ms budget ~4x): also defer when the typical cost of the
+    //  next call would carry us past the budget. The first call of a pass always runs.
+    // Always allow a few calls per pass so progress cannot be starved by the prediction.
+    constexpr int kMinCallsPerPass = 8;
+    // (the minimum only overrides the PREDICTION; the hard budget always applies, or one pass
+    //  could run eight 45 ms composite stitches back to back)
+    const bool overBudget = m_upgradeSpentMs >= kUpgradeBudgetMs ||
+        (m_upgradeSpentMs > 0.0 && m_upgradeCallsThisPass >= kMinCallsPerPass &&
+         m_upgradeSpentMs + m_upgradeCallEmaMs > kUpgradeBudgetMs);
+    if (overBudget) {
+        m_upgradesDeferred = true;
+        Profiler::counterAdd("upgBudgetSkip", 1);
+        return;
+    }
+    ++m_upgradeCallsThisPass;
+    struct SpendTimer {
+        double& acc;
+        double& ema;
+        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        ~SpendTimer() {
+            double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            acc += ms;
+            if (ms > 0.5) { ema = 0.85 * ema + 0.15 * ms; }  // only calls that did real stitching
+        }
+    } spendTimer{m_upgradeSpentMs, m_upgradeCallEmaMs};
     if (_tileSet.source->isRaster()) {
         // Case 1 (pre-existing): _tileSet.source IS the elevation RasterSource, and this tile
         // is its own raster tile (terrain-ground/hillshade) -- single self-referencing entry.
@@ -973,7 +1125,8 @@ void TileManager::upgradeAttachedRasters(TileSet& _tileSet, Tile& _tile, const T
     // is on its way in), so re-stitching THEIR composites is wasted work that piles onto
     // exactly the frames that are already busiest (pan/zoom churn). They get upgraded the
     // moment they are visible again.
-    if (_tile.isProxy()) { return; }
+    if (_tile.isProxy()) { Profiler::counterAdd("upgProxySkip", 1); return; }
+    Profiler::counterAdd("upgVectorTiles", 1);
 
     // TEMP DIAGNOSTIC (docs/terrain-drape-cellcaps-investigation.md's "gridRes coordination"
     //  open question - round 16 of the rock-texture-v2 effort, added after the round-15
@@ -1003,7 +1156,7 @@ void TileManager::upgradeAttachedRasters(TileSet& _tileSet, Tile& _tile, const T
 
     auto& sources = _tileSet.source->rasterSources();
     auto& rasters = _tile.rasters();
-    if (sources.empty() || rasters.size() < sources.size()) { return; }
+    if (sources.empty() || rasters.size() < sources.size()) { Profiler::counterAdd("upgNoSrcSkip", 1); return; }
     size_t offset = rasters.size() - sources.size();
 
     // Each vector tile's OWN styling zoom `s` is computed independently from ITS OWN on-screen
@@ -1180,6 +1333,28 @@ void TileManager::upgradeAttachedRasters(TileSet& _tileSet, Tile& _tile, const T
             }
         }
 
+        // DRAPE CHORDING DIAGNOSTIC (2026-10-11): polygon tessellation density is frozen at tile
+        //  build time (gridRes = min(256, 64 << (builtS - z))), while the terrain lattice the
+        //  polygons must nest in is now the ADAPTIVE one (terrainMeshCellsAt) at the finest zoom
+        //  displayed under this tile's footprint. Count tiles whose lattice has more cells per
+        //  tile edge than their polygon grid (triangles then chord across lattice cells and the
+        //  ground mesh pokes through on convex ridges), and by how many doublings.
+        {
+            const int dispZ = std::min<int>(std::min<int>(int(finestDisplayedUnderFootprint),
+                                                         int(_tile.getID().z) + 2), 16);
+            const int dz = std::max(0, dispZ - int(_tile.getID().z));
+            const int lattice = terrainMeshCellsAt(dispZ, terrainMeshRefZoom(), terrainMeshBoost()) << dz;
+            const int builtOver = std::max(0, int(_tile.getID().s) - int(_tile.getID().z));
+            const int grid = std::min(256, kTerrainMeshGridRes << builtOver);
+            Profiler::counterAdd("drapeTiles", 1);
+            if (lattice > grid) {
+                Profiler::counterAdd("drapeChordTiles", 1);
+                int dbl = 0;
+                while ((grid << dbl) < lattice) { dbl++; }
+                Profiler::counterAdd("drapeChordDoublings", dbl);
+            }
+        }
+
         // Target everything below at the LIVE, NEIGHBOR-AWARE styling zoom (effectiveS above)
         // OR the finest elevation zoom actually displayed under this tile's footprint
         // (finestDisplayedUnderFootprint above), whichever is finer - not the s frozen into
@@ -1211,7 +1386,9 @@ void TileManager::upgradeAttachedRasters(TileSet& _tileSet, Tile& _tile, const T
         TileID texId(raster.tileID.x, raster.tileID.y, raster.tileID.z);
         auto plainTex = rs->getTexture(texId);
 
-        ElevationMosaicInfo* info = raster.texture->userData
+        // userData may also be a plain elevation tile's ElevTexInfo: check the type tag.
+        ElevationMosaicInfo* info = (raster.texture->userData &&
+                *static_cast<const uint32_t*>(raster.texture->userData.get()) == kElevationMosaicInfoMagic)
                 ? static_cast<ElevationMosaicInfo*>(raster.texture->userData.get()) : nullptr;
         bool holdsPlain = plainTex && raster.texture == plainTex;
         // Textures that are neither the plain texture nor carry mosaic/composite info (the
@@ -1243,31 +1420,6 @@ void TileManager::upgradeAttachedRasters(TileSet& _tileSet, Tile& _tile, const T
         // rendered/ready (used by the per-cell cap loop below) were already computed above,
         // ahead of livePrimary - see that block's comment for why (round 14 fix needed them
         // earlier than they used to be built).
-
-        // TEMP DIAGNOSTIC (docs/terrain-drape-cellcaps-investigation.md section 7.1, round 8's
-        //  leading hypothesis - added to confirm/refute it against a live 2026-08-01 "torn
-        //  forest and rock-texture triangles under tilt near the Matterhorn" report, per
-        //  that doc's own explicit "no fix without sign-off" recommendation - this is
-        //  diagnostics only, not a fix). Fires whenever the elevation tileset is DISPLAYING
-        //  tiles finer than this drape composite's own target zoom zt under this tile's
-        //  footprint - the one regime the cap machinery below cannot represent (its walk starts
-        //  at zt and only goes coarser; finer-displayed cells fall into the zTarget < 0 "leave
-        //  at zt" branch with no trace). Remove once the investigation concludes either way.
-        {
-            int finestDisplayed = -1;
-            for (const TileID& r : rendered) {
-                if (r.z <= zt) { continue; }
-                int ddl = r.z - int(livePrimary.z);
-                if (ddl < 0) { continue; }  // shouldn't happen; guard against UB from a negative shift
-                if ((r.x >> ddl) == livePrimary.x && (r.y >> ddl) == livePrimary.y) {
-                    finestDisplayed = std::max(finestDisplayed, int(r.z));
-                }
-            }
-            if (finestDisplayed > zt) {
-                LOGD("Drape ceiling below displayed terrain: tile %s zt=%d displayed=z%d (liveS=%d effectiveS=%d)",
-                     _liveId.toString().c_str(), zt, finestDisplayed, int(_liveId.s), int(effectiveS));
-            }
-        }
 
         if (!rendered.empty()) {
             cellCaps.assign(size_t(N) * size_t(N), uint8_t(zt));
@@ -1321,7 +1473,9 @@ void TileManager::upgradeAttachedRasters(TileSet& _tileSet, Tile& _tile, const T
         // built at another zoom), AND displayed-terrain zoom changes under the footprint, all
         // uniformly.
         if (rs->m_buildElevationMosaic) {
-            auto mosaic = rs->buildElevationMosaic(livePrimary, plainBase, caps);
+            // requestElevationMosaic == buildElevationMosaic unless async stitching is enabled,
+            // in which case only upgrades of an already-attached mosaic go to the worker.
+            auto mosaic = rs->requestElevationMosaic(livePrimary, plainBase, caps);
             if (mosaic && mosaic != raster.texture) {
                 raster.texture = mosaic;
             }

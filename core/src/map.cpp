@@ -2,6 +2,7 @@
 
 #include "debug/textDisplay.h"
 #include "debug/frameInfo.h"
+#include "util/builders.h"
 #include "debug/profiler.h"
 #include "gl.h"
 #include "gl/glError.h"
@@ -31,7 +32,10 @@
 #include "view/flyTo.h"
 #include "view/view.h"
 
+#include <algorithm>
 #include <bitset>
+#include <chrono>
+#include <cstdlib>
 #include <cmath>
 
 namespace Tangram {
@@ -91,6 +95,32 @@ public:
     // pass. Texture-backed (colorRenderBuffer=false) like selectionBuffer is once resized,
     // since it must be bound as a sampler2D.
     std::unique_ptr<FrameBuffer> backgroundBuffer = std::make_unique<FrameBuffer>(0, 0);
+
+    // Dynamic resolution (2026-10-11 perf work): while the camera is moving the scene is rasterized
+    //  into this offscreen target at `renderScale` of the viewport size, then upscaled to the
+    //  default framebuffer; once the camera has been still for `settleSeconds` the scale returns
+    //  to 1 and the next frame is full resolution. renderScaleMoving comes from
+    //  ASCEND_RENDER_SCALE (1 = off, the core default; the app sets 0.75).
+    std::unique_ptr<FrameBuffer> sceneBuffer;
+    bool renderScaleEnvRead = false;
+    float renderScaleMoving = 1.f;
+    float settleSeconds = 0.25f;
+    float renderScale = 1.f;
+    // adaptive part of the dynamic resolution: the moving-state scale is driven by measured frame
+    //  time (see Map::update), between renderScaleMin and 1; <0 = not initialized yet
+    float adaptiveScale = -1.f;
+    float renderScaleMin = 0.5f;
+    float targetFrameSeconds = 0.022f;
+    float frameEma = 0.f;
+    bool adaptiveEnabled = true;
+    double lastMotionTime = -1e9;
+    bool hasLastCamera = false;
+    glm::mat4 lastViewMatrix{1.f};
+    glm::mat4 lastProjMatrix{1.f};
+    float lastZoom = 0.f;
+    glm::dvec3 lastCamPos{0.0};
+    float lastBaseZoom = 0.f, lastYaw = 0.f, lastPitch = 0.f, lastMaxPitch = 0.f;
+    float lastW = 0.f, lastH = 0.f;
 
     bool cacheGlState = false;
     float pickRadius = .5f;
@@ -296,6 +326,113 @@ MapState Map::update(float _dt) {
         if (sceneState.tilesLoading) {
             state |= MapState::tiles_loading;
         }
+        // budget-deferred tile work (churn/upgrade caps, unpublished background stitches)
+        //  needs further updates even when nothing else would request a frame
+        if (scene.tileManager()->needsFollowUpFrame()) {
+            state |= MapState::is_animating;
+        }
+    }
+
+    // Dynamic resolution: camera motion drives the scene render scale
+    {
+        if (!impl->renderScaleEnvRead) {
+            // read lazily: the app sets its defaults (setenv) after core static init
+            impl->renderScaleEnvRead = true;
+            if (const char* e = getenv("ASCEND_RENDER_SCALE")) {
+                impl->renderScaleMoving = std::min(1.f, std::max(0.25f, float(atof(e))));
+            }
+            if (const char* e = getenv("ASCEND_RENDER_SCALE_MIN")) {
+                impl->renderScaleMin = std::min(1.f, std::max(0.25f, float(atof(e))));
+            }
+            if (const char* e = getenv("ASCEND_RENDER_TARGET_MS")) {
+                impl->targetFrameSeconds = std::max(8.f, float(atof(e))) * 0.001f;
+            }
+            if (const char* e = getenv("ASCEND_RENDER_ADAPT")) {
+                impl->adaptiveEnabled = atoi(e) != 0;
+            }
+            if (const char* e = getenv("ASCEND_RENDER_SETTLE_MS")) {
+                impl->settleSeconds = std::max(0.f, float(atof(e)) * 0.001f);
+            }
+        }
+        auto& view = impl->view;
+        // tolerance, not exact equality: the elevation-aware view re-derives its zoom/eye height
+        //  as DEM tiles refine, which must not count as the user moving the camera
+        auto matNear = [](const glm::mat4& a, const glm::mat4& b) {
+            for (int c = 0; c < 4; c++) {
+                for (int r = 0; r < 4; r++) {
+                    float x = a[c][r], y = b[c][r];
+                    if (std::fabs(x - y) > 1e-6f * std::max(1.f, std::max(std::fabs(x), std::fabs(y)))) { return false; }
+                }
+            }
+            return true;
+        };
+        // Motion is judged from the USER-CONTROLLED camera parameters only. The view matrices and
+        //  getZoom() are elevation-aware (zoom is derived from the terrain depth at screen center),
+        //  so they drift whenever terrain data or mesh density changes and must not count as the
+        //  camera moving (that fed back into the render scale / mesh boost and never settled).
+        const glm::dvec3 camPos = view.getPosition();
+        // pitch is clamped to a max-pitch curve evaluated at the (elevation-derived) zoom, so while
+        //  it sits on that clamp it wobbles with the zoom without the user touching anything
+        const float maxPitchRad = glm::radians(view.getMaxPitch());
+        const bool onClampNow = view.getPitch() >= maxPitchRad - 2e-3f;
+        const bool onClampPrev = impl->lastPitch >= impl->lastMaxPitch - 2e-3f;
+        const bool pitchMoved = std::fabs(view.getPitch() - impl->lastPitch) > 1e-6 &&
+            !(onClampNow && onClampPrev);
+        impl->lastMaxPitch = maxPitchRad;
+        bool moved = !impl->hasLastCamera ||
+            camPos.x != impl->lastCamPos.x || camPos.y != impl->lastCamPos.y ||
+            std::fabs(view.getBaseZoom() - impl->lastBaseZoom) > 1e-5 ||
+            std::fabs(view.getYaw() - impl->lastYaw) > 1e-6 ||
+            pitchMoved ||
+            float(view.getWidth()) != impl->lastW || float(view.getHeight()) != impl->lastH;
+        (void)matNear;
+        impl->lastCamPos = camPos;
+        impl->lastBaseZoom = view.getBaseZoom();
+        impl->lastYaw = view.getYaw();
+        impl->lastPitch = view.getPitch();
+        impl->lastZoom = view.getZoom();
+        impl->lastW = float(view.getWidth());
+        impl->lastH = float(view.getHeight());
+        const bool first = !impl->hasLastCamera;
+        impl->hasLastCamera = true;
+
+        double now = std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (moved && !first) { impl->lastMotionTime = now; }
+        bool recentlyMoved = (now - impl->lastMotionTime) < double(impl->settleSeconds);
+        // Adaptive dynamic resolution: while the camera moves, steer the scene scale so the
+        //  frame time (time between updates) stays near the target - heavy views (big zoomed-out
+        //  alpine panoramas: millions of hillshade/rock fragments) drop toward renderScaleMin,
+        //  light ones climb back to full resolution. At rest the scale is always 1.
+        if (impl->adaptiveScale < 0.f) { impl->adaptiveScale = impl->renderScaleMoving; }
+        if (impl->adaptiveEnabled && moved && !first && _dt > 0.f && _dt < 0.5f) {
+            impl->frameEma = impl->frameEma <= 0.f ? _dt : 0.8f * impl->frameEma + 0.2f * _dt;
+            if (impl->frameEma > impl->targetFrameSeconds * 1.1f) {
+                impl->adaptiveScale = std::max(impl->renderScaleMin, impl->adaptiveScale - 0.03f);
+            } else if (impl->frameEma < impl->targetFrameSeconds * 0.8f) {
+                impl->adaptiveScale = std::min(1.f, impl->adaptiveScale + 0.015f);
+            }
+        }
+        const float movingScale = impl->adaptiveEnabled ? impl->adaptiveScale : impl->renderScaleMoving;
+        float target = (movingScale < 0.999f && recentlyMoved) ? movingScale : 1.f;
+        impl->renderScale = target;
+        // keep frames coming until the settle delay elapses so the full-resolution frame happens
+        //  even though no input event will arrive
+        if (movingScale < 0.999f && recentlyMoved && !moved) {
+            state |= MapState::is_animating;
+        }
+        // Settle-time mesh refinement: the terrain mesh (and the drape lattice) doubles its
+        //  density once the camera has been still a little longer than the full-resolution
+        //  switch, so panning stays snappy and a resting view sharpens (util/builders.h)
+        {
+            const double boostDelay = std::max(double(impl->settleSeconds), 0.4);
+            const bool boostSettled = (now - impl->lastMotionTime) >= boostDelay;
+            setTerrainMeshBoost(boostSettled ? terrainMeshMaxBoost() : 0);
+            if (terrainMeshMaxBoost() > 0 && !boostSettled && !moved) {
+                state |= MapState::is_animating;
+            }
+        }
+        Profiler::counter("renderScale", double(impl->renderScale));
     }
 
     FrameInfo::endUpdate();
@@ -358,9 +495,31 @@ void Map::render() {
     impl->background = (drawSelectionDebug || drawDepthDebug) ?
             Color(0, 0, 0, 255) : scene.backgroundColor(view.getIntegerZoom());
 
-    // Setup default framebuffer for a new frame
-    FrameBuffer::apply(renderState, renderState.defaultFrameBuffer(),
-                       viewport, impl->background.toColorF());
+    // Setup the frame's render target: the default framebuffer, or (dynamic resolution, camera in
+    //  motion) a scaled offscreen target that is upscaled onto the default framebuffer below.
+    const GLuint realDefaultFB = renderState.defaultFrameBuffer();
+    bool scaledTarget = false;
+    int scaledW = 0, scaledH = 0;
+    if (impl->renderScale < 0.999f && !drawSelectionDebug && !drawDepthDebug) {
+        scaledW = std::max(1, int(std::lround(viewport.z * impl->renderScale)));
+        scaledH = std::max(1, int(std::lround(viewport.w * impl->renderScale)));
+        if (!impl->sceneBuffer || impl->sceneBuffer->getWidth() != scaledW ||
+            impl->sceneBuffer->getHeight() != scaledH) {
+            // 24-bit depth: the default framebuffer's depth precision is relied on by draped
+            //  polygons coinciding with the terrain surface
+            impl->sceneBuffer = std::make_unique<FrameBuffer>(scaledW, scaledH, false, GL_RGBA8,
+                                                              GL_DEPTH_COMPONENT24, true);
+        }
+        scaledTarget = impl->sceneBuffer->applyAsRenderTarget(renderState, impl->background.toColorF());
+        if (scaledTarget) {
+            renderState.setDefaultFramebufferOverride(impl->sceneBuffer->getHandle());
+            renderState.setRenderScale(float(scaledW) / viewport.z);
+        }
+    }
+    if (!scaledTarget) {
+        FrameBuffer::apply(renderState, renderState.defaultFrameBuffer(),
+                           viewport, impl->background.toColorF());
+    }
 
     if (drawSelectionDebug) {
         impl->selectionBuffer->drawDebug(renderState, {viewport.z, viewport.w});
@@ -376,8 +535,22 @@ void Map::render() {
             platform->setContinuousRendering(drawnAnimatedStyle);
         }
 
+        if (scaledTarget) {
+            // upscale the low-resolution scene onto the real default framebuffer. A textured quad,
+            //  not glBlitFramebuffer: the window framebuffer is 4x multisampled, and a scaling
+            //  blit from a single-sample target into it is GL_INVALID_OPERATION (map never updated).
+            renderState.setDefaultFramebufferOverride(0);
+            renderState.setRenderScale(1.f);
+            FrameBuffer::apply(renderState, realDefaultFB, viewport, impl->background.toColorF());
+            impl->sceneBuffer->drawFullscreen(renderState, {view.getWidth(), view.getHeight()});
+        }
+
         scene.labelManager()->drawDebug(renderState, view);
     }
+
+    // never leave the override set (e.g. early-outs above)
+    renderState.setDefaultFramebufferOverride(0);
+    renderState.setRenderScale(1.f);
 
     FrameInfo::draw(renderState, view, *this);
 

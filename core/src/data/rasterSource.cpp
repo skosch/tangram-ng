@@ -5,15 +5,32 @@
 #include "tile/tile.h"
 #include "tile/tileBuilder.h"
 #include "tile/tileTask.h"
+#include "util/builders.h"
+#include "util/elevationManager.h"
 #include "util/mapProjection.h"
 #include "log.h"
+#include "platform.h"
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
 namespace Tangram {
+
+float elevationMosaicMarginFrac() {
+    static const float k = []() {
+        float v = 1.f;
+        if (const char* e = std::getenv("ASCEND_MOSAIC_MARGIN")) { v = float(std::atof(e)); }
+        if (!(v > 0.f) || v >= 1.f) { return 1.f; }
+        // snap to 1/2^n so margins are integral and mip chains halve evenly
+        float p = 1.f;
+        while (p * 0.5f >= v * 0.7071f && p > 1.f / 16.f) { p *= 0.5f; }
+        return p;
+    }();
+    return k;
+}
 
 namespace {
 
@@ -39,20 +56,36 @@ namespace {
 // which is what keeps the high-pass texture shading free of tile-boundary steps. (With the
 // naive odd 3W = 771 size, neighbor grids are misaligned at every mip level and NPOT mip
 // downsampling is driver-arbitrary, leaving a faint visible seam on every boundary.)
-inline size_t cellRowOffset(int dy, int Wp) { return size_t(1 - dy) * size_t(Wp); }
+// Margin (texels) kept around the center cell: Wp for the classic full-cell ring.
+inline int mosaicMargin(int Wp) {
+    return std::max(1, std::min(Wp, int(std::lround(double(Wp) * double(elevationMosaicMarginFrac())))));
+}
 
-// Copy one Wp x Wp cell (raw bytes, `bpp` bytes/pixel) from a real tile buffer (row stride
-// `W` samples) into the mosaic. dx/dy in {-1, 0, 1} are TILE offsets (dx = 1: east
-// neighbor, dy = 1: south neighbor).
+// Where neighbor offset `e` (in TEXTURE-axis direction: -1 = toward index 0) lands along one
+// mosaic axis, and which cell-local source range supplies it: the center cell is the whole
+// [m, m+Wp); a lower neighbor contributes its last m samples to [0, m); a higher neighbor its
+// first m samples to [m+Wp, m+Wp+m). With m == Wp this is exactly the classic 3-cell layout.
+struct AxisSpan { int src0, len, dst0; };
+inline AxisSpan axisSpan(int e, int Wp, int m) {
+    if (e == 0) { return {0, Wp, m}; }
+    if (e < 0) { return {Wp - m, m, 0}; }
+    return {0, m, m + Wp};
+}
+
+// Copy the part of one neighbor/own cell that falls inside the mosaic (raw bytes, `bpp`
+// bytes/pixel) from a real tile buffer (row stride `W` samples) into the mosaic. dx/dy in
+// {-1, 0, 1} are TILE offsets (dx = 1: east neighbor, dy = 1: south neighbor); rows run
+// south -> north so the row-axis offset is -dy.
 void copyMosaicCell(GLubyte* mosaic, int Wp, int W, int bpp,
                      int dx, int dy, const GLubyte* srcData) {
-    size_t mosaicRowBytes = size_t(3 * Wp) * size_t(bpp);
-    size_t rowOff = cellRowOffset(dy, Wp);
-    size_t colOff = size_t(dx + 1) * size_t(Wp) * size_t(bpp);
-    for (int r = 0; r < Wp; r++) {
-        std::memcpy(mosaic + (rowOff + size_t(r)) * mosaicRowBytes + colOff,
-                    srcData + size_t(r) * size_t(W) * size_t(bpp),
-                    size_t(Wp) * size_t(bpp));
+    const int m = mosaicMargin(Wp);
+    const size_t mosaicRowBytes = size_t(Wp + 2 * m) * size_t(bpp);
+    const AxisSpan cs = axisSpan(dx, Wp, m);
+    const AxisSpan rs = axisSpan(-dy, Wp, m);
+    for (int r = 0; r < rs.len; r++) {
+        std::memcpy(mosaic + size_t(rs.dst0 + r) * mosaicRowBytes + size_t(cs.dst0) * size_t(bpp),
+                    srcData + (size_t(rs.src0 + r) * size_t(W) + size_t(cs.src0)) * size_t(bpp),
+                    size_t(cs.len) * size_t(bpp));
     }
 }
 
@@ -67,21 +100,23 @@ void copyMosaicCell(GLubyte* mosaic, int Wp, int W, int bpp,
 // transient, replaced with real data by patchNeighborMosaics() as neighbor tiles arrive.
 void fillMirroredNeighborCell(GLubyte* mosaic, int Wp, int W, int bpp,
                                int dx, int dy, const GLubyte* ownData) {
-    int overlap = W - Wp;
-    size_t mosaicRowBytes = size_t(3 * Wp) * size_t(bpp);
-    size_t rowOff = cellRowOffset(dy, Wp);
-    size_t colOff = size_t(dx + 1) * size_t(Wp) * size_t(bpp);
-    for (int r = 0; r < Wp; r++) {
-        // reflection: srcRow = Wp - r for node-registered (about the shared node), else
-        // Wp - 1 - r (about the inter-pixel edge); index Wp is valid only when overlap = 1
-        int srcRow = (dy == 0) ? r : (Wp - 1 + overlap - r);
+    const int overlap = W - Wp;
+    const int m = mosaicMargin(Wp);
+    const size_t mosaicRowBytes = size_t(Wp + 2 * m) * size_t(bpp);
+    const AxisSpan cs = axisSpan(dx, Wp, m);
+    const AxisSpan rs = axisSpan(-dy, Wp, m);
+    for (int r = 0; r < rs.len; r++) {
+        int cellRow = rs.src0 + r;
+        // reflection: srcRow = Wp - cellRow for node-registered (about the shared node), else
+        // Wp - 1 - cellRow (about the inter-pixel edge); index Wp is valid only when overlap = 1
+        int srcRow = (dy == 0) ? cellRow : (Wp - 1 + overlap - cellRow);
         const GLubyte* srcRowPtr = ownData + size_t(srcRow) * size_t(W) * size_t(bpp);
-        GLubyte* dstRowPtr = mosaic + (rowOff + size_t(r)) * mosaicRowBytes + colOff;
+        GLubyte* dstRowPtr = mosaic + size_t(rs.dst0 + r) * mosaicRowBytes + size_t(cs.dst0) * size_t(bpp);
         if (dx == 0) {
-            std::memcpy(dstRowPtr, srcRowPtr, size_t(Wp) * size_t(bpp));
+            std::memcpy(dstRowPtr, srcRowPtr + size_t(cs.src0) * size_t(bpp), size_t(cs.len) * size_t(bpp));
         } else {
-            for (int c = 0; c < Wp; c++) {
-                int srcCol = Wp - 1 + overlap - c;
+            for (int c = 0; c < cs.len; c++) {
+                int srcCol = Wp - 1 + overlap - (cs.src0 + c);
                 std::memcpy(dstRowPtr + size_t(c) * size_t(bpp), srcRowPtr + size_t(srcCol) * size_t(bpp), size_t(bpp));
             }
         }
@@ -171,14 +206,14 @@ void encodeElevationPixel(GLubyte* p, double value, int bpp, bool isFloat) {
 // every other raw elevation tile buffer in this file (row 0 = south, increasing = north -- see
 // the mosaic layout notes above cellRowOffset()); node row index j follows the SAME convention
 // purely so it composes directly with the row math in fillLatticeUpsampledCell below.
-std::vector<double> buildLatticeNodes(const GLubyte* data, int W, int bpp, bool isFloat) {
-    std::vector<double> nodes(65 * 65);
-    for (int j = 0; j <= 64; j++) {
-        int row = std::min(W - 1, std::max(0, int((double(j) / 64.0) * double(W))));
-        for (int i = 0; i <= 64; i++) {
-            int col = std::min(W - 1, std::max(0, int((double(i) / 64.0) * double(W))));
+std::vector<double> buildLatticeNodes(const GLubyte* data, int W, int bpp, bool isFloat, int cells = 64) {
+    std::vector<double> nodes(size_t(cells + 1) * size_t(cells + 1));
+    for (int j = 0; j <= cells; j++) {
+        int row = std::min(W - 1, std::max(0, int((double(j) / double(cells)) * double(W))));
+        for (int i = 0; i <= cells; i++) {
+            int col = std::min(W - 1, std::max(0, int((double(i) / double(cells)) * double(W))));
             const GLubyte* p = data + (size_t(row) * size_t(W) + size_t(col)) * size_t(bpp);
-            nodes[size_t(j) * 65 + size_t(i)] = decodeElevationPixel(p, bpp, isFloat);
+            nodes[size_t(j) * size_t(cells + 1) + size_t(i)] = decodeElevationPixel(p, bpp, isFloat);
         }
     }
     return nodes;
@@ -192,17 +227,18 @@ std::vector<double> buildLatticeNodes(const GLubyte* data, int W, int bpp, bool 
 // lies entirely within one coarse triangle (the anti-diagonal split is scale-invariant), so
 // linear interpolation of the coarse corners at the fine node's exact position gives exactly what
 // the coarse mesh itself would render there -- see fillLatticeUpsampledCell's doc comment.
-double evalLatticePL(const std::vector<double>& nodes, double u, double v) {
-    double stx = std::min(1.0, std::max(0.0, u)) * 64.0;
-    double sty = std::min(1.0, std::max(0.0, v)) * 64.0;
-    int cx = std::min(63, int(std::floor(stx)));
-    int cy = std::min(63, int(std::floor(sty)));
+[[maybe_unused]] double evalLatticePL(const std::vector<double>& nodes, double u, double v, int cells = 64) {
+    const size_t stride = size_t(cells + 1);
+    double stx = std::min(1.0, std::max(0.0, u)) * double(cells);
+    double sty = std::min(1.0, std::max(0.0, v)) * double(cells);
+    int cx = std::min(cells - 1, int(std::floor(stx)));
+    int cy = std::min(cells - 1, int(std::floor(sty)));
     double fx = stx - double(cx);
     double fy = sty - double(cy);
-    double h00 = nodes[size_t(cy) * 65 + size_t(cx)];
-    double h10 = nodes[size_t(cy) * 65 + size_t(cx + 1)];
-    double h01 = nodes[size_t(cy + 1) * 65 + size_t(cx)];
-    double h11 = nodes[size_t(cy + 1) * 65 + size_t(cx + 1)];
+    double h00 = nodes[size_t(cy) * stride + size_t(cx)];
+    double h10 = nodes[size_t(cy) * stride + size_t(cx + 1)];
+    double h01 = nodes[size_t(cy + 1) * stride + size_t(cx)];
+    double h11 = nodes[size_t(cy + 1) * stride + size_t(cx + 1)];
     if (fx + fy <= 1.0) {
         return h00 + fx * (h10 - h00) + fy * (h01 - h00);
     }
@@ -225,24 +261,55 @@ void fillLatticeUpsampledCell(GLubyte* composite, int compositeW, int Wp, int bp
                                int col, int row, int cellW, int cellH,
                                const std::vector<double>& ancestorNodes,
                                int32_t blockColOriginWest, int32_t blockRowOriginNorth,
-                               int32_t blockSize, bool isFloat) {
+                               int32_t blockSize, bool isFloat, int latticeCells = 64) {
+    const size_t nodeStride = size_t(latticeCells + 1);
     size_t compositeRowBytes = size_t(compositeW) * size_t(bpp);
     size_t rowOff = size_t(N - 1 - row) * size_t(Wp);
     size_t colOff = size_t(col) * size_t(Wp);
     // South-based block origin (row 0 = south, increasing = north), matching every raw tile
     // buffer's own row convention (see buildLatticeNodes).
     int32_t blockRowOriginSouth = int32_t(N) - blockRowOriginNorth - blockSize;
+
+    // PERF (2026-10-11): the per-texel u (and, per row, v) mapping and the lattice cell/frac
+    // split depend only on the column (row), so tabulate them once per cell instead of redoing
+    // the divisions/floors for every texel (was ~40 ns/texel; a 1024^2 composite spent ~40 ms
+    // here). Same math, same doubles -- the output is bit-identical to evalLatticePL().
+    static thread_local std::vector<int> s_cx;
+    static thread_local std::vector<double> s_fx;
+    s_cx.resize(size_t(cellW));
+    s_fx.resize(size_t(cellW));
+    for (int c = 0; c < cellW; c++) {
+        double westFracGlobal = double(colOff + size_t(c)) / double(compositeW - 1);
+        double u = (westFracGlobal * double(N) - double(blockColOriginWest)) / double(blockSize);
+        double stx = std::min(1.0, std::max(0.0, u)) * double(latticeCells);
+        int cx = std::min(latticeCells - 1, int(std::floor(stx)));
+        s_cx[size_t(c)] = cx;
+        s_fx[size_t(c)] = stx - double(cx);
+    }
+
     for (int r = 0; r < cellH; r++) {
         size_t globalRow = rowOff + size_t(r);
         double southFracGlobal = double(globalRow) / double(compositeW - 1);
-        double vLocal = (southFracGlobal * double(N) - double(blockRowOriginSouth)) / double(blockSize);
+        double v = (southFracGlobal * double(N) - double(blockRowOriginSouth)) / double(blockSize);
+        double sty = std::min(1.0, std::max(0.0, v)) * double(latticeCells);
+        int cy = std::min(latticeCells - 1, int(std::floor(sty)));
+        double fy = sty - double(cy);
+        const double* n0 = &ancestorNodes[size_t(cy) * nodeStride];
+        const double* n1 = &ancestorNodes[size_t(cy + 1) * nodeStride];
         GLubyte* dstRow = composite + globalRow * compositeRowBytes + colOff * size_t(bpp);
         for (int c = 0; c < cellW; c++) {
-            size_t globalCol = colOff + size_t(c);
-            double westFracGlobal = double(globalCol) / double(compositeW - 1);
-            double uLocal = (westFracGlobal * double(N) - double(blockColOriginWest)) / double(blockSize);
-            double val = evalLatticePL(ancestorNodes, uLocal, vLocal);
-            encodeElevationPixel(dstRow + size_t(c) * size_t(bpp), val, bpp, isFloat);
+            int cx = s_cx[size_t(c)];
+            double fx = s_fx[size_t(c)];
+            double h00 = n0[cx], h10 = n0[cx + 1], h01 = n1[cx], h11 = n1[cx + 1];
+            double val = (fx + fy <= 1.0)
+                ? h00 + fx * (h10 - h00) + fy * (h01 - h00)
+                : h11 + (1.0 - fx) * (h01 - h11) + (1.0 - fy) * (h10 - h11);
+            if (isFloat) {
+                float f = float(val);
+                std::memcpy(dstRow + size_t(c) * size_t(bpp), &f, sizeof(float));
+            } else {
+                encodeElevationPixel(dstRow + size_t(c) * size_t(bpp), val, bpp, isFloat);
+            }
         }
     }
 }
@@ -323,26 +390,16 @@ std::shared_ptr<Texture> stitchElevationMosaic(const std::shared_ptr<Texture>& o
     int Wp = W - overlap;
     if (Wp <= 0) { return nullptr; }
 
-    int mosaicW = 3 * Wp;
+    int mosaicW = Wp + 2 * mosaicMargin(Wp);
     size_t mosaicRowBytes = size_t(mosaicW) * size_t(bpp);
 
-    // Reuse one persistent scratch buffer across calls instead of heap-allocating a fresh
-    // ~9x-tile-sized (e.g. ~7-9MB for a 512px elevation tile) vector on every stitch: this
-    // function was profiled as the single biggest main-thread CPU cost (~30% of capture time),
-    // and the allocation/deallocation itself -- not the per-row memcpy work below -- was the
-    // waste (see docs/tile-pipeline-perf-plan.md). `static thread_local` rather than a plain
-    // `static` is a defensive habit, not a requirement: stitchElevationMosaic() is only ever
-    // called from RasterSource::buildElevationMosaic() on the main thread (same thread-safety
-    // contract as getTexture() above -- see the note on RasterTileTask::addRaster()), so a
-    // plain function-local static would already be safe here; thread_local just costs nothing
-    // extra and avoids relying on that invariant never changing elsewhere. resize() never
-    // shrinks capacity, so repeated calls at the same (or smaller) mosaic size reuse the
-    // existing allocation with no new malloc/free at all. Every byte is unconditionally
-    // overwritten below (own cell + all 8 neighbor cells, real or mirror-extrapolated) before
-    // the buffer is read, so there is no dependency on prior contents or zero-initialization.
-    static thread_local std::vector<GLubyte> s_scratchMosaic;
-    s_scratchMosaic.resize(mosaicRowBytes * size_t(mosaicW));
-    GLubyte* mosaic = s_scratchMosaic.data();
+    // Stitch straight into a malloc'd buffer that the Texture then adopts (no scratch buffer +
+    // second full-size copy as before: that copy was a whole extra pass over up to ~38 MB per
+    // composite-centered mosaic). Every byte is unconditionally overwritten below (own cell +
+    // all 8 neighbor cells, real or mirror-extrapolated) before the buffer is read.
+    const size_t mosaicBytes = mosaicRowBytes * size_t(mosaicW);
+    GLubyte* mosaic = static_cast<GLubyte*>(std::malloc(mosaicBytes));
+    if (!mosaic) { return nullptr; }
 
     // Tile's own data occupies the center third [Wp, 2Wp) x [Wp, 2Wp) -- see
     // docs/texture-shading-plan.md "Frozen Interface Contract".
@@ -379,14 +436,14 @@ std::shared_ptr<Texture> stitchElevationMosaic(const std::shared_ptr<Texture>& o
     // RasterSource::patchNeighborMosaics() can overwrite individual cells in place when
     // late-arriving neighbor tiles replace their mirror-extrapolated placeholders.
     auto tex = std::make_shared<Texture>(options, false);
-    tex->setPixelData(mosaicW, mosaicW, bpp, mosaic, s_scratchMosaic.size());
+    if (!tex->adoptPixelData(mosaicW, mosaicW, bpp, mosaic, mosaicBytes)) { return nullptr; }
 
     return tex;
 }
 
 std::shared_ptr<Texture> stitchElevationOverzoomMosaic(const std::shared_ptr<Texture>& own,
                                                         const std::vector<OverzoomCell>& cells,
-                                                        int N) {
+                                                        int N, int ownZoom, int refZoom) {
     if (!own || N <= 1) { return nullptr; }
     if (int(cells.size()) != N * N) { return nullptr; }
 
@@ -417,16 +474,32 @@ std::shared_ptr<Texture> stitchElevationOverzoomMosaic(const std::shared_ptr<Tex
 
     int compositeW = (N - 1) * Wp + ownW;
     size_t rowBytes = size_t(compositeW) * size_t(bpp);
-    std::vector<GLubyte> buf(rowBytes * size_t(compositeW));
+    const size_t compositeBytes = rowBytes * size_t(compositeW);
+    // calloc: large zeroed blocks come straight from fresh pages (no memset pass), and the
+    // texture adopts the buffer below instead of copying it.
+    GLubyte* buf = static_cast<GLubyte*>(std::calloc(compositeBytes, 1));
+    if (!buf) { return nullptr; }
+    struct BufGuard { GLubyte* p; ~BufGuard() { if (p) { std::free(p); } } } bufGuard{buf};
 
-    // One 65x65 lattice-node grid per distinct fallback source actually used -- an ancestor tile
+    // One lattice-node grid per distinct fallback source actually used -- an ancestor tile
     // with blockSize > 1 typically supplies several zt-grid cells at once, so building its
-    // lattice once and reusing it avoids redundant work.
+    // lattice once and reusing it avoids redundant work. The lattice density is the ancestor's
+    // own ADAPTIVE terrain-mesh cell count (terrainMeshCellsAt; 64 when ownZoom < 0, the legacy
+    // fixed-density behavior): the composite targets zoom ownZoom + log2(N) and an ancestor
+    // spanning blockSize cells per side sits log2(blockSize) levels above that.
+    int targetZoom = 0;
+    if (ownZoom >= 0) { while ((1 << targetZoom) < N) { targetZoom++; } targetZoom += ownZoom; }
+    auto latticeCellsFor = [&](int32_t blockSize) -> int {
+        if (ownZoom < 0) { return 64; }
+        int dl = 0;
+        while ((1 << dl) < blockSize) { dl++; }
+        return terrainMeshCellsAt(targetZoom - dl, refZoom);
+    };
     std::map<const Texture*, std::vector<double>> latticeCache;
-    auto latticeFor = [&](const Texture* tex, const GLubyte* data, int w) -> const std::vector<double>& {
+    auto latticeFor = [&](const Texture* tex, const GLubyte* data, int w, int latCells) -> const std::vector<double>& {
         auto it = latticeCache.find(tex);
         if (it == latticeCache.end()) {
-            it = latticeCache.emplace(tex, buildLatticeNodes(data, w, bpp, isFloat)).first;
+            it = latticeCache.emplace(tex, buildLatticeNodes(data, w, bpp, isFloat, latCells)).first;
         }
         return it->second;
     };
@@ -452,23 +525,26 @@ std::shared_ptr<Texture> stitchElevationOverzoomMosaic(const std::shared_ptr<Tex
 
             if (validExact) {
                 // Exact: real data cached at the composite's own target zoom for this cell.
-                copyOverzoomGridCell(buf.data(), compositeW, Wp, ownW, bpp, N, col, row,
+                copyOverzoomGridCell(buf, compositeW, Wp, ownW, bpp, N, col, row,
                                       cellW, cellH, cell.texture->bufferData());
             } else if (validReal && cell.blockSize > 1) {
                 // A real, but coarser, ancestor covers this cell (and typically several more) --
                 // triangle-PL-upsample its own terrain-mesh surface instead of nearest-sampling
                 // its raw pixels (see fillLatticeUpsampledCell's doc comment).
-                const auto& nodes = latticeFor(cell.texture.get(), cell.texture->bufferData(), cell.texture->width());
-                fillLatticeUpsampledCell(buf.data(), compositeW, Wp, bpp, N, col, row, cellW, cellH,
+                const int latCells = latticeCellsFor(cell.blockSize);
+                const auto& nodes = latticeFor(cell.texture.get(), cell.texture->bufferData(),
+                                               cell.texture->width(), latCells);
+                fillLatticeUpsampledCell(buf, compositeW, Wp, bpp, N, col, row, cellW, cellH,
                                           nodes, cell.blockColOriginWest, cell.blockRowOriginNorth,
-                                          cell.blockSize, isFloat);
+                                          cell.blockSize, isFloat, latCells);
             } else {
                 // No usable source named for this cell (missing/malformed input) -- fall all the
                 // way back to `own` itself over the whole footprint, same safety net the old
                 // nearest-neighbor fallback provided, just PL-upsampled now.
-                const auto& nodes = latticeFor(own.get(), ownData, ownW);
-                fillLatticeUpsampledCell(buf.data(), compositeW, Wp, bpp, N, col, row, cellW, cellH,
-                                          nodes, 0, 0, N, isFloat);
+                const int latCells = latticeCellsFor(N);
+                const auto& nodes = latticeFor(own.get(), ownData, ownW, latCells);
+                fillLatticeUpsampledCell(buf, compositeW, Wp, bpp, N, col, row, cellW, cellH,
+                                          nodes, 0, 0, N, isFloat, latCells);
             }
         }
     }
@@ -485,7 +561,8 @@ std::shared_ptr<Texture> stitchElevationOverzoomMosaic(const std::shared_ptr<Tex
     // -- rather than patched in place, so there's no need to keep its CPU buffer resident past
     // the GPU upload.
     auto tex = std::make_shared<Texture>(options);
-    tex->setPixelData(compositeW, compositeW, bpp, buf.data(), buf.size());
+    bufGuard.p = nullptr;  // adoptPixelData() takes ownership (and frees on failure)
+    if (!tex->adoptPixelData(compositeW, compositeW, bpp, buf, compositeBytes)) { return nullptr; }
 
     return tex;
 }
@@ -725,6 +802,10 @@ std::unique_ptr<Texture> RasterSource::createTexture(TileID _tile, const std::ve
     auto length = _rawTileData.size();
     auto tex = std::make_unique<Texture>(m_texOptions, !m_keepTextureData);
     if (!tex->loadImageFromMemory(data, length)) { tex.reset(); }
+    // Elevation tiles (CPU buffer kept): compute min/max, Laplacian RMS and the salient-texel
+    // facing table here on the decode worker instead of lazily on the main thread the first
+    // time the LOD selector or labels ask for it.
+    if (tex && m_keepTextureData) { ElevationManager::precomputeTileInfo(*tex, _tile); }
     return tex;
 }
 
@@ -962,6 +1043,7 @@ std::shared_ptr<Texture> RasterSource::buildElevationMosaic(TileID _tile, const 
         }
         info->rugosity = computeRugosity(*ownForMosaic, id);
         info->compositeZoom = achievedZoom;
+        info->builtTime = nowSeconds();
         // Initial neighborMask: which cells stitchElevationMosaic() above actually found real
         // data for (same dimension/bpp check it applies internally) vs. mirror-extrapolated --
         // drives the R2 patch-upload debounce (see ElevationMosaicInfo::neighborMask).
@@ -1049,55 +1131,54 @@ void RasterSource::pruneOverzoomMosaicsIfNeeded() {
     }
 }
 
-std::shared_ptr<Texture> RasterSource::buildOverzoomElevationMosaic(TileID _primary, const std::shared_ptr<Texture>& _ownTexture,
-                                                                    const uint8_t* _cellZoomCaps) {
-    if (!_ownTexture || !_ownTexture->bufferData() || !m_keepTextureData) { return nullptr; }
-
-    int zt = overzoomTargetZoom(_primary);
-    if (zt <= _primary.z) { return nullptr; }  // not overzoomed enough to be worth compensating
-
-    PROFILE_SCOPE(Profiler::intern("buildOverzoomElevationMosaic:" + name()));
-
+uint64_t RasterSource::compositeSignature(TileID _primary, int zt, const uint8_t* _cellZoomCaps,
+                                          int _refZoom) {
     int levels = zt - _primary.z;
     int N = 1 << levels;
     int32_t baseX = _primary.x << levels;
     int32_t baseY = _primary.y << levels;
-    TileID key(_primary.x, _primary.y, _primary.z, zt);
 
     // Per-cell TARGET zoom: zt, capped by the caller-provided displayed-terrain zoom for the
     // cell (see the doc comment in rasterSource.h -- matching the DISPLAYED zoom rather than
     // the finest CACHED zoom is what makes the drape sit on the rendered terrain surface).
+    // Cheap per-cell fingerprint of what the stitch would actually use: the cell's target zoom
+    // AND whether real data at that zoom is cached right now. Drives the rebuild-vs-reuse
+    // decision without walking the full ancestor chain or re-stitching when nothing has
+    // actually changed since the last call -- this is what keeps calling this function every
+    // update cheap in the steady state. Folding the target zoom in means a displayed-zoom flip
+    // (either direction) changes the signature and triggers exactly one re-stitch.
+    uint64_t signature = 1469598103934665603ull;  // FNV-1a offset basis
+    for (int row = 0; row < N; row++) {
+        for (int col = 0; col < N; col++) {
+            int zc = zt;
+            if (_cellZoomCaps) {
+                int cap = int(_cellZoomCaps[size_t(row) * size_t(N) + size_t(col)]);
+                zc = std::max<int>(_primary.z, std::min<int>(zt, cap));
+            }
+            int dl = zt - zc;
+            auto tex = getTexture(TileID((baseX + col) >> dl, (baseY + row) >> dl, zc));
+            uint64_t v = (uint64_t(zc) << 1) | ((tex && tex->bufferData()) ? 1u : 0u);
+            // cells that are PL-upsampled from a coarser lattice depend on the adaptive terrain
+            //  mesh density (reference zoom): a change must re-stitch them
+            if (dl > 0) { v ^= uint64_t(uint32_t(_refZoom)) << 16; }
+            signature = (signature ^ v) * 1099511628211ull;  // FNV-1a prime
+        }
+    }
+    return signature;
+}
+
+void RasterSource::gatherCompositeCells(TileID _primary, int zt, const std::shared_ptr<Texture>& _ownTexture,
+                                        const uint8_t* _cellZoomCaps, std::vector<OverzoomCell>& cells) {
+    int levels = zt - _primary.z;
+    int N = 1 << levels;
+    int32_t baseX = _primary.x << levels;
+    int32_t baseY = _primary.y << levels;
+
     auto cellTargetZoom = [&](int row, int col) -> int {
         if (!_cellZoomCaps) { return zt; }
         int cap = int(_cellZoomCaps[size_t(row) * size_t(N) + size_t(col)]);
         return std::max<int>(_primary.z, std::min<int>(zt, cap));
     };
-
-    // Cheap per-cell fingerprint of what the stitch below would actually use: the cell's
-    // target zoom AND whether real data at that zoom is cached right now. Drives the
-    // rebuild-vs-reuse decision without walking the full ancestor chain or re-stitching when
-    // nothing has actually changed since the last call -- this is what keeps calling this
-    // function every update (TileManager::upgradeAttachedRasters does) cheap in the steady
-    // state. Folding the target zoom in means a displayed-zoom flip (either direction)
-    // changes the signature and triggers exactly one re-stitch.
-    uint64_t signature = 1469598103934665603ull;  // FNV-1a offset basis
-    for (int row = 0; row < N; row++) {
-        for (int col = 0; col < N; col++) {
-            int zc = cellTargetZoom(row, col);
-            int dl = zt - zc;
-            auto tex = getTexture(TileID((baseX + col) >> dl, (baseY + row) >> dl, zc));
-            uint64_t v = (uint64_t(zc) << 1) | ((tex && tex->bufferData()) ? 1u : 0u);
-            signature = (signature ^ v) * 1099511628211ull;  // FNV-1a prime
-        }
-    }
-
-    auto existingIt = m_overzoomMosaics.find(key);
-    if (existingIt != m_overzoomMosaics.end()) {
-        auto* info = existingIt->second->userData
-            ? static_cast<ElevationMosaicInfo*>(existingIt->second->userData.get()) : nullptr;
-        if (info && info->coverageSignature == signature) { return existingIt->second; }
-        // else: more (or, if a tile was evicted, less) real data is cached now -- rebuild below.
-    }
 
     // Per zt-grid cell (independently -- this is the fix for intra-footprint zoom variation, see
     // docs/terrain-illumination-plan.md "triangle-PL upsampling"): use real data at the cell's
@@ -1107,7 +1188,7 @@ std::shared_ptr<Texture> RasterSource::buildOverzoomElevationMosaic(TileID _prim
     // starts at za == zt, dl == 0 and the block geometry degenerates to the single exact cell.
     // Deliberately cache-only (docs/terrain-illumination-plan.md): no new fetch is triggered
     // even when a cell's real data isn't cached yet.
-    std::vector<OverzoomCell> cells(size_t(N) * size_t(N));
+    cells.assign(size_t(N) * size_t(N), OverzoomCell());
     for (int row = 0; row < N; row++) {
         for (int col = 0; col < N; col++) {
             OverzoomCell& cell = cells[size_t(row) * size_t(N) + size_t(col)];
@@ -1135,8 +1216,36 @@ std::shared_ptr<Texture> RasterSource::buildOverzoomElevationMosaic(TileID _prim
             }
         }
     }
+}
 
-    auto composite = stitchElevationOverzoomMosaic(_ownTexture, cells, N);
+std::shared_ptr<Texture> RasterSource::buildOverzoomElevationMosaic(TileID _primary, const std::shared_ptr<Texture>& _ownTexture,
+                                                                    const uint8_t* _cellZoomCaps) {
+    if (!_ownTexture || !_ownTexture->bufferData() || !m_keepTextureData) { return nullptr; }
+
+    int zt = overzoomTargetZoom(_primary);
+    if (zt <= _primary.z) { return nullptr; }  // not overzoomed enough to be worth compensating
+
+    PROFILE_SCOPE(Profiler::intern("buildOverzoomElevationMosaic:" + name()));
+
+    int levels = zt - _primary.z;
+    int N = 1 << levels;
+    TileID key(_primary.x, _primary.y, _primary.z, zt);
+    const int refZoom = terrainMeshRefZoom();
+
+    uint64_t signature = compositeSignature(_primary, zt, _cellZoomCaps, refZoom);
+
+    auto existingIt = m_overzoomMosaics.find(key);
+    if (existingIt != m_overzoomMosaics.end()) {
+        auto* info = existingIt->second->userData
+            ? static_cast<ElevationMosaicInfo*>(existingIt->second->userData.get()) : nullptr;
+        if (info && info->coverageSignature == signature) { return existingIt->second; }
+        // else: more (or, if a tile was evicted, less) real data is cached now -- rebuild below.
+    }
+
+    std::vector<OverzoomCell> cells;
+    gatherCompositeCells(_primary, zt, _ownTexture, _cellZoomCaps, cells);
+
+    auto composite = stitchElevationOverzoomMosaic(_ownTexture, cells, N, _primary.z, refZoom);
     if (!composite) { return nullptr; }
 
     // Keep the plain texture alive for future rebuilds once the styling zoom flips (see
@@ -1156,6 +1265,232 @@ std::shared_ptr<Texture> RasterSource::buildOverzoomElevationMosaic(TileID _prim
          _primary.toString().c_str(), key.toString().c_str(), composite->width(), composite->height(),
          zt, N * N, _cellZoomCaps ? "display-capped" : "uncapped", (unsigned long long)signature);
     return composite;
+}
+
+// ---- Asynchronous upgrade path ---------------------------------------------------------------
+
+struct RasterSource::StitchJob {
+    TileID id{0, 0, 0};       // (x, y, z) mosaic key
+    TileID primary{0, 0, 0};  // live primary (carries s)
+    int zt = 0;
+    int N = 1;
+    int refZoom = 100;        // adaptive terrain mesh reference zoom the lattice was built for
+    uint64_t signature = 0;
+    std::shared_ptr<Texture> plain;
+    std::vector<OverzoomCell> cells;
+    // Same-zoom neighbors as buildElevationMosaic() would have gathered them for a
+    // composite-centered mosaic (neighbor composite when registered, else plain texture).
+    std::array<std::shared_ptr<Texture>, 9> neighbors;
+    // outputs
+    std::shared_ptr<Texture> composite;
+    std::shared_ptr<Texture> mosaic;
+    float rugosity = 0.f;
+    uint16_t neighborMask = 0;
+};
+
+RasterSource::~RasterSource() {
+    if (m_stitchThread.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(m_stitchMutex);
+            m_stitchStop = true;
+        }
+        m_stitchCv.notify_all();
+        m_stitchThread.join();
+    }
+}
+
+void RasterSource::startStitchWorker() {
+    if (m_stitchThread.joinable()) { return; }
+    m_stitchThread = std::thread([this]() { stitchWorkerLoop(); });
+}
+
+void RasterSource::stitchWorkerLoop() {
+    setCurrentThreadPriority(10);
+    while (true) {
+        std::unique_ptr<StitchJob> job;
+        {
+            std::unique_lock<std::mutex> lock(m_stitchMutex);
+            m_stitchCv.wait(lock, [&]() { return m_stitchStop || !m_stitchQueue.empty(); });
+            if (m_stitchStop) { return; }
+            job = std::move(m_stitchQueue.front());
+            m_stitchQueue.pop_front();
+        }
+
+        {
+            PROFILE_SCOPE("stitchJob");
+            job->composite = stitchElevationOverzoomMosaic(job->plain, job->cells, job->N, job->primary.z, job->refZoom);
+            if (job->composite) {
+                auto info = std::make_shared<ElevationMosaicInfo>();
+                info->plainTexture = job->plain;
+                info->compositeZoom = job->zt;
+                info->coverageSignature = job->signature;
+                job->composite->userData = std::move(info);
+
+                int W = job->composite->width();
+                int bpp = job->composite->getOptions().bytesPerPixel();
+                for (size_t i = 0; i < 9; i++) {
+                    if (i == 4) { continue; }
+                    auto& nb = job->neighbors[i];
+                    if (nb && nb->bufferData() && nb->width() == W && nb->height() == W &&
+                        nb->getOptions().bytesPerPixel() == bpp) {
+                        job->neighborMask |= uint16_t(1u << i);
+                    }
+                }
+                job->mosaic = stitchElevationMosaic(job->composite, job->neighbors);
+                job->rugosity = computeRugosity(*job->composite, job->id);
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(m_stitchMutex);
+            m_stitchDone.push_back(std::move(job));
+        }
+    }
+}
+
+std::shared_ptr<Texture> RasterSource::requestElevationMosaic(TileID _live, const std::shared_ptr<Texture>& _plain,
+                                                              const uint8_t* _caps) {
+    if (!m_asyncStitch || !m_buildElevationMosaic) {
+        return buildElevationMosaic(_live, _plain, _caps);
+    }
+    TileID id(_live.x, _live.y, _live.z);
+    auto existing = getExistingMosaic(id);
+    if (!existing || !_plain || !_plain->bufferData() || !m_keepTextureData) {
+        // Nothing registered (or nothing to stitch from): the synchronous path owns correctness.
+        return buildElevationMosaic(_live, _plain, _caps);
+    }
+
+    int zt = overzoomTargetZoom(_live);
+    if (zt <= _live.z) { return existing; }
+
+    TileID key(_live.x, _live.y, _live.z, zt);
+    const int refZoom = terrainMeshRefZoom();
+    uint64_t signature = compositeSignature(_live, zt, _caps, refZoom);
+
+    auto* einfo = existing->userData ? static_cast<ElevationMosaicInfo*>(existing->userData.get()) : nullptr;
+    auto compIt = m_overzoomMosaics.find(key);
+    if (compIt != m_overzoomMosaics.end() && einfo && einfo->ownTexture == compIt->second) {
+        auto* cinfo = compIt->second->userData
+            ? static_cast<ElevationMosaicInfo*>(compIt->second->userData.get()) : nullptr;
+        if (cinfo && cinfo->coverageSignature == signature) {
+            Profiler::counterAdd("mosaicCacheHit", 1);
+            return existing;  // up to date
+        }
+    }
+
+    if (m_stitchInFlight.count(id)) { return existing; }
+
+    // Per-tile debounce: coverage typically improves cell by cell over a few frames; rebuilding
+    // for every single arrival multiplies the work (and the upload) by the cell count.
+    constexpr double kRebuildDebounceSeconds = 0.15;
+    if (einfo && einfo->builtTime > 0.0 && (nowSeconds() - einfo->builtTime) < kRebuildDebounceSeconds) {
+        return existing;
+    }
+
+    auto job = std::make_unique<StitchJob>();
+    job->id = id;
+    job->primary = _live;
+    job->zt = zt;
+    job->N = 1 << (zt - _live.z);
+    job->signature = signature;
+    job->refZoom = refZoom;
+    job->plain = _plain;
+    gatherCompositeCells(_live, zt, _plain, _caps, job->cells);
+
+    int32_t max = 1 << _live.z;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) { continue; }
+            int32_t ny = _live.y + dy;
+            if (ny < 0 || ny >= max) { continue; }
+            int32_t nx = ((_live.x + dx) % max + max) % max;
+            std::shared_ptr<Texture> nb = getTexture(TileID(nx, ny, _live.z));
+            if (auto nbc = getExistingOverzoomMosaic(TileID(nx, ny, _live.z, zt))) { nb = nbc; }
+            job->neighbors[size_t(dy + 1) * 3 + size_t(dx + 1)] = nb;
+        }
+    }
+
+    Profiler::counterAdd("mosaicAsyncSubmit", 1);
+    startStitchWorker();
+    {
+        std::lock_guard<std::mutex> lock(m_stitchMutex);
+        m_stitchInFlight.insert(id);
+        m_stitchQueue.push_back(std::move(job));
+    }
+    m_stitchCv.notify_one();
+    return existing;
+}
+
+void RasterSource::pumpStitchResults(size_t _byteBudget) {
+    if (!m_asyncStitch) { return; }
+    PROFILE_SCOPE(Profiler::intern("pumpStitchResults:" + name()));
+
+    size_t published = 0;
+    int count = 0;
+    while (true) {
+        std::unique_ptr<StitchJob> job;
+        {
+            std::lock_guard<std::mutex> lock(m_stitchMutex);
+            if (m_stitchDone.empty()) { break; }
+            // Always publish at least one; afterwards stop once the byte budget is spent.
+            if (count > 0 && published >= _byteBudget) { break; }
+            job = std::move(m_stitchDone.front());
+            m_stitchDone.pop_front();
+            m_stitchInFlight.erase(job->id);
+        }
+        count++;
+        if (!job->composite || !job->mosaic) { continue; }
+
+        auto& mosaic = job->mosaic;
+        published += mosaic->bufferSize();
+
+        pruneOverzoomMosaicsIfNeeded();
+        m_overzoomMosaics[TileID(job->primary.x, job->primary.y, job->primary.z, job->zt)] = job->composite;
+
+        auto info = std::make_shared<ElevationMosaicInfo>();
+        info->ownTexture = job->composite;
+        info->plainTexture = job->plain;
+        info->rugosity = job->rugosity;
+        info->compositeZoom = job->zt;
+        info->neighborMask = job->neighborMask;
+        info->builtTime = nowSeconds();
+        for (size_t i = 0; i < 9; i++) {
+            if (job->neighborMask & (1u << i)) { info->neighborTextures[i] = job->neighbors[i]; }
+        }
+
+        // Neighbors that arrived while the stitch was running were not in the snapshot and
+        // patchNeighborMosaics() had no registered mosaic to patch: copy their cells in now so
+        // the transient mirror placeholder doesn't become permanent.
+        int W = job->plain->width();
+        int Wp = W - W % 2;
+        int bpp = job->plain->getOptions().bytesPerPixel();
+        int32_t max = 1 << job->id.z;
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                if (dx == 0 && dy == 0) { continue; }
+                size_t idx = size_t(dy + 1) * 3 + size_t(dx + 1);
+                if (info->neighborMask & (1u << idx)) { continue; }
+                int32_t ny = job->id.y + dy;
+                if (ny < 0 || ny >= max) { continue; }
+                int32_t nx = ((job->id.x + dx) % max + max) % max;
+                auto nb = getTexture(TileID(nx, ny, job->id.z));
+                if (!nb || !nb->bufferData() || nb->width() != W || nb->height() != W ||
+                    nb->getOptions().bytesPerPixel() != bpp) { continue; }
+                if (mosaic->width() != Wp + 2 * mosaicMargin(Wp) || !mosaic->bufferData()) { continue; }
+                copyMosaicCell(mosaic->bufferData(), Wp, W, bpp, dx, dy, nb->bufferData());
+                info->neighborMask |= uint16_t(1u << idx);
+                info->neighborTextures[idx] = nb;
+            }
+        }
+
+        mosaic->userData = std::move(info);
+        for (auto it = m_mosaics.begin(); it != m_mosaics.end();) {
+            it = it->second.expired() ? m_mosaics.erase(it) : std::next(it);
+        }
+        m_mosaics[job->id] = mosaic;
+        Profiler::counterAdd("mosaicAsyncPublished", 1);
+    }
+    if (count > 0) { Profiler::counterAdd("mosaicAsyncPublishedKB", double(published) / 1024.0); }
 }
 
 float RasterSource::aggregateRugosity() {
@@ -1197,7 +1532,7 @@ void RasterSource::patchNeighborMosaics(const TileID& _tileId, const std::shared
             if (!mosaic) { m_mosaics.erase(mosaicIt); continue; }
 
             int Wp = W - W % 2;
-            if (!mosaic->bufferData() || mosaic->width() != 3 * Wp ||
+            if (!mosaic->bufferData() || mosaic->width() != Wp + 2 * mosaicMargin(Wp) ||
                 mosaic->getOptions().bytesPerPixel() != bpp) { continue; }
 
             // The new tile sits at grid offset (-dx, -dy) relative to the neighboring tile

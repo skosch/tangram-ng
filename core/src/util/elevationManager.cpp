@@ -59,7 +59,7 @@ public:
       setupTileShaderUniforms(rs, _tile, *m_shaderProgram, m_mainUniforms);
       m_shaderProgram->setUniformf(rs, m_uOrder, 0.f);
 
-      bool styleMeshDrawn = rasterMesh()->draw(rs, *m_shaderProgram);
+      bool styleMeshDrawn = rasterMeshFor(_tile.getID().z, 0)->draw(rs, *m_shaderProgram);
       if (!styleMeshDrawn) {
           LOGN("Mesh built by style %s cannot be drawn", m_name.c_str());
       }
@@ -150,12 +150,96 @@ bool ElevationManager::hasTile(TileID tileId)
   return ok;
 }
 
+// C++14: odr-used static constexpr members need an out-of-class definition.
+constexpr int ElevationManager::kDemTiers;
+constexpr int ElevationManager::kDemOctants;
+constexpr float ElevationManager::kDemTierLo[];
+
+namespace {
+// Cached on the elevation Texture's userData (see ElevationManager::getMinMaxElev).
+struct ElevTexInfo {
+  uint32_t magic = 0xE1E7E1E7u;  // != kElevationMosaicInfoMagic (data/rasterSource.h)
+  float min, max;
+  float lapRms;
+  ElevationManager::DemFacingStats facing;
+};
+
+// Gradient-azimuth octant, centered on the axes (0 = +x, 1 = +x+y, 2 = +y, ... counter-
+// clockwise), without atan2.
+inline int gradOctant(float gx, float gy)
+{
+  float ax = std::fabs(gx), ay = std::fabs(gy);
+  if(ay <= 0.41421356f*ax) { return gx >= 0 ? 0 : 4; }
+  if(ax <= 0.41421356f*ay) { return gy >= 0 ? 2 : 6; }
+  if(gx >= 0) { return gy >= 0 ? 1 : 7; }
+  return gy >= 0 ? 3 : 5;
+}
+
+ElevTexInfo* elevTexInfo(Texture& tex, TileID id)
+{
+  if(!tex.userData) {
+    auto infoPtr = std::make_shared<ElevTexInfo>();
+    ElevTexInfo& info = *infoPtr;
+    info.min = FLT_MAX; info.max = -FLT_MAX; info.lapRms = 0;
+    const int w = tex.width(), h = tex.height();
+    const size_t npix = size_t(w)*h;
+    const bool isFloat = tex.getOptions().pixelFormat == PixelFormat::FLOAT;
+    const float* fbuf = isFloat ? (const float*)tex.bufferData() : nullptr;
+    const uint8_t* bbuf = isFloat ? nullptr : tex.bufferData();
+    auto at = [&](size_t i) -> float {
+      if(isFloat) { return fbuf[i]; }
+      const uint8_t* p = &bbuf[i*4];
+      return (p[0]*256 + p[1] + p[2]/256.0f) - 32768;
+    };
+    for(size_t ii = 0; ii < npix; ++ii) {
+      float e = at(ii);
+      info.min = std::min(e, info.min);
+      info.max = std::max(e, info.max);
+    }
+    if(w > 2 && h > 2) {
+      // true ground size of one texel (256 texels span a tile; node-registered 257-wide tiles)
+      LngLat ll = MapProjection::projectedMetersToLngLat(MapProjection::tileCenter(id));
+      double cosLat = std::cos(ll.latitude*M_PI/180.0);
+      double texM = MapProjection::metersPerTileAtZoom(id.z)*cosLat/double(w - (w % 2));
+      info.facing.texelMeters = float(texM);
+      info.facing.texels = uint32_t((w - 2)*(h - 2));
+      const float invH = float(1.0/texM);
+      const float invH2 = 0.5f*invH;
+      double sum = 0;
+      for(int y = 1; y < h - 1; ++y) {
+        for(int x = 1; x < w - 1; ++x) {
+          size_t i = size_t(y)*w + x;
+          float l = 4*at(i) - at(i - 1) - at(i + 1) - at(i - w) - at(i + w);
+          sum += double(l)*l;
+          float q = std::fabs(l)*invH;
+          if(q >= ElevationManager::kDemTierLo[0]) {
+            int t = 0;
+            while(t + 1 < ElevationManager::kDemTiers && q >= ElevationManager::kDemTierLo[t + 1]) { ++t; }
+            // rows run south -> north, columns west -> east (= world +y, +x)
+            float gx = (at(i + 1) - at(i - 1))*invH2;
+            float gy = (at(i + w) - at(i - w))*invH2;
+            int o = gradOctant(gx, gy);
+            info.facing.cnt[t][o]++;
+            info.facing.sgx[t][o] += gx;
+            info.facing.sgy[t][o] += gy;
+          }
+        }
+      }
+      info.lapRms = float(std::sqrt(sum / (double(w - 2)*(h - 2))));
+    }
+    tex.userData = infoPtr;
+  }
+  return static_cast<ElevTexInfo*>(tex.userData.get());
+}
+}  // namespace
+
+void ElevationManager::precomputeTileInfo(Texture& tex, TileID id)
+{
+  if(tex.bufferData()) { elevTexInfo(tex, TileID(id.x, id.y, id.z)); }
+}
+
 glm::vec2 ElevationManager::getMinMaxElev(TileID tileId, int ancestors)
 {
-  struct ElevTexInfo {
-    float min, max;
-  };
-
   while(tileId.z > m_elevationSource->zoomOptions().maxZoom) { tileId = tileId.getParent(); }
   auto tex = m_elevationSource->getTexture(tileId);
   while(!tex && (tileId.z > 14 || (ancestors-- > 0 && tileId.z > 1))) {
@@ -164,29 +248,27 @@ glm::vec2 ElevationManager::getMinMaxElev(TileID tileId, int ancestors)
   }
   if(!tex) { return {0, 9000}; }
 
-  if(!tex->userData) {
-    ElevTexInfo info = {FLT_MAX, -FLT_MAX};
-    size_t npix = tex->width()*tex->height();
-    if(tex->getOptions().pixelFormat == PixelFormat::FLOAT) {
-      float* texbuff = (float*)tex->bufferData();
-      for(size_t ii = 0; ii < npix; ++ii) {
-        info.min = std::min(texbuff[ii], info.min);
-        info.max = std::max(texbuff[ii], info.max);
-      }
-    }
-    else {
-      uint8_t* texbuff = tex->bufferData();
-      for(size_t ii = 0; ii < npix; ++ii) {
-        uint8_t* p = &texbuff[ii*4];
-        float elev = (p[0]*256 + p[1] + p[2]/256.0f) - 32768;
-        info.min = std::min(elev, info.min);
-        info.max = std::max(elev, info.max);
-      }
-    }
-    tex->userData = std::make_shared<ElevTexInfo>(info);
-  }
-  auto* info = static_cast<ElevTexInfo*>(tex->userData.get());
+  auto* info = elevTexInfo(*tex, tileId);
   return {info->min, info->max};
+}
+
+ElevationManager::TerrainDetail ElevationManager::getTerrainDetail(TileID tileId)
+{
+  while(tileId.z > m_elevationSource->zoomOptions().maxZoom) { tileId = tileId.getParent(); }
+  auto tex = m_elevationSource->getTexture(tileId);
+  if(!tex) { return {}; }
+  auto* info = elevTexInfo(*tex, tileId);
+  TerrainDetail d;
+  d.relief = info->max - info->min;
+  d.lapRms = info->lapRms;
+  d.valid = true;
+  d.facing = info->facing.texels > 0 ? &info->facing : nullptr;
+  return d;
+}
+
+int32_t ElevationManager::elevationSourceId() const
+{
+  return m_elevationSource ? m_elevationSource->id() : -1;
 }
 
 void ElevationManager::renderTerrainDepth(RenderState& _rs, const View& _view,
@@ -284,6 +366,48 @@ float ElevationManager::getDepth(glm::vec2 screenpos)
   if(pos.x < 0 || pos.y < 0 || pos.x >= d.w || pos.y >= d.h) { return 0; }
   //return 2*depth[int(pos.x) + int(h - pos.y - 1)*w] - 1;  // convert from 0..1 (glDepthRange) to -1..1 (NDC)
   return m_depthData[0].depth[int(pos.x) + int(d.h - pos.y - 1)*d.w];
+}
+
+bool ElevationManager::isBoxOccluded(glm::dvec2 lo, glm::dvec2 hi, float zMin, float zMax)
+{
+  auto& d = m_depthData[0];
+  if(d.depth.empty() || d.w <= 0 || d.h <= 0 || d.viewProj == glm::mat4(0)) { return false; }
+
+  // corners relative to the camera position the depth pass was rendered from (same convention
+  // as the label code: model translation = origin - viewPos, absolute elevation)
+  glm::dvec2 c = MapProjection::wrapProjectedMeters(0.5*(lo + hi) - d.viewPos);
+  glm::dvec2 half = 0.5*(hi - lo);
+  float minW = FLT_MAX;
+  float sx0 = FLT_MAX, sy0 = FLT_MAX, sx1 = -FLT_MAX, sy1 = -FLT_MAX;
+  for(int i = 0; i < 8; ++i) {
+    glm::vec4 p(float(c.x + ((i & 1) ? half.x : -half.x)),
+                float(c.y + ((i & 2) ? half.y : -half.y)),
+                (i & 4) ? zMax : zMin, 1.f);
+    glm::vec4 clip = d.viewProj*p;
+    if(!(clip.w > 1e-3f)) { return false; }   // reaches the camera plane: don't claim occlusion
+    minW = std::min(minW, clip.w);
+    float sx = (clip.x/clip.w*0.5f + 0.5f)*float(d.w);
+    float sy = (clip.y/clip.w*0.5f + 0.5f)*float(d.h);   // GL row order (0 = bottom), as stored
+    sx0 = std::min(sx0, sx); sx1 = std::max(sx1, sx);
+    sy0 = std::min(sy0, sy); sy1 = std::max(sy1, sy);
+  }
+  if(sx1 < 0 || sy1 < 0 || sx0 >= d.w || sy0 >= d.h) { return false; }  // off-screen: not our call
+  sx0 = std::max(sx0, 0.f); sy0 = std::max(sy0, 0.f);
+  sx1 = std::min(sx1, float(d.w - 1)); sy1 = std::min(sy1, float(d.h - 1));
+
+  // margin: depth buffer was rendered from last frame's camera and coarser terrain
+  const float limit = minW*0.97f - 5.f;
+  if(limit <= 0.f) { return false; }
+  const int kN = 6;
+  for(int j = 0; j < kN; ++j) {
+    int py = int(sy0 + (sy1 - sy0)*float(j)/float(kN - 1));
+    for(int i = 0; i < kN; ++i) {
+      int px = int(sx0 + (sx1 - sx0)*float(i)/float(kN - 1));
+      float z = d.depth[size_t(py)*size_t(d.w) + size_t(px)];
+      if(!(z > 0.f && z < limit)) { return false; }  // sky / no data / not nearer: visible
+    }
+  }
+  return true;
 }
 
 void ElevationManager::drawDepthDebug(RenderState& _rs, const View& _view)

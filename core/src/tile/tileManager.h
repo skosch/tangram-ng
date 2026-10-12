@@ -53,7 +53,14 @@ public:
     /* Returns the set of currently visible tiles */
     const auto& getVisibleTiles() const { return m_tiles; }
 
-    int numLoadingTiles() const { return m_tilesInProgress; }
+    // A deferred raster upgrade (see m_upgradeSpentMs) counts as loading so the app keeps
+    //  rendering frames until the backlog drains, like an in-flight tile does.
+    // True when work was deferred by a per-update budget (upgrade/churn caps) or finished
+    // background stitches await publishing: the app should render another frame even if nothing
+    // else (input, animation, a completing tile) would trigger one -- otherwise deferred work only
+    // advances on idle timer ticks (~1 Hz) and the view refines in slow motion.
+    bool needsFollowUpFrame() const { return m_upgradesDeferred || m_stitchesPending || m_demDeferred; }
+    int numLoadingTiles() const { return m_tilesInProgress + ((m_upgradesDeferred || m_stitchesPending) ? 1 : 0); }
     int numTotalTiles() const;
 
     std::shared_ptr<TileSource> getTileSource(int32_t _sourceId);
@@ -179,6 +186,32 @@ protected:
     // handful of RasterSources. Cache keyed by RasterSource*, populated lazily on first use each
     // pass and cleared at the top of updateTileSets() below.
     std::unordered_map<RasterSource*, std::pair<std::set<TileID>, std::set<TileID>>> m_upgradeRasterCache;
+
+    // Perf (2026-10-10, real traces: single-frame main-thread stalls of 2.0-2.9 s): upgradeAttachedRasters()
+    // does real elevation mosaic / overzoom-composite stitches (up to ~150 ms each, 39-248 in
+    // one frame after a zoom change) with no cap - the addRaster() path has m_stitchBudget but
+    // this one never did. Wall-clock budget per updateTileSets() pass: once spent, remaining
+    // tiles keep their current raster and are retried next update (the function is already
+    // designed to be re-entered every update; it just delays WHEN a refinement lands by a few
+    // frames, spreading the work instead of one multi-second hitch).
+    double m_upgradeSpentMs = 0.0;
+    bool m_upgradesDeferred = false;
+    // Background elevation stitches queued/running/unpublished (RasterSource::hasPendingStitches).
+    bool m_stitchesPending = false;
+    // Saliency promotions denied by the per-frame churn cap this update (need another update).
+    bool m_demDeferred = false;
+    // Elevation nodes (x,y,z) the saliency rule refined last / this traversal: hysteresis so a
+    // node already refined only coarsens again once its mass falls to half the refine threshold
+    // (otherwise nodes sitting at the threshold flip every update, each flip a tile fetch +
+    // mosaic stitch + upload).
+    std::set<TileID> m_demRefinedPrev, m_demRefinedCur;
+    // experimental saliency DEM LOD state (tileManager.cpp DemLodConfig)
+    float m_demTauScale = 1.f;
+    int m_demLeaves = 0;
+    int m_demSalientRefines = 0;
+    int m_demNewThisFrame = 0;
+    int m_upgradeCallsThisPass = 0;   // calls made in the current update pass
+    double m_upgradeCallEmaMs = 0.0;  // EMA of real upgrade-call cost, see upgradeAttachedRasters
 
     // UX diagnosis (2026-07-11): a user report of non-monotonic detail (fine -> smoother ->
     // fine again on a single mountainside while panning) can't be explained by the `s`-staircase

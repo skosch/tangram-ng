@@ -13,26 +13,29 @@
 namespace Tangram {
 
 class RenderTexture : public Texture {
-    static constexpr TextureOptions textureOptions(GLenum _pixelFormat) {
+    static constexpr TextureOptions textureOptions(GLenum _pixelFormat, bool _linear) {
         TextureOptions options;
         options.pixelFormat = PixelFormat(_pixelFormat);
-        options.minFilter = TextureMinFilter::NEAREST;
-        options.magFilter = TextureMagFilter::NEAREST;
+        options.minFilter = _linear ? TextureMinFilter::LINEAR : TextureMinFilter::NEAREST;
+        options.magFilter = _linear ? TextureMagFilter::LINEAR : TextureMagFilter::NEAREST;
         return options;
     }
 public:
-    RenderTexture(int width, int height, GLenum _pixelFormat)
-        : Texture(textureOptions(_pixelFormat)) {
+    RenderTexture(int width, int height, GLenum _pixelFormat, bool _linear = false)
+        : Texture(textureOptions(_pixelFormat, _linear)) {
         resize(width, height);
     }
     GLuint glHandle() const { return m_glHandle; }
 };
 
-FrameBuffer::FrameBuffer(int _width, int _height, bool _colorRenderBuffer, GLenum _pixelFormat) :
+FrameBuffer::FrameBuffer(int _width, int _height, bool _colorRenderBuffer, GLenum _pixelFormat,
+                         GLenum _depthFormat, bool _linearFilter) :
     m_glFrameBufferHandle(0),
     m_glDepthRenderBufferHandle(0),
     m_glColorRenderBufferHandle(0),
     m_pixelFormat(_pixelFormat),
+    m_depthFormat(_depthFormat),
+    m_linearFilter(_linearFilter),
     m_valid(false),
     m_colorRenderBuffer(_colorRenderBuffer),
     m_width(_width), m_height(_height) {
@@ -161,7 +164,7 @@ void FrameBuffer::init(RenderState& _rs) {
         GL::framebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                     GL_RENDERBUFFER, m_glColorRenderBufferHandle);
     } else {
-        m_texture = std::make_unique<RenderTexture>(m_width, m_height, m_pixelFormat);
+        m_texture = std::make_unique<RenderTexture>(m_width, m_height, m_pixelFormat, m_linearFilter);
         m_texture->bind(_rs, 0);
         GL::framebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                  GL_TEXTURE_2D, m_texture->glHandle(), 0);
@@ -170,7 +173,7 @@ void FrameBuffer::init(RenderState& _rs) {
     // Create depth render buffer
     GL::genRenderbuffers(1, &m_glDepthRenderBufferHandle);
     GL::bindRenderbuffer(GL_RENDERBUFFER, m_glDepthRenderBufferHandle);
-    GL::renderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, m_width, m_height);
+    GL::renderbufferStorage(GL_RENDERBUFFER, m_depthFormat, m_width, m_height);
     GL::framebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
                                 GL_RENDERBUFFER, m_glDepthRenderBufferHandle);
 
@@ -188,6 +191,14 @@ void FrameBuffer::init(RenderState& _rs) {
 FrameBuffer::~FrameBuffer() {
     if (m_rs) {
         m_rs->queueFramebufferDeletion(m_glFrameBufferHandle);
+    }
+}
+
+void FrameBuffer::drawFullscreen(RenderState& _rs, glm::vec2 _dim) {
+    if (m_texture) {
+        _rs.blending(GL_FALSE);
+        _rs.culling(GL_FALSE);
+        Primitives::drawTexture(_rs, *m_texture, glm::vec2{}, _dim);
     }
 }
 

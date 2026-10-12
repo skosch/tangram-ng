@@ -110,6 +110,14 @@ public:
 
     GLuint defaultFrameBuffer() const;
 
+    // Dynamic resolution: while the scene is rendered into a scaled offscreen target (Map::render),
+    // that target stands in for the default framebuffer (defaultFrameBuffer() returns it, so the
+    // halo background snapshot and offscreen-pass restores keep working) and renderScale() is
+    // the scene-render resolution factor (1 = full resolution).
+    void setDefaultFramebufferOverride(GLuint handle) { m_defaultFramebufferOverride = handle; }
+    float renderScale() const { return m_renderScale; }
+    void setRenderScale(float scale) { m_renderScale = scale; }
+
     GLuint getQuadIndexBuffer();
 
     void flushResourceDeletion();
@@ -246,6 +254,8 @@ private:
     } m_viewport;
 
     GLint m_defaultFramebuffer = 0;
+    GLuint m_defaultFramebufferOverride = 0;
+    float m_renderScale = 1.f;
 
 };
 

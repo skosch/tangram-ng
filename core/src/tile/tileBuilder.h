@@ -35,6 +35,11 @@ public:
 private:
 
     // Determine and apply DrawRules for a @_feature
+    // Profiling-only per-build accumulators (TileBuilder is single-threaded per worker).
+    bool m_profOn = false;
+    uint32_t m_profFeatures = 0, m_profMatched = 0;
+    double m_profMatchMs = 0, m_profAddMs = 0;
+
     void applyStyling(const Feature& _feature, const SceneLayer& _layer);
 
     const Scene& m_scene;

@@ -7,13 +7,27 @@
 #include "util/mapProjection.h"
 
 #include <array>
+#include <condition_variable>
+#include <deque>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <set>
+#include <thread>
 
 namespace Tangram {
 
 class RasterTileTask;
+
+// Neighbor-ring margin of an elevation mosaic as a fraction of the tile's own cell width Wp.
+// 1.0 (default) is the classic 3Wp x 3Wp layout (a full cell per neighbor); 0.5 / 0.25 / 0.125
+// keep only a margin strip of that width around the tile, so the mosaic is (1+2k)Wp square:
+// k = 0.25 is 2.25^2/9 = 4x fewer bytes to stitch, upload and keep resident. Reach of shadow
+// marching and the coarsest texture-shading bands shrinks to k tile widths. Read once from
+// ASCEND_MOSAIC_MARGIN and snapped to a power of two (so mip chains halve evenly). The shader
+// side receives the same value as global.elevation_mosaic_span = 1 + 2k (see mapsapp.cpp).
+float elevationMosaicMarginFrac();
 
 // Combine a tile's own WxW texture with (up to) 8 neighbor textures (same zoom: N, S, E, W,
 // NE, NW, SE, SW) into a single padded 3Wp x 3Wp "mosaic" texture (Wp = W - overlap, see
@@ -115,15 +129,24 @@ struct OverzoomCell {
 //
 // Returns nullptr if `own` has no CPU-side buffer data, isn't square, `cells.size()` != N * N,
 // or N <= 1.
+//
+// ownZoom/refZoom: with ownZoom >= 0 the PL upsampling uses each ancestor's ADAPTIVE terrain mesh
+// density (terrainMeshCellsAt, util/builders.h; the composite targets ownZoom + log2(N));
+// ownZoom < 0 keeps the legacy fixed 64-cell lattice (unit tests).
 std::shared_ptr<Texture> stitchElevationOverzoomMosaic(const std::shared_ptr<Texture>& own,
                                                         const std::vector<OverzoomCell>& cells,
-                                                        int N);
+                                                        int N, int ownZoom = -1, int refZoom = 100);
 
 // Attached via Texture::userData to every 3Wp neighbor-ring mosaic (m_mosaics, built by
 // RasterSource::buildElevationMosaic) AND to every overzoom composite (m_overzoomMosaics, built
 // by RasterSource::buildOverzoomElevationMosaic). `ownTexture == nullptr` distinguishes the two:
 // null marks the texture as being a composite itself.
+// First member of ElevationMosaicInfo: lets code that only has a Texture::userData pointer tell
+// it apart from the ElevTexInfo that plain elevation tiles carry (util/elevationManager.cpp).
+constexpr uint32_t kElevationMosaicInfoMagic = 0xE1E7A5A1u;
+
 struct ElevationMosaicInfo {
+    uint32_t magic = kElevationMosaicInfoMagic;
     // Mosaics only (null on a composite's own info): the center-cell texture actually used
     // (plain per-tile texture or an overzoom composite), kept alive for as long as the mosaic
     // lives: m_textures only holds weak refs and Tiles reference the mosaic instead of the
@@ -184,6 +207,9 @@ struct ElevationMosaicInfo {
     // or this has gone stale too long, so several neighbor arrivals in quick succession
     // collapse into one re-upload instead of one each (tile-pipeline-perf-plan.md R2).
     double firstDirtyTime = 0.0;
+    // Mosaics only: steady_clock seconds this mosaic was published (sync build or async job
+    // completion). Drives the per-tile rebuild debounce of RasterSource::requestElevationMosaic().
+    double builtTime = 0.0;
 };
 
 // All 8 neighbor bits set (see ElevationMosaicInfo::neighborMask), i.e. every neighbor cell
@@ -286,6 +312,33 @@ class RasterSource : public TileSource {
         --m_uploadBudget;
         return true;
     }
+
+    // ---- Asynchronous mosaic/composite upgrades (2026-10-11) -------------------------------
+    // Stitching a composite-centered mosaic is 5-60 ms of memcpy/lattice math on the main
+    // thread (and up to 38 MB of texture). Upgrades of an ALREADY-ATTACHED raster (composite
+    // coverage improving as finer tiles stream in, display-zoom flips) don't need to be
+    // synchronous: the old mosaic stays valid and bound until the new one is ready. Those go
+    // through requestElevationMosaic(), which snapshots the immutable inputs (shared_ptr<Texture>
+    // CPU buffers) and hands the stitch to one low-priority worker thread; pumpStitchResults()
+    // then publishes finished mosaics on the main thread under a per-update byte budget, which
+    // also paces their GPU upload. The initial attachment (RasterTileTask::addRaster) stays
+    // synchronous: a tile must never bind a texture whose layout isn't the mosaic's.
+    struct StitchJob;
+    bool m_asyncStitch = false;
+    std::mutex m_stitchMutex;
+    std::condition_variable m_stitchCv;
+    std::deque<std::unique_ptr<StitchJob>> m_stitchQueue;   // waiting for the worker
+    std::deque<std::unique_ptr<StitchJob>> m_stitchDone;    // finished, waiting for main
+    std::set<TileID> m_stitchInFlight;                      // (x,y,z) keys queued or running
+    std::thread m_stitchThread;
+    bool m_stitchStop = false;
+    void stitchWorkerLoop();
+    void startStitchWorker();
+    // Gather the cell sources for an N x N composite exactly as buildOverzoomElevationMosaic()
+    // would (cache-only lookups), and the coverage signature they imply.
+    uint64_t compositeSignature(TileID _primary, int zt, const uint8_t* _caps, int _refZoom);
+    void gatherCompositeCells(TileID _primary, int zt, const std::shared_ptr<Texture>& _own,
+                              const uint8_t* _caps, std::vector<OverzoomCell>& _cells);
 
     friend class RasterTileTask;
     friend class TileSource;
@@ -455,6 +508,35 @@ public:
 
     RasterSource(const std::string& _name, std::unique_ptr<DataSource> _sources,
                  TextureOptions _options, TileSource::ZoomOptions _zoomOptions = {});
+    ~RasterSource() override;
+
+    // Enable the background upgrade path (see requestElevationMosaic). Off by default so unit
+    // tests and non-elevation sources keep the simple synchronous behavior.
+    void setAsyncStitching(bool _on) { m_asyncStitch = _on; }
+    bool asyncStitching() const { return m_asyncStitch; }
+
+    // Upgrade-only counterpart of buildElevationMosaic() for a tile that ALREADY has a valid
+    // mosaic attached (TileManager::upgradeAttachedRasters). Returns the best registered
+    // mosaic right now (possibly newer than what the caller holds) and, when a better one is
+    // wanted, schedules the stitch on the worker instead of doing it inline. Falls back to the
+    // synchronous buildElevationMosaic() only when nothing is registered yet (correctness: the
+    // caller must never be left holding a plain texture under the ELEVATION_MOSAIC shader).
+    // Behaves exactly like buildElevationMosaic() when async stitching is disabled.
+    std::shared_ptr<Texture> requestElevationMosaic(TileID _livePrimary,
+                                                    const std::shared_ptr<Texture>& _plainBase,
+                                                    const uint8_t* _cellZoomCaps);
+
+    // Publish finished background stitches (main thread). At most ~`_byteBudget` bytes of new
+    // mosaic texture are made visible per call (one oversize item is always allowed so a
+    // single huge mosaic cannot starve), which paces the first-bind GPU uploads.
+    void pumpStitchResults(size_t _byteBudget);
+
+    // True while background stitches are queued, running or finished-but-unpublished; the tile
+    // manager counts this as "loading" so the main loop keeps rendering until they land.
+    bool hasPendingStitches() {
+        std::lock_guard<std::mutex> lock(m_stitchMutex);
+        return !m_stitchInFlight.empty();
+    }
 
     // TODO Is this always PNG or can it also be JPEG?
     const char* mimeType() const override { return "image/png"; };

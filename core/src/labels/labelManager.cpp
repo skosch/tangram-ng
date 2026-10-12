@@ -19,6 +19,8 @@
 #include "tile/tileCache.h"
 #include "tile/tileManager.h"
 #include "view/view.h"
+
+#include <algorithm>
 #include "util/elevationManager.h"
 
 #include "glm/glm.hpp"
@@ -38,7 +40,7 @@ namespace {
 // (labelManager.h) for why this replaced a fixed per-frame label COUNT (round 9). A budget
 // in real time, rather than label count, behaves the same in both Debug and Release
 // without needing two separately-tuned constants.
-constexpr double kAnchorRefineBudgetMs = 4.0;
+constexpr double kAnchorRefineBudgetMs = 2.0;  // round 6: was 4.0; trace 140216 measured ~6 ms/frame actual (single-call overshoot)
 
 // Round 16: same idiom as kAnchorRefineBudgetMs above, for Label::refinePriority() - see
 // LabelManager::m_priorityRefineTimeUsedMs's doc comment (labelManager.h) for why this was
@@ -46,7 +48,7 @@ constexpr double kAnchorRefineBudgetMs = 4.0;
 // mosaic's pyramid is cached, but a fresh pyramid build is not, and refinePriority() (unlike
 // refineAnchor()) was never gated at all - one call per not-yet-refined label, every frame,
 // no ceiling.
-constexpr double kPriorityRefineBudgetMs = 4.0;
+constexpr double kPriorityRefineBudgetMs = 2.0;  // round 6: was 4.0
 
 // docs/label-placement-v2-spec.md's "Deterministic-but-not-jittery collision resolution"
 // (Option A) -- see LabelManager::priorityComparator()'s own comment for the full
@@ -57,11 +59,45 @@ constexpr double kPriorityRefineBudgetMs = 4.0;
 constexpr int kStableFramesThreshold = 5;
 }
 
+namespace {
+// Wall-clock accumulator into a plain per-frame slot (flushed once per frame through
+// Profiler::counter in updateLabelSet). Deliberately NOT Profiler::counterAdd: that takes a
+// global mutex plus a string-keyed map lookup per call, and doing it per label per frame
+// inflated the very LabelsCollect time being measured. Costs one branch when not capturing.
+struct ProfileAccum {
+    double& slot;
+    std::chrono::steady_clock::time_point t0;
+    bool on;
+    ProfileAccum(double& s, bool _on) : slot(s), on(_on) {
+        if (on) { t0 = std::chrono::steady_clock::now(); }
+    }
+    ~ProfileAccum() {
+        if (on) {
+            slot += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        }
+    }
+};
+}
+
 LabelManager::LabelManager()
     : m_needUpdate(false),
       m_lastZoom(0.0f) {}
 
 LabelManager::~LabelManager() {}
+
+void LabelManager::ensureViewportMax(ElevationManager& _elevManager) {
+    if (m_vmaxComputed) { return; }
+    m_vmaxComputed = true;
+    ProfileAccum _pa(m_prof[kProfViewportMax], m_profOn);
+    float vmax = -FLT_MAX;
+    for (const auto& tile : *m_vmaxTiles) {
+        glm::vec2 minMax = _elevManager.getMinMaxElev(tile->getID(), 0);
+        if (minMax == glm::vec2(0.f, 9000.f)) { continue; }  // not resident for this tile
+        vmax = std::max(vmax, minMax.y);
+    }
+    m_vmaxHave = vmax > -FLT_MAX;
+    m_vmaxValue = m_vmaxHave ? vmax : 0.f;
+}
 
 void LabelManager::processLabelUpdate(const ViewState& _viewState, const LabelSet* _labelSet, Style* _style,
                                 const Tile* _tile, const Marker* _marker, ElevationManager* _elevManager,
@@ -84,7 +120,21 @@ void LabelManager::processLabelUpdate(const ViewState& _viewState, const LabelSe
     glm::mat4 elevMVP;
     bool recalcPos = false, behindCam = false;
     bool useElev = _elevManager && _style->blendOrder() < INT_MAX;
-    bool setElev = useElev && (_marker || _elevManager->hasTile(_tile->getID()));
+    // hasTile() is a pure function of the tile (it samples the tile center, always evaluated
+    //  here with m_minZoom == 0 - see the reset at the end of this function) and costs a full
+    //  ancestor-climbing raster lookup that thrashes ElevationManager::getElevation()'s
+    //  single-slot cache. updateLabels() walks tiles in the outer loop and styles inner, so a
+    //  one-slot per-tile memo cuts it from (styles-with-labels x tiles) lookups per frame to
+    //  one per tile; identical results by construction.
+    bool tileHasElev = true;
+    if (useElev && _tile) {
+        if (m_hasElevTile != _tile) {
+            m_hasElevTile = _tile;
+            m_hasElevValue = _elevManager->hasTile(_tile->getID());
+        }
+        tileHasElev = m_hasElevValue;
+    }
+    bool setElev = useElev && (_marker || tileHasElev);
     if (useElev) {
         if (_tile) {
             _elevManager->setMinZoom(!_tile->rasters().empty() ?
@@ -114,9 +164,14 @@ void LabelManager::processLabelUpdate(const ViewState& _viewState, const LabelSe
         // just be the one-time copy setRelative() already does). Cheap no-op for any label that
         // isn't tracking a relative's priority; independent of elevation/terrain being enabled
         // at all.
-        label->syncRelativePriority();
+        {
+            ProfileAccum _pa(m_prof[kProfSync], m_profOn);
+            label->syncRelativePriority();
+        }
+        if (m_profOn) { m_prof[kProfIterated] += 1; }
 
         if (setElev && !label->m_elevationSet) {
+            ProfileAccum _pa(m_prof[kProfSetElev], m_profOn);
             if (_tile) {
                 label->m_elevationSet = label->setElevation(*_elevManager, _tile->getOrigin(), _tile->getScale());
             } else if (_marker) {
@@ -140,16 +195,23 @@ void LabelManager::processLabelUpdate(const ViewState& _viewState, const LabelSe
         // (and pay a real rebuild) on the first peak of every newly-streamed-in tile.
         if (_elevManager && !label->m_prominenceRefined) {
             if (m_priorityRefineTimeUsedMs < kPriorityRefineBudgetMs) {
+                float vmaxElev = _viewportMaxElev;
+                bool haveVmax = _haveViewportMaxElev;
+                if (m_vmaxTiles && label->options().refinePriorityWithTextureShading) {
+                    ensureViewportMax(*_elevManager);
+                    vmaxElev = m_vmaxValue;
+                    haveVmax = m_vmaxHave;
+                }
                 auto t0 = std::chrono::steady_clock::now();
                 if (_tile) {
                     label->m_prominenceRefined =
                         label->refinePriority(*_elevManager, _tile->getOrigin(), _tile->getScale(),
-                                              _viewportMaxElev, _haveViewportMaxElev);
+                                              vmaxElev, haveVmax);
                 } else if (_marker) {
                     double scale = _marker->extent();
                     if (scale <= 0) { scale = MapProjection::metersPerTileAtZoom(_marker->builtZoomLevel()); }
                     label->m_prominenceRefined = label->refinePriority(*_elevManager, _marker->origin(), scale,
-                                                                        _viewportMaxElev, _haveViewportMaxElev);
+                                                                        vmaxElev, haveVmax);
                 }
                 auto t1 = std::chrono::steady_clock::now();
                 m_priorityRefineTimeUsedMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -210,10 +272,16 @@ void LabelManager::processLabelUpdate(const ViewState& _viewState, const LabelSe
         auto bounds = (_onlyRender || !label->canOcclude()) ? screenBounds : extendedBounds;
 
         const glm::mat4& mvp = _tile ? _tile->mvp() : _marker->modelViewProjectionMatrix();
-        if (!label->update(mvp, _viewState, &bounds, transform)) {
+        bool updated;
+        {
+            ProfileAccum _pa(m_prof[kProfUpdate], m_profOn);
+            updated = label->update(mvp, _viewState, &bounds, transform);
+        }
+        if (!updated) {
             continue;
         }
 
+        ProfileAccum _pdepth(m_prof[kProfDepth], m_profOn);
         if (useElev) {
             // clamp to viewport to get reasonable behavior for labels entering and leaving screen
             glm::vec2 xyclamped = glm::clamp(glm::vec2(screenCoord), {0,0}, screenBounds.max - 1.0f);
@@ -286,10 +354,13 @@ void LabelManager::updateLabels(const ViewState& _viewState, float _dt, const Sc
     if (!_onlyRender) { m_labels.clear(); }
 
     m_selectionLabels.clear();
+    m_hasElevTile = nullptr;  // per-frame memo, see processLabelUpdate()
 
     m_needUpdate = false;
     m_anchorRefineTimeUsedMs = 0.0;
     m_priorityRefineTimeUsedMs = 0.0;
+    m_profOn = Profiler::isCapturing();
+    for (auto& v : m_prof) { v = 0.0; }
 
     auto* elevManager = _scene.elevationManager();
 
@@ -302,15 +373,13 @@ void LabelManager::updateLabels(const ViewState& _viewState, float _dt, const Sc
     // -- no new fetch, no climbing. A tile with no elevation raster attached (flat style,
     // terrain toggled off, or not yet loaded) is simply skipped, matching
     // getMinMaxElev()'s own documented "nothing resident" sentinel {0, 9000}.
-    float viewportMaxElev = -FLT_MAX;
-    if (elevManager) {
-        for (const auto& tile : _tiles) {
-            glm::vec2 minMax = elevManager->getMinMaxElev(tile->getID(), 0);
-            if (minMax == glm::vec2(0.f, 9000.f)) { continue; }  // not resident for this tile
-            viewportMaxElev = std::max(viewportMaxElev, minMax.y);
-        }
-    }
-    bool haveViewportMaxElev = viewportMaxElev > -FLT_MAX;
+    // Lazy (round 6): only labels that opted into refinePriorityWithTextureShading ever read
+    // this, and in steady state none are pending -- the eager per-frame scan over every
+    // visible tile cost ~1.5 ms/frame for nothing. See ensureViewportMax().
+    m_vmaxTiles = elevManager ? &_tiles : nullptr;
+    m_vmaxComputed = false;
+    const float viewportMaxElev = 0.f;
+    const bool haveViewportMaxElev = false;
 
     const auto& _styles = _scene.styles();
     for (const auto& tile : _tiles) {
@@ -349,6 +418,7 @@ void LabelManager::updateLabels(const ViewState& _viewState, float _dt, const Sc
     }
 
     if (elevManager) { elevManager->setMinZoom(0); }
+    m_vmaxTiles = nullptr;
 #if 0  //def DEBUG
     if (_scene.elevationManager()) {
         auto& depthData = _scene.elevationManager()->getDepthData();
@@ -578,12 +648,28 @@ void LabelManager::handleOcclusions(const ViewState& _viewState, bool _hideExtra
 
     using iterator = decltype(m_labels)::const_iterator;
 
-    // Find the label to which the obb belongs
+    // Find the label to which the obb belongs. Entries before the one being processed have
+    // obbsRange.start non-decreasing in iteration order (each range is claimed at
+    // m_obbs.size() when that entry's obbs() is first called, in this same loop's order), so
+    // binary-search the last entry with start <= obb instead of the old linear scan -- that
+    // scan ran once per OBB-level collision and was O(labels) each, i.e. quadratic in dense
+    // views (4.4k labels in a real trace). Empty-range entries share their start with the
+    // next entry, so walk back over them; fall back to the linear scan if the invariant is
+    // ever violated, so results are identical either way.
     auto findLabel = [](iterator begin, iterator end, int obb) {
+        auto contains = [obb](const LabelEntry& e) {
+            return obb >= e.obbsRange.start && obb < e.obbsRange.end();
+        };
+        auto ub = std::upper_bound(begin, end, obb, [](int v, const LabelEntry& e) {
+            return v < int(e.obbsRange.start);
+        });
+        while (ub != begin) {
+            --ub;
+            if (contains(*ub)) { return ub->label; }
+            if (ub->obbsRange.length > 0) { break; }  // non-empty range that doesn't contain it
+        }
         for (auto it = begin; it != end; it++) {
-            if (obb >= it->obbsRange.start && obb < it->obbsRange.end()) {
-                return it->label;
-            }
+            if (contains(*it)) { return it->label; }
         }
         assert(false);
         return static_cast<Label*>(nullptr);
@@ -734,6 +820,22 @@ bool LabelManager::withinRepeatDistance(Label *_label) {
     return false;
 }
 
+void LabelManager::flushProfileCounters(bool _onlyRender) {
+    // Emitted on onlyRender frames too (round 6): those are ~2/3 of captured frames and cost
+    // nearly as much label time as full updates, which the counters used to hide.
+    Profiler::counter(_onlyRender ? "labelOnlyRenderFrame" : "labelFullFrame", 1.0);
+    Profiler::counter("labelPriorityRefineMs", m_priorityRefineTimeUsedMs);
+    Profiler::counter("labelAnchorRefineMs", m_anchorRefineTimeUsedMs);
+    if (m_profOn) {
+        Profiler::counter("labelUpdateMs", m_prof[kProfUpdate]);
+        Profiler::counter("labelSetElevMs", m_prof[kProfSetElev]);
+        Profiler::counter("labelSyncMs", m_prof[kProfSync]);
+        Profiler::counter("labelDepthEmplaceMs", m_prof[kProfDepth]);
+        Profiler::counter("labelViewportMaxElevMs", m_prof[kProfViewportMax]);
+        Profiler::counter("labelsIterated", m_prof[kProfIterated]);
+    }
+}
+
 void LabelManager::updateLabelSet(const View& _view, float _dt, const Scene& _scene,
                             const std::vector<std::shared_ptr<Tile>>& _tiles,
                             const std::vector<std::unique_ptr<Marker>>& _markers,
@@ -748,9 +850,13 @@ void LabelManager::updateLabelSet(const View& _view, float _dt, const Scene& _sc
         PROFILE_SCOPE("LabelsCollect");
         updateLabels(_viewState, _dt, _scene, _tiles, _markers, _onlyRender);
     }
+    flushProfileCounters(_onlyRender);
     if (_onlyRender) { return; }
 
-    std::sort(m_labels.begin(), m_labels.end(), LabelManager::priorityComparator);
+    {
+        PROFILE_SCOPE("LabelsSort");
+        std::sort(m_labels.begin(), m_labels.end(), LabelManager::priorityComparator);
+    }
 
     /// Mark labels to skip transitions
 
@@ -767,6 +873,7 @@ void LabelManager::updateLabelSet(const View& _view, float _dt, const Scene& _sc
     }
 
     // Update label state
+    PROFILE_SCOPE("LabelsStateAndMesh");
     for (auto& entry : m_labels) {
         //if (m_lastZoom < _viewState.zoom && entry.label->isOccluded() && !entry.label->occludedLastFrame()) {
         //    LOGD("Label hidden on zoom in: %s (%d labels)", entry.label->debugTag.c_str(), int(m_labels.size()));

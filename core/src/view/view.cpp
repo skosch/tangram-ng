@@ -1,4 +1,5 @@
 #include "view/view.h"
+#include <cstdlib>
 
 #include "log.h"
 #include "scene/stops.h"
@@ -404,7 +405,16 @@ void View::updateMatrices() {
     float prevViewZ = m_elevationManager ? m_elevationManager->getDepth({m_vpWidth/2, m_vpHeight/2}) : 0;
     if (m_type != CameraType::perspective) {
     } else if (prevViewZ > 0 && prevViewZ < 1E9f) {
-        double minCameraDist = exp2(-m_maxZoom) * worldToCameraHeight;
+        // Minimum camera clearance above terrain: a heightfield sampled at ~1 m per pixel is no
+        //  longer a rock face, and looking straight at a wall from a few hundred meters shows
+        //  nothing but DEM texels and procedural noise. The clearance corresponds to zoom
+        //  ASCEND_TERRAIN_MAX_ZOOM (default 16.5, ~1 m/pixel at mid latitudes), independent of the
+        //  (higher) overall max zoom used over flat/2D content.
+        static const float terrainMaxZoom = [] {
+            const char* e = std::getenv("ASCEND_TERRAIN_MAX_ZOOM");
+            return e ? float(std::atof(e)) : 16.5f;
+        }();
+        double minCameraDist = exp2(-std::min(m_maxZoom, terrainMaxZoom)) * worldToCameraHeight;
         double prevCamDist = exp2(-m_elevationManager->getDepthData().zoom) * worldToCameraHeight;
         double viewZ = prevViewZ + m_pos.z - prevCamDist;
         // decrease base zoom if too close to terrain (but never increase)
@@ -757,6 +767,106 @@ double View::steepnessCorrection(TileID tile) const {
         }
     }
     return bestCorrection;
+}
+
+float View::getTileDistance(TileID tile) const {
+    glm::dvec3 eye(m_pos.x + m_eye.x, m_pos.y + m_eye.y, m_eye.z);
+    return float(glm::distance(eye, glm::dvec3(MapProjection::tileCenter(tile), 0.)));
+}
+
+float View::getTileNearDistance(TileID tile, float topElev) const {
+    glm::dvec3 eye(m_pos.x + m_eye.x, m_pos.y + m_eye.y, m_eye.z);
+    BoundingBox b = MapProjection::tileBounds(tile);
+    glm::dvec2 lo = glm::min(b.min, b.max), hi = glm::max(b.min, b.max);
+    double dx = std::max({lo.x - eye.x, 0.0, eye.x - hi.x});
+    double dy = std::max({lo.y - eye.y, 0.0, eye.y - hi.y});
+    double dz = std::max(0.0, eye.z - double(topElev));
+    return float(std::sqrt(dx*dx + dy*dy + dz*dz));
+}
+
+float View::pixelsPerMeterAtDistance(float distMeters) const {
+    if (!(distMeters > 0)) { return 0.f; }
+    return float(m_vpHeight) / (2.f * distMeters * std::tan(0.5f * m_fov));
+}
+
+bool View::demChildrenResident(TileID tile) const {
+    if (!m_elevationManager) { return true; }
+    for (int i = 0; i < 4; i++) {
+        if (m_elevationManager->getTerrainDetail(tile.getChild(i, 100)).valid) { return true; }
+    }
+    return false;
+}
+
+bool View::demSaliencyWantsChildren(TileID tile, float tau, float nyquistBoost, int maxZoom,
+                                    float massFrac) const {
+    if (!m_elevationManager || tile.z >= maxZoom) { return false; }
+    ++m_demStats.evaluated;
+
+    // true-ground texel size of this node's children (256 texels per tile)
+    LngLat ll = MapProjection::projectedMetersToLngLat(MapProjection::tileCenter(tile));
+    double cosLat = std::cos(ll.latitude * M_PI / 180.0);
+    double hChild = 0.5 * MapProjection::metersPerTileAtZoom(tile.z) * cosLat / 256.0;
+
+    // Salient-texel table of the node itself, else of the nearest loaded ancestor (detail per
+    // texel shrinks ~0.4x per level in the offline calibration, so an ancestor's q is scaled
+    // accordingly; the salient FRACTION is assumed uniform over the ancestor's footprint).
+    ElevationManager::TerrainDetail d;
+    int up = 0;
+    {
+        TileID t = tile;
+        for (; up <= 4 && t.z > 0; ++up, t = t.getParent()) {
+            d = m_elevationManager->getTerrainDetail(t);
+            if (d.valid) { break; }
+        }
+    }
+    if (!d.valid || !d.facing || d.facing->texels == 0) { ++m_demStats.noData; return false; }
+    const auto& fs = *d.facing;
+
+    // Camera geometry at the tile: direction camera -> tile (center at the tile's real top
+    // elevation), and pixel density at its nearest point.
+    glm::vec2 mm = m_elevationManager->getMinMaxElev(tile, 3);
+    float topElev = (mm == glm::vec2(0.f, 9000.f)) ? 0.f : mm.y;
+    glm::dvec3 eye(m_pos.x + m_eye.x, m_pos.y + m_eye.y, m_eye.z);
+    glm::dvec2 c = MapProjection::tileCenter(tile);
+    glm::dvec3 dir = glm::dvec3(c, 0.5 * double(topElev)) - eye;
+    double len = glm::length(dir);
+    if (len < 1e-3) { return true; }
+    dir /= len;
+    float vx = float(dir.x), vy = float(dir.y), vz = float(dir.z);   // vz < 0 when looking down
+
+    float dNear = getTileNearDistance(tile, topElev);
+    float ppm = pixelsPerMeterAtDistance(dNear);
+    if (!(ppm > 0.f)) { return true; }  // at/inside the near plane: always wants detail
+
+    // Hidden behind terrain drawn last frame (a valley behind a ridge): extra detail there is
+    // wasted. Needs a real elevation range for the box; the "unknown" sentinel skips the test.
+    if (mm != glm::vec2(0.f, 9000.f)) {
+        BoundingBox b = MapProjection::tileBounds(tile);
+        glm::dvec2 lo = glm::min(b.min, b.max), hi = glm::max(b.min, b.max);
+        if (m_elevationManager->isBoxOccluded(lo, hi, mm.x, mm.y)) { ++m_demStats.occluded; return false; }
+    }
+
+    const float rhoMin = std::exp2(-2.f * nyquistBoost);
+    const float K = float(hChild * hChild) * ppm * ppm;   // pixels^2 per child texel at P = 1
+    const float qScale = std::pow(0.4f, float(up));
+
+    float mass = 0.f;
+    for (int t = 0; t < ElevationManager::kDemTiers; ++t) {
+        float lo = ElevationManager::kDemTierLo[t];
+        float hi = ElevationManager::kDemTierLo[t + 1];
+        float center = (hi > 1e8f) ? lo * 1.5f : std::sqrt(lo * hi);
+        if (center * qScale < tau) { continue; }
+        for (int o = 0; o < ElevationManager::kDemOctants; ++o) {
+            uint32_t n = fs.cnt[t][o];
+            if (!n) { continue; }
+            float inv = 1.f / float(n);
+            float P = (fs.sgx[t][o] * vx + fs.sgy[t][o] * vy) * inv - vz;
+            if (P > 0.f && K * P >= rhoMin) { mass += float(n); }
+        }
+    }
+    if (mass >= massFrac * float(fs.texels)) { ++m_demStats.accepted; return true; }
+    ++m_demStats.belowMass;
+    return false;
 }
 
 float View::getTileDistanceZoomBound(TileID tile) const {

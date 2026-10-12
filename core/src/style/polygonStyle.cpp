@@ -1,4 +1,5 @@
 #include "style/polygonStyle.h"
+#include <cstdlib>
 
 #include "gl/mesh.h"
 #include "gl/shaderProgram.h"
@@ -122,16 +123,40 @@ public:
         //  (rasterStyle.cpp) instead of needlessly tessellating finer than the ground it sits on.
         //  Never exceeds the configured ceiling, so the worst-case tiles are unaffected.
         int overzoomLevels = std::max(0, int(id.s) - int(id.z));
-        // TEMP (rock-texture-v2 round 20, forced-density test): bypass the overzoomLevels
-        //  scale-down entirely and always use the full configured ceiling, to test whether
-        //  mesh density (as opposed to composite data, already ruled out in round 19) is the
-        //  cause of tearing that survives at low/no overzoom. Revert to the commented formula
-        //  below once confirmed either way.
-        m_builder.gridRes = m_style.activeTerrainGrid();
-        // int overzoomLevels = std::max(0, int(id.s) - int(id.z));
-        // m_builder.gridRes = m_style.activeTerrainGrid() > 0
-        //     ? std::min(m_style.activeTerrainGrid(), kTerrainMeshGridRes << overzoomLevels)
-        //     : 0;
+        // Restored 2026-10-10 (perf): the rock-texture-v2 round-20 forced-density TEMP that
+        //  bypassed this scale-down (always using the full 256 ceiling) was a test of whether
+        //  mesh density caused the torn-triangle symptom; rounds 17-19 then found the real
+        //  causes (OSM coverage gap, tile-cache thrash) and the density hypothesis was
+        //  independently refuted in round 16, so the forced ceiling bought nothing and cost up
+        //  to 16x the polygon vertices (256^2 vs 64^2 cells per tile) on every draped
+        //  land-cover tile - a real trace had unlit-polygons at 77 ms/frame with a near-empty
+        //  fragment shader. Non-overzoomed tiles now match the terrain mesh's own 64-cell grid
+        //  (the design intent above); overzoomed ones still scale up to the style's ceiling.
+        // The polygon grid must be at least as fine as the terrain lattice it drapes on, or
+        //  triangles chord across convex relief and the hillshade overlay fails its depth test
+        //  there (unshaded "torn" patches on steep faces - confirmed 2026-10-12: forcing 256
+        //  removed them). The lattice per vector-tile edge is terrainMeshCellsAt(zt, ref) <<
+        //  (zt - z) with zt up to z + 2, i.e. 64 << clamp(ref - z, 0, 2) cells, where ref is
+        //  the CURRENT reference zoom (round(view zoom) + bias; util/builders.h). The tile's own
+        //  styling zoom `s` is only a per-tile screen-area heuristic and routinely lags the view
+        //  (far tiles, tiles built before a zoom-in), so size the grid from the reference zoom
+        //  too (+1 level of margin for zooming in after the build), whichever is finer.
+        const int refLevels = std::max(0, std::min(2, terrainMeshRefZoom() - int(id.z) + 1));
+        const int gridLevels = std::max(overzoomLevels, refLevels);
+        m_builder.gridRes = m_style.activeTerrainGrid() > 0
+            ? std::min(m_style.activeTerrainGrid(), kTerrainMeshGridRes << gridLevels)
+            : 0;
+        // DIAGNOSTIC (2026-10-12, drape patches): ASCEND_POLY_GRID=N forces the draped polygon grid
+        //  to min(style ceiling, N) regardless of the tile's styling zoom, to test whether polygon
+        //  triangles chording across the terrain lattice (grid coarser than lattice) causes the
+        //  unshaded/torn patches. Costs vertices; remove once settled.
+        if (m_style.activeTerrainGrid() > 0) {
+            static const int forced = [] {
+                const char* e = getenv("ASCEND_POLY_GRID");
+                return e ? atoi(e) : 0;
+            }();
+            if (forced > 0) { m_builder.gridRes = std::min(m_style.activeTerrainGrid(), forced); }
+        }
         // TEMP DIAGNOSTIC (rock-texture-v2 round 18, "torn holes while panning at zoom 16+,
         //  angle-dependent" investigation): rounds 14-17 refuted the composite-data-mismatch,
         //  gridRes-staleness, elevation-shelf-pinning, and OSM-coverage-gap hypotheses in

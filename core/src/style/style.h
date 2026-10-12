@@ -167,6 +167,9 @@ protected:
         // View uniforms
         UniformLocation uDevicePixelRatio{"u_device_pixel_ratio"};
         UniformLocation uResolution{"u_resolution"};
+        UniformLocation uRenderScale{"u_render_scale"};
+        UniformLocation uTerrainMeshBoost{"u_terrain_mesh_boost"};
+        UniformLocation uTerrainRefZoom{"u_terrain_ref_zoom"};
         UniformLocation uMapPosition{"u_map_position"};
         UniformLocation uNormalMatrix{"u_normal_matrix"};
         UniformLocation uInverseNormalMatrix{"u_inverse_normal_matrix"};

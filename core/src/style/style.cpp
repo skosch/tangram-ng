@@ -15,6 +15,7 @@
 #include "style/material.h"
 #include "tile/tile.h"
 #include "view/view.h"
+#include "util/builders.h"
 
 #include "rasters_glsl.h"
 
@@ -224,6 +225,9 @@ void Style::setupShaderUniforms(RenderState& rs, ShaderProgram& _program, const 
 
     // Set Map Position
     _program.setUniformf(rs, _uniforms.uResolution, _view.getWidth(), _view.getHeight());
+    _program.setUniformf(rs, _uniforms.uRenderScale, rs.renderScale());
+    _program.setUniformf(rs, _uniforms.uTerrainMeshBoost, float(terrainMeshBoost()));
+    _program.setUniformf(rs, _uniforms.uTerrainRefZoom, float(terrainMeshRefZoom()));
 
     const auto& mapPos = _view.getPosition();
     _program.setUniformf(rs, _uniforms.uMapPosition, mapPos.x, mapPos.y, _view.getZoom());

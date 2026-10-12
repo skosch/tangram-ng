@@ -101,6 +101,15 @@ protected:
                             const Tile* _tile, const Marker* _marker, ElevationManager* _elevManager,
                             float _dt, bool _onlyRender, float _viewportMaxElev, bool _haveViewportMaxElev);
 
+    // Lazily computed highest elevation among this frame's resident tiles (see
+    // ensureViewportMax()); m_vmaxTiles is non-null only while updateLabels() runs.
+    void ensureViewportMax(ElevationManager& _elevManager);
+    void flushProfileCounters(bool _onlyRender);
+    const std::vector<std::shared_ptr<Tile>>* m_vmaxTiles = nullptr;
+    bool m_vmaxComputed = false;
+    bool m_vmaxHave = false;
+    float m_vmaxValue = 0.f;
+
     bool m_needUpdate;
 
     isect2d::ISect2D<glm::vec2> m_isect2d;
@@ -158,6 +167,17 @@ protected:
     // Same measured-wall-clock-budget idiom, not a fixed count, for the same
     // Debug-vs-Release reason.
     double m_priorityRefineTimeUsedMs = 0.0;
+
+    // One-slot per-frame memo of ElevationManager::hasTile() for the tile currently being
+    // walked by updateLabels() (see processLabelUpdate()); reset each frame.
+    // Per-frame profiling accumulators (only filled while a Profiler capture is active), see
+    // ProfileAccum in labelManager.cpp.
+    enum { kProfUpdate, kProfSetElev, kProfSync, kProfDepth, kProfViewportMax, kProfIterated, kProfCount };
+    double m_prof[kProfCount] = {};
+    bool m_profOn = false;
+
+    const Tile* m_hasElevTile = nullptr;
+    bool m_hasElevValue = false;
 };
 
 }

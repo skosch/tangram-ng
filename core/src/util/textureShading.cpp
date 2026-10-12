@@ -106,6 +106,10 @@ std::vector<float> boxFilterDownsample(const std::vector<float>& src, int srcSiz
 struct Pyramid {
     std::vector<std::vector<float>> levels;  // levels[0] = decoded level0, then box-filter downsamples
     std::vector<int> sizes;                  // sizes[i] = levels[i]'s width/height
+    // Mosaic-space texel coordinate of levels[0]'s (0,0). Always a multiple of
+    // 2^kMaxLevels so the box-filter grid of every level lines up exactly with the
+    // full-mosaic pyramid's (level k texel i covers source texels [i*2^k, (i+1)*2^k)).
+    int originX = 0, originY = 0;
 };
 
 Pyramid buildPyramid(const Texture& mosaic) {
@@ -116,25 +120,43 @@ Pyramid buildPyramid(const Texture& mosaic) {
     int bpp = options.bytesPerPixel();
     bool isFloat = options.pixelFormat == PixelFormat::FLOAT;
 
-    std::vector<float> level0(size_t(mosaicW) * size_t(mosaicW));
-    for (int y = 0; y < mosaicW; y++) {
-        for (int x = 0; x < mosaicW; x++) {
-            const GLubyte* px = data + (size_t(y) * size_t(mosaicW) + size_t(x)) * size_t(bpp);
-            level0[size_t(y) * size_t(mosaicW) + size_t(x)] = float(decodeElevation(px, bpp, isFloat));
+    // Perf (2026-10-10, real trace: refine calls ~100 ms each, LabelsCollect 445 ms mean
+    // at 160-280 visible tiles): sampleFromPyramid() only ever reads the CENTER third of
+    // the mosaic (uv in [1/3, 2/3], bilinear reaching one texel further), but this used to
+    // decode and box-filter all 9 cells. A level-k texel only depends on source texels
+    // within 2^k, so cropping to the center cell plus a margin of 2*2^kMaxLevels texels,
+    // with the crop origin snapped to a multiple of 2^kMaxLevels (grid alignment), gives
+    // BIT-IDENTICAL samples in the center third from ~1/7 of the decode work and memory.
+    constexpr int kAlign = 1 << kMaxLevels;
+    constexpr int kMargin = 2 * kAlign;
+    int Wp = mosaicW / 3;
+    int x0 = std::max(0, ((Wp - kMargin) / kAlign) * kAlign);
+    int x1 = std::min(mosaicW, ((2 * Wp + kMargin + kAlign - 1) / kAlign) * kAlign);
+    int cropW = x1 - x0;
+    p.originX = p.originY = x0;
+
+    std::vector<float> level0(size_t(cropW) * size_t(cropW));
+    for (int y = 0; y < cropW; y++) {
+        const GLubyte* row = data + (size_t(y + x0) * size_t(mosaicW) + size_t(x0)) * size_t(bpp);
+        float* out = &level0[size_t(y) * size_t(cropW)];
+        if (isFloat) {
+            std::memcpy(out, row, size_t(cropW) * sizeof(float));
+        } else {
+            for (int x = 0; x < cropW; x++) {
+                out[x] = float(decodeElevation(row + size_t(x) * size_t(bpp), bpp, false));
+            }
         }
     }
-    p.levels.push_back(level0);
-    p.sizes.push_back(mosaicW);
+    p.levels.push_back(std::move(level0));
+    p.sizes.push_back(cropW);
 
-    std::vector<float> level = std::move(level0);
-    int levelSize = mosaicW;
+    int levelSize = cropW;
     for (int k = 0; k < kMaxLevels; k++) {
         int nextSize;
-        std::vector<float> next = boxFilterDownsample(level, levelSize, nextSize);
+        std::vector<float> next = boxFilterDownsample(p.levels.back(), levelSize, nextSize);
         if (nextSize < 2) { break; }  // pyramid bottomed out
-        p.levels.push_back(next);
+        p.levels.push_back(std::move(next));
         p.sizes.push_back(nextSize);
-        level = std::move(next);
         levelSize = nextSize;
     }
     return p;
@@ -174,10 +196,18 @@ float sampleFromPyramid(const Pyramid& p, TileID tileId, ProjectedMeters worldPo
     // Difference adjacent levels, weighting band k by pow(2, -k*alpha) -- Brown's power-law
     // filter discretization, exactly as pinned in docs/texture-shading-plan.md and mirrored by
     // hillshade.yaml's textureShading().
-    double hPrev = bilinearSample(p.levels[0], p.sizes[0], muvU * p.sizes[0], muvV * p.sizes[0]);
+    // Full-pyramid level-k coordinate is muv * (mosaicW >> k) (the original expression used
+    //  the level's own size, which equals mosaicW >> k for the uncropped pyramid); the
+    //  cropped level's origin in that space is origin >> k (origin is 2^kMaxLevels-aligned).
+    auto levelSample = [&](size_t k) {
+        double fullSize = double(mosaicW >> k);
+        double ox = double(p.originX >> k), oy = double(p.originY >> k);
+        return bilinearSample(p.levels[k], p.sizes[k], muvU * fullSize - ox, muvV * fullSize - oy);
+    };
+    double hPrev = levelSample(0);
     double z = 0.0;
     for (size_t k = 1; k < p.levels.size(); k++) {
-        double hNext = bilinearSample(p.levels[k], p.sizes[k], muvU * p.sizes[k], muvV * p.sizes[k]);
+        double hNext = levelSample(k);
         z += (hPrev - hNext) * std::pow(2.0, -double(k - 1) * double(kAlpha));
         hPrev = hNext;
     }
@@ -217,27 +247,47 @@ float sampleTextureShading(RasterSource& elevationSource, ProjectedMeters worldP
     int mosaicW = mosaic->width();
     if (mosaicW <= 0 || mosaicW != mosaic->height() || (mosaicW % 3) != 0) { return 0.5f; }
 
-    // Perf (round 8): this is called up to ~45 times per peak from refineAnchor() (5 sample
-    // points x up to 9 anchors) plus once more from refinePriority(), all against the SAME
-    // mosaic for a given peak -- and building the pyramid is a full decode + kMaxLevels
-    // box-filter downsample pass over the whole mosaic buffer, independent of the sample
-    // point. Single-slot cache (weak_ptr-keyed, so a destroyed/replaced mosaic -- e.g. a fresh
-    // stitch, see buildElevationMosaic()'s "always rebuilt as a fresh Texture object" comment
-    // in rasterSource.cpp -- is never mistaken for a live one, unlike a raw-pointer-identity
-    // check) rather than a full per-texture LRU: consecutive calls in one frame overwhelmingly
-    // target the same mosaic (one label's own 46 calls, or several nearby peaks sharing one
-    // tile), so this alone captures the large majority of the redundant work. A peak whose
-    // mosaic differs from the immediately-preceding call just pays the normal one-time
-    // rebuild cost, same as before this change.
-    static std::weak_ptr<Texture> s_cachedMosaic;
-    static Pyramid s_cachedPyramid;
-    if (s_cachedMosaic.lock() != mosaic) {
-        s_cachedPyramid = buildPyramid(*mosaic);
-        s_cachedMosaic = mosaic;
+    // Perf (round 8, widened 2026-10-10): called up to ~45 times per peak from refineAnchor()
+    // plus once from refinePriority(), against the SAME mosaic for a given peak; the pyramid
+    // is independent of the sample point. The round-8 single slot thrashed in a real
+    // 160-280-visible-tile trace (labels from many tiles interleave per frame, every switch a
+    // full rebuild), so this is a small LRU keyed by weak_ptr identity (a destroyed/replaced
+    // mosaic is never mistaken for a live one - see buildElevationMosaic()'s "always rebuilt
+    // as a fresh Texture object" comment in rasterSource.cpp). Pyramids are cropped to ~1/7
+    // of the mosaic (buildPyramid), so 32 entries stay in the low tens of MB.
+    struct CacheEntry {
+        std::weak_ptr<Texture> mosaic;
+        std::shared_ptr<Pyramid> pyramid;
+        uint64_t lastUse = 0;
+    };
+    constexpr size_t kCacheSize = 32;
+    static std::vector<CacheEntry> s_cache;
+    static uint64_t s_tick = 0;
+    ++s_tick;
+
+    CacheEntry* hit = nullptr;
+    CacheEntry* victim = nullptr;
+    for (auto& e : s_cache) {
+        auto m = e.mosaic.lock();
+        if (m == mosaic) { hit = &e; break; }
+        if (!m) { victim = &e; }  // expired entries are preferred victims
     }
+    if (!hit) {
+        if (s_cache.size() < kCacheSize && !victim) {
+            s_cache.emplace_back();
+            victim = &s_cache.back();
+        } else if (!victim) {
+            victim = &*std::min_element(s_cache.begin(), s_cache.end(),
+                [](const CacheEntry& a, const CacheEntry& b) { return a.lastUse < b.lastUse; });
+        }
+        victim->pyramid = std::make_shared<Pyramid>(buildPyramid(*mosaic));
+        victim->mosaic = mosaic;
+        hit = victim;
+    }
+    hit->lastUse = s_tick;
 
     ok = true;
-    return sampleFromPyramid(s_cachedPyramid, raster.tileID, worldPos, mosaicW);
+    return sampleFromPyramid(*hit->pyramid, raster.tileID, worldPos, mosaicW);
 }
 
 }

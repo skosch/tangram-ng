@@ -84,6 +84,19 @@ bool Texture::setPixelData(int _width, int _height, int _bytesPerPixel,
     return true;
 }
 
+bool Texture::adoptPixelData(int _width, int _height, int _bytesPerPixel,
+                             GLubyte* _mallocBuffer, size_t _length) {
+    if (!_mallocBuffer) { return false; }
+    if (!sanityCheck(_width, _height, _bytesPerPixel, _length)) {
+        std::free(_mallocBuffer);
+        return false;
+    }
+    m_buffer.reset(_mallocBuffer);
+    m_bufferSize = _length;
+    resize(_width, _height);
+    return true;
+}
+
 void Texture::setSpriteAtlas(std::unique_ptr<Tangram::SpriteAtlas> sprites) {
     m_spriteAtlas = std::move(sprites);
 }

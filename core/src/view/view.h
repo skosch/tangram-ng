@@ -257,6 +257,12 @@ public:
     // Get the set of all tiles visible at the current position and zoom.
     //void getVisibleTiles(const std::function<void(TileID)>& _tileCb, int zoomBias, TileID tile = TileID(0,0,0)) const;
     float getTileScreenArea(TileID tile) const;
+    // Eye -> tile-center (at sea level) distance in meters and the on-screen size of one meter
+    // perpendicular to the view direction at that distance, for screen-space-error LOD.
+    float getTileDistance(TileID tile) const;
+    // Nearest distance from the eye to the tile's footprint (a box up to topElev meters high).
+    float getTileNearDistance(TileID tile, float topElev) const;
+    float pixelsPerMeterAtDistance(float distMeters) const;
 
     // Ratio between a tile's real local foreshortening (from a sampled elevation gradient) and
     // flat ground's - see view.cpp doc comment (getTileScreenArea).
@@ -273,6 +279,30 @@ public:
     // should take max(getIntegerZoom(), this) per tile instead, to let near-camera tiles under
     // tilt earn the resolution their distance actually justifies (see TileManager::updateTileSets).
     float getTileDistanceZoomBound(TileID tile) const;
+
+    // Saliency-driven DEM LOD (docs/dem-saliency-lod-plan.md, Phase 2, experimental): should the
+    // elevation quadtree subdivide `tile` into its children? True iff
+    //  (a) the child level's texel is not finer than the on-screen pixel footprint at the tile's
+    //      NEAREST point (Nyquist; `nyquistBoost` levels of deliberate oversampling allowed), AND
+    //  (b) the tile's terrain carries real detail one level down - measured as the slope change
+    //      per texel, lapRms / texelSize, from the tile's own (or nearest loaded ancestor's)
+    //      elevation data - at or above `tau`.
+    // Returns false when no elevation data is resident yet (the coarse leaf loads first, then
+    // refines). Only ever used to ADD refinement on top of the area rule.
+    // True if any of tile's four children already has resident elevation data (promotion is free).
+    bool demChildrenResident(TileID tile) const;
+    // Refine `tile` into its children iff the visible, camera-facing part of it still holds
+    // unresolved detail that its children's texels would resolve on screen. Uses the tile's
+    // (or nearest loaded ancestor's) salient-texel table (ElevationManager::DemFacingStats):
+    // texels with slope-change-per-texel >= tau whose projected child-texel area
+    // P * ppm^2 * hChild^2 >= 2^(-2*boost) pixels^2 (P = projected-area factor of the local
+    // surface normal for this camera: 0 for back-facing, sin(pitch) for flat ground, >1 for
+    // camera-facing slopes) are summed; refine when they cover >= massFrac of the tile.
+    bool demSaliencyWantsChildren(TileID tile, float tau, float nyquistBoost, int maxZoom,
+                                  float massFrac) const;
+    // Per-update diagnostic tallies of demSaliencyWantsChildren() outcomes (reset by the caller).
+    struct DemSelectorStats { int evaluated = 0, noData = 0, occluded = 0, belowMass = 0, accepted = 0; };
+    mutable DemSelectorStats m_demStats;
 
     const glm::mat4& getOrthoViewportMatrix() const { return m_orthoViewport; };
 

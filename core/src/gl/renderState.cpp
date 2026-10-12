@@ -428,6 +428,7 @@ bool RenderState::viewport(GLint x, GLint y, GLsizei width, GLsizei height) {
 }
 
 GLuint RenderState::defaultFrameBuffer() const {
+    if (m_defaultFramebufferOverride) { return m_defaultFramebufferOverride; }
     return (GLuint)m_defaultFramebuffer;
 }
 
