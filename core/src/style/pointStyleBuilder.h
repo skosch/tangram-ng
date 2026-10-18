@@ -101,6 +101,8 @@ private:
 
     std::unique_ptr<IconMesh> m_iconMesh;
 
+    void capGatedLabels();
+
     float m_zoom = 0;
     float m_styleZoom = 0;
     float m_tileScale = 1;

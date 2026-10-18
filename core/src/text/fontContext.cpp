@@ -155,6 +155,11 @@ bool FontContext::layoutText(TextStyle::Parameters& _params, const icu::UnicodeS
         return false;
     }
 
+    // Tracking is specified in em; shape advances are in pixels of the font's raster size.
+    if (_params.letterSpacing != 0.f && _params.font) {
+        line.addTracking(_params.letterSpacing * _params.font->size());
+    }
+
     line.setScale(_params.fontScale);
 
     // m_batch.drawShapeRange() calls FontContext's TextureCallback for new glyphs

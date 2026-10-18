@@ -53,6 +53,21 @@ public:
         float fontScale = 1;
         float lineSpacing = 0;
 
+        // Typographic tracking, in em (0.1 == 10% of the font size added between every
+        // pair of adjacent characters). docs/label-typography.md.
+        float letterSpacing = 0.f;
+        // Optional "fit" tracking for labels that follow a path/area: if > 0 the label is
+        // tracked out so that it spans this fraction of the path length (never tighter
+        // than `letterSpacing`, never wider than `letterSpacingMax` em).
+        float letterSpacingFit = 0.f;
+        float letterSpacingMax = 0.6f;
+        // Gaussian smoothing radius (px) applied to line/area label paths, so labels follow
+        // the large-scale shape of a ridge, valley or river and not its digitizing jitter.
+        float pathSmoothing = 0.f;
+        // Perpendicular shift (px, positive = towards the top of the screen at rotation 0)
+        // applied to a line label's path: sets a river name beside the river instead of on it.
+        float pathOffset = 0.f;
+
         bool hasComplexShaping = false;
     };
 
@@ -159,6 +174,7 @@ namespace std {
             hash_combine(seed, p.strokeColor);
             hash_combine(seed, p.strokeWidth);
             hash_combine(seed, p.fontSize);
+            hash_combine(seed, p.letterSpacing);
             hash_combine(seed, p.wordWrap);
             hash_combine(seed, p.maxLineWidth);
             hash_combine(seed, int(p.transform));

@@ -30,6 +30,8 @@
 
 #include <cassert>
 #include <cfloat>
+#include <climits>
+#include <cmath>
 #include <chrono>
 
 namespace Tangram {
@@ -48,7 +50,7 @@ constexpr double kAnchorRefineBudgetMs = 2.0;  // round 6: was 4.0; trace 140216
 // mosaic's pyramid is cached, but a fresh pyramid build is not, and refinePriority() (unlike
 // refineAnchor()) was never gated at all - one call per not-yet-refined label, every frame,
 // no ceiling.
-constexpr double kPriorityRefineBudgetMs = 2.0;  // round 6: was 4.0
+constexpr double kPriorityRefineBudgetMs = 4.0;  // round 6: was 4.0
 
 // docs/label-placement-v2-spec.md's "Deterministic-but-not-jittery collision resolution"
 // (Option A) -- see LabelManager::priorityComparator()'s own comment for the full
@@ -137,8 +139,13 @@ void LabelManager::processLabelUpdate(const ViewState& _viewState, const LabelSe
     bool setElev = useElev && (_marker || tileHasElev);
     if (useElev) {
         if (_tile) {
+            // A tile without its own elevation raster (e.g. the peaks-only source, which
+            //  deliberately does not drag a DEM tile per far vector tile along) accepts a DEM
+            //  up to 7 levels coarser than the tile itself: far peaks sit on coarse terrain
+            //  and must still be given an elevation, or they stay at sea level, under it.
             _elevManager->setMinZoom(!_tile->rasters().empty() ?
-                                     _tile->rasters().back().tileID.z : std::min(int(_tile->getID().z), 14));
+                                     _tile->rasters().back().tileID.z
+                                     : std::max(0, std::min(int(_tile->getID().z), 14) - 7));
         }
         // if depth data is older than last frame, we have to recalculate label positions
         auto& depthData = _elevManager->getDepthData();
@@ -281,6 +288,27 @@ void LabelManager::processLabelUpdate(const ViewState& _viewState, const LabelSe
             continue;
         }
 
+        // Distance-aware peak density (Label::Options::dominanceGate): show a peak only while
+        // its measured dominance radius is a sufficient fraction of its distance from the
+        // camera. The icon and its linked text labels read the same number (gateOwner()), so
+        // they appear and disappear together; the actual hiding happens in handleOcclusions()
+        // (and the render-only path below) via occlude(), so labels fade out normally.
+        if (const Label* owner = (_tile && _elevManager && _elevManager->m_elevationSource) ? label->gateOwner() : nullptr) {
+            // clip.w = depth along the view axis, in projected meters; scale to ground meters
+            float depthPm = label->screenCoord().w != 0.f ? 1.f / label->screenCoord().w : 0.f;
+            double py = _tile->getOrigin().y + double(label->modelCenter().y) * _tile->getScale();
+            float depthM = depthPm / float(std::cosh(py / 6378137.0));
+            bool wasShown = !label->gatedOut();
+            float ratio = owner->options().dominanceGate;
+            bool pass = Label::passesDominanceGate(owner->dominanceMeters(), depthM, ratio, wasShown);
+            // Collision rank = the peak's own dominance (how big a deal it is), NOT dominance/
+            // distance: the latter ranks any foreground bump above a distant major summit
+            // (200 m / 300 m beats 9 km / 20 km), which is the opposite of "most prominent".
+            // The gate above already makes distance matter for visibility.
+            label->setGateResult(!pass, owner->dominanceMeters());
+            if (!pass) { label->occlude(); }
+        }
+
         ProfileAccum _pdepth(m_prof[kProfDepth], m_profOn);
         if (useElev) {
             // clamp to viewport to get reasonable behavior for labels entering and leaving screen
@@ -306,7 +334,7 @@ void LabelManager::processLabelUpdate(const ViewState& _viewState, const LabelSe
 
         bool isProxy = _tile && _tile->isProxy();
         if (_onlyRender) {
-            if (label->occludedLastFrame()) { label->occlude(); }
+            if (label->occludedLastFrame() || label->gatedOut()) { label->occlude(); }
 
             if (label->visibleState() || !label->canOcclude()) {
                 m_needUpdate |= label->evalState(_dt);
@@ -532,6 +560,21 @@ bool LabelManager::priorityComparator(const LabelEntry& _a, const LabelEntry& _b
     if (aprio != bprio) {
         return aprio < bprio;
     }
+    // Distance-gated peaks: within the named/unnamed half-tier band, the peak with the larger
+    // dominance radius wins a collision, ahead of the
+    // generic "closer to camera" and "higher tile zoom" rules below - those would otherwise
+    // let any minor foreground knoll beat a major summit on the horizon, which is exactly
+    // backwards for "what's that peak". Bucketed on a log scale (~26% steps) so this stays a
+    // strict weak ordering and ties fall through to the existing deterministic chain.
+    if (_a.label->gateOwner() && _b.label->gateOwner()) {
+        float aband = std::floor(_a.priority * 2.f), bband = std::floor(_b.priority * 2.f);
+        if (aband != bband) { return aband < bband; }
+        // read from the owning icon, not the label itself: an icon and its linked text must
+        // compare identically or a child could sort ahead of its parent (parents are expected
+        // to be resolved first, see handleOcclusions())
+        int ab = _a.label->gateOwner()->apparentBucket(), bb = _b.label->gateOwner()->apparentBucket();
+        if (ab != bb) { return ab > bb; }
+    }
     if (_a.tile && _b.tile) {
         if (_a.tile->getID().z != _b.tile->getID().z) {
             return _a.tile->getID().z > _b.tile->getID().z;  // higher zoom over lower zoom
@@ -691,6 +734,13 @@ void LabelManager::handleOcclusions(const ViewState& _viewState, bool _hideExtra
           l->occlude();
           l->skipTransitions();
           continue;
+        }
+
+        // Distance-gated peak (see processLabelUpdate()): hidden regardless of collisions, and,
+        // not being inserted into the collision grid below, it doesn't displace anything.
+        if (l->gatedOut()) {
+            l->occlude();
+            continue;
         }
 
         // Parent must have been processed earlier so at this point its

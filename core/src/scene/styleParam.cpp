@@ -33,6 +33,9 @@ const std::map<std::string, StyleParamKey> s_StyleParamMap = {
     {"flat", StyleParamKey::flat},
     {"font:family", StyleParamKey::text_font_family},
     {"font:fill", StyleParamKey::text_font_fill},
+    {"font:letter_spacing", StyleParamKey::text_font_letter_spacing},
+    {"font:letter_spacing_fit", StyleParamKey::text_font_letter_spacing_fit},
+    {"font:letter_spacing_max", StyleParamKey::text_font_letter_spacing_max},
     {"font:size", StyleParamKey::text_font_size},
     {"font:stroke:color", StyleParamKey::text_font_stroke_color},
     {"font:stroke:width", StyleParamKey::text_font_stroke_width},
@@ -61,13 +64,18 @@ const std::map<std::string, StyleParamKey> s_StyleParamMap = {
     {"placement_spacing", StyleParamKey::placement_spacing},
     {"priority", StyleParamKey::priority},
     {"priority_texture_shading", StyleParamKey::priority_texture_shading},
+    {"dominance_gate", StyleParamKey::dominance_gate},
     {"repeat_distance", StyleParamKey::repeat_distance},
     {"repeat_group", StyleParamKey::repeat_group},
     {"size", StyleParamKey::size},
+    {"smooth", StyleParamKey::text_smooth},
+    {"path_offset", StyleParamKey::text_path_offset},
     {"sprite", StyleParamKey::sprite},
     {"sprite_default", StyleParamKey::sprite_default},
     {"style", StyleParamKey::style},
     {"text2:font:family", StyleParamKey::text2_font_family},
+    {"text2:font:fill", StyleParamKey::text2_font_fill},
+    {"text2:font:letter_spacing", StyleParamKey::text2_font_letter_spacing},
     {"text2:font:size", StyleParamKey::text2_font_size},
     {"text2:font:weight", StyleParamKey::text2_font_weight},
     {"text2:text_source", StyleParamKey::text2_source},
@@ -80,6 +88,9 @@ const std::map<std::string, StyleParamKey> s_StyleParamMap = {
     {"text:font:alpha", StyleParamKey::text_font_alpha},
     {"text:font:family", StyleParamKey::text_font_family},
     {"text:font:fill", StyleParamKey::text_font_fill},
+    {"text:font:letter_spacing", StyleParamKey::text_font_letter_spacing},
+    {"text:font:letter_spacing_fit", StyleParamKey::text_font_letter_spacing_fit},
+    {"text:font:letter_spacing_max", StyleParamKey::text_font_letter_spacing_max},
     {"text:font:size", StyleParamKey::text_font_size},
     {"text:font:stroke:alpha", StyleParamKey::text_font_stroke_alpha},
     {"text:font:stroke:color", StyleParamKey::text_font_stroke_color},
@@ -94,6 +105,8 @@ const std::map<std::string, StyleParamKey> s_StyleParamMap = {
     {"text:order", StyleParamKey::text_order},
     {"text:priority", StyleParamKey::text_priority},
     {"text:repeat_distance", StyleParamKey::text_repeat_distance},
+    {"text:smooth", StyleParamKey::text_smooth},
+    {"text:path_offset", StyleParamKey::text_path_offset},
     {"text:repeat_group", StyleParamKey::text_repeat_group},
     {"text:text_source", StyleParamKey::text_source},
     {"text:text_source:left", StyleParamKey::text_source_left},
@@ -374,6 +387,13 @@ StyleParam::Value StyleParam::parseNode(StyleParamKey key, const YAML::Node& nod
     case StyleParamKey::outline_miter_limit:
     case StyleParamKey::placement_min_length_ratio:
     case StyleParamKey::text_anchor_gap_scale:
+    case StyleParamKey::dominance_gate:
+    case StyleParamKey::text_font_letter_spacing:
+    case StyleParamKey::text_font_letter_spacing_fit:
+    case StyleParamKey::text_font_letter_spacing_max:
+    case StyleParamKey::text2_font_letter_spacing:
+    case StyleParamKey::text_smooth:
+    case StyleParamKey::text_path_offset:
     case StyleParamKey::text_font_stroke_width: {
         float floatValue;
         if (YamlUtil::getFloat(node, floatValue, true)) {
@@ -386,6 +406,7 @@ StyleParam::Value StyleParam::parseNode(StyleParamKey key, const YAML::Node& nod
     case StyleParamKey::color:
     case StyleParamKey::outline_color:
     case StyleParamKey::text_font_fill:
+    case StyleParamKey::text2_font_fill:
     case StyleParamKey::text_font_stroke_color: {
         Color result;
         if (parseColor(node, result)) {
@@ -509,6 +530,7 @@ std::string StyleParam::toString() const {
     case StyleParamKey::outline_style:
     case StyleParamKey::repeat_distance:
     case StyleParamKey::text_font_fill:
+    case StyleParamKey::text2_font_fill:
     case StyleParamKey::text_font_stroke_color:
     case StyleParamKey::text_repeat_distance:
     case StyleParamKey::cap:
@@ -527,6 +549,13 @@ std::string StyleParam::toString() const {
     case StyleParamKey::angle:
     case StyleParamKey::outline_miter_limit:
     case StyleParamKey::text_anchor_gap_scale:
+    case StyleParamKey::dominance_gate:
+    case StyleParamKey::text_font_letter_spacing:
+    case StyleParamKey::text_font_letter_spacing_fit:
+    case StyleParamKey::text_font_letter_spacing_max:
+    case StyleParamKey::text2_font_letter_spacing:
+    case StyleParamKey::text_smooth:
+    case StyleParamKey::text_path_offset:
         if (!value.is<float>()) break;
         return k + std::to_string(value.get<float>());
     default:
@@ -714,6 +743,7 @@ bool StyleParam::isColor(StyleParamKey _key) {
         case StyleParamKey::color:
         case StyleParamKey::outline_color:
         case StyleParamKey::text_font_fill:
+        case StyleParamKey::text2_font_fill:
         case StyleParamKey::text_font_stroke_color:
             return true;
         default:
@@ -771,6 +801,12 @@ bool StyleParam::isNumberType(StyleParamKey _key) {
         case StyleParamKey::miter_limit:
         case StyleParamKey::outline_miter_limit:
         case StyleParamKey::placement_min_length_ratio:
+        case StyleParamKey::text_font_letter_spacing:
+        case StyleParamKey::text_font_letter_spacing_fit:
+        case StyleParamKey::text_font_letter_spacing_max:
+        case StyleParamKey::text2_font_letter_spacing:
+        case StyleParamKey::text_smooth:
+        case StyleParamKey::text_path_offset:
             return true;
         default:
             return false;

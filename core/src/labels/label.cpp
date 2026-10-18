@@ -3,6 +3,7 @@
 #include "labels/anchorOccupancyGrid.h"
 #include "log.h"
 #include "platform.h"
+#include "data/rasterSource.h"
 #include "tile/tile.h"
 #include "util/elevationManager.h"
 #include "util/geom.h"
@@ -12,6 +13,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <unordered_map>
 
 namespace Tangram {
 
@@ -96,10 +98,69 @@ float Label::isolationScore(double peakElev, float regionMaxElev, float marginMe
 
 bool Label::refinePriority(ElevationManager& elevMgr, glm::dvec2 origin, double scale,
                            float viewportMaxElev, bool haveViewportMaxElev) {
-    if (!m_options.refinePriorityWithTextureShading) { return true; }
+    const bool wantShade = m_options.refinePriorityWithTextureShading;
+    const bool wantDominance = m_options.dominanceGate > 0.f;
+    if (!wantShade && !wantDominance) { return true; }
     if (!elevMgr.m_elevationSource) { return false; }
 
     ProjectedMeters worldPos = origin + glm::dvec2(modelCenter()) * scale;
+
+    // Distance-gate input: how dominant is this peak, measured once on the loaded DEM (see
+    // peakDominanceRadius()). Done for every gated peak, including ones with a real OSM
+    // prominence tag - that tag says how prominent a summit is in absolute terms, but not
+    // how much it matters at a given viewing distance relative to what's around it.
+    if (wantDominance && m_dominanceM < 0.f) {
+        // A tile rebuild (the tile's styling zoom changed, a scene update...) creates fresh
+        // Label objects for the same peaks. Remembering the result by position means those
+        // appear at once instead of being hidden until re-measured - which looked like every
+        // label popping out and slowly back in. Main thread only, so a plain static is fine.
+        static std::unordered_map<uint64_t, float> s_dominanceByPos;
+        uint64_t posKey = (uint64_t(uint32_t(int64_t(std::llround(worldPos.x / 4.0)))) << 32)
+                        | uint64_t(uint32_t(int64_t(std::llround(worldPos.y / 4.0))));
+        auto cached = s_dominanceByPos.find(posKey);
+        if (cached != s_dominanceByPos.end()) {
+            m_dominanceM = cached->second;
+        } else {
+            // The ring samples reach far outside the tile this label lives in, where only a
+            // coarser DEM tile may be resident: take whatever is there (the caller has set a
+            // per-tile minimum zoom for placing labels, which would reject those samples).
+            // Samples go straight to the raster source with a small per-call cache of the
+            // coarse tiles found, because RasterSource::getRaster() climbs from the finest
+            // resident zoom on every call and a fully dominant peak takes ~700 samples.
+            std::unordered_map<uint64_t, Raster> tileCache;
+            auto elevAt = [&](ProjectedMeters p, double& e) {
+                constexpr int kCellZoom = 12;
+                TileID cell = MapProjection::projectedMetersTile(p, kCellZoom);
+                uint64_t key = (uint64_t(uint32_t(cell.x)) << 32) | uint64_t(uint32_t(cell.y));
+                auto it = tileCache.find(key);
+                if (it == tileCache.end()) {
+                    Raster r = elevMgr.m_elevationSource->getRaster(p);
+                    // only reuse for the whole cell when the tile found covers it entirely
+                    if (!r.texture || r.tileID.z > kCellZoom) {
+                        if (!r.texture) { return false; }
+                        e = ElevationManager::elevationLerp(*r.texture, r.tileID, p);
+                        return true;
+                    }
+                    it = tileCache.emplace(key, std::move(r)).first;
+                }
+                e = ElevationManager::elevationLerp(*it->second.texture, it->second.tileID, p);
+                return true;
+            };
+            // Ground meters per projected meter at this latitude (Web Mercator: 1/cosh(y/R)).
+            double groundPerProjected = 1.0 / std::cosh(worldPos.y / 6378137.0);
+            PeakDominance dom = peakDominanceRadius(elevAt, worldPos, groundPerProjected);
+            if (!dom.valid) { return false; }
+            // No retry when neighbouring DEM tiles are missing (dom.complete == false): a peak
+            // at the edge of the loaded area may read as more dominant than it is, which is
+            // better than the alternative - retries re-ran the full scan every frame and
+            // starved every other label of refinement budget.
+            m_dominanceM = dom.radiusMeters;
+            if (s_dominanceByPos.size() > 200000) { s_dominanceByPos.clear(); }
+            s_dominanceByPos.emplace(posKey, m_dominanceM);
+        }
+    }
+    if (!wantShade) { return true; }
+
     bool ok = false;
     float shade = sampleTextureShading(*elevMgr.m_elevationSource, worldPos, ok);
     if (!ok) { return false; }
@@ -240,6 +301,14 @@ bool Label::refineAnchor(ElevationManager& elevMgr, glm::dvec2 origin, double sc
 
         if (!sampleFootprintCost(footprintCenterTile, costs[i])) {
             return false; // retry next frame once every candidate is sampleable
+        }
+        // Soft "name above elevation" preference: a small additive cost on the wrong side of
+        // the icon. Smaller than the cost difference between a ridge crest and a flank, so
+        // avoiding prominent ridges still wins; it only decides between near-equal spots.
+        if (m_options.anchorVerticalPref != 0.f) {
+            constexpr float kVerticalPrefCost = 0.06f;
+            // dir.y < 0 is above the icon, so pref +1 (above) penalizes dir.y > 0
+            if (dir.y * m_options.anchorVerticalPref > 0.f) { costs[i] += kVerticalPrefCost; }
         }
     }
 

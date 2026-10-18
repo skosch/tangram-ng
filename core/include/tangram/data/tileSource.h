@@ -37,6 +37,12 @@ public:
         int32_t maxDisplayZoom = -1;
         // Maximum zoom for which tiles will be requested
         int32_t maxZoom = 18;
+        // If > 0: while the view's integer LOD zoom is within one level of this, the tile
+        // selection keeps subdividing this source's tiles down to at least this zoom, ignoring
+        // the per-tile distance cap that otherwise hands distant tiles a coarser zoom. For a
+        // source whose coarser tiles lack the content it exists for (the peaks source: the
+        // server emits mountain_peak from z11 only), so distant tiles must not degrade.
+        int32_t minDataZoom = 0;
         // controls the zoom level for the tiles of the tilesource to scale the tiles to
         // apt pixel
         // 0: 256 pixel tiles
@@ -147,6 +153,11 @@ public:
     int64_t generation() const { return m_generation; }
 
     const ZoomOptions& zoomOptions() { return m_zoomOptions; }
+    // MVT only: if non-empty, only these layers are decoded (YAML `mvt_layers`). For a source
+    // that shares tiles with a heavier one but uses a single layer (the peaks source), this
+    // skips decoding every road/landcover/building feature of every tile.
+    void setMvtLayers(std::vector<std::string> _layers) { m_mvtLayers = std::move(_layers); }
+    const std::vector<std::string>& mvtLayers() const { return m_mvtLayers; }
     int32_t minDisplayZoom() const { return m_zoomOptions.minDisplayZoom; }
     int32_t maxDisplayZoom() const { return m_zoomOptions.maxDisplayZoom; }
     int32_t maxZoom() const { return m_zoomOptions.maxZoom; }
@@ -202,6 +213,8 @@ protected:
 
     // zoom dependent props
     ZoomOptions m_zoomOptions;
+
+    std::vector<std::string> m_mvtLayers;
 
     // data needed to recreate MBTilesDataSource and NetworkDataSource for offline tile downloader
     OfflineInfo m_offlineInfo;

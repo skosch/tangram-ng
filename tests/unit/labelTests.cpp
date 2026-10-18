@@ -415,3 +415,23 @@ TEST_CASE( "LabelManager::priorityComparator is deterministic, not history-depen
         REQUIRE_FALSE(LabelManager::priorityComparator(eBetter, eWorse));
     }
 }
+
+TEST_CASE("Dominance gate: far peaks need more dominance, near ones little", "[Core][Label]") {
+    // ratio 0.08, need = 0.08 * d * d / (d + 10 km)
+    // 1 km summit: needs ~1067 m at 20 km, ~926 m at 18 km
+    REQUIRE(Label::passesDominanceGate(1000.f, 18000.f, 0.08f, false));
+    REQUIRE_FALSE(Label::passesDominanceGate(1000.f, 20000.f, 0.08f, false));
+    // a 200 m knoll is fine at 5 km (needs ~133 m) but not at 7 km (~230 m)
+    REQUIRE(Label::passesDominanceGate(200.f, 5000.f, 0.08f, false));
+    REQUIRE_FALSE(Label::passesDominanceGate(200.f, 7000.f, 0.08f, false));
+    // disabled gate always passes; unmeasured dominance never does
+    REQUIRE(Label::passesDominanceGate(-1.f, 1e6f, 0.f, false));
+    REQUIRE_FALSE(Label::passesDominanceGate(-1.f, 100.f, 0.08f, false));
+}
+
+TEST_CASE("Dominance gate: hysteresis keeps a shown peak a little past the threshold", "[Core][Label]") {
+    // need ~1067 at 20 km; a shown label survives down to ~907, a hidden one needs 1067
+    REQUIRE(Label::passesDominanceGate(950.f, 20000.f, 0.08f, true));
+    REQUIRE_FALSE(Label::passesDominanceGate(950.f, 20000.f, 0.08f, false));
+    REQUIRE_FALSE(Label::passesDominanceGate(850.f, 20000.f, 0.08f, true));
+}

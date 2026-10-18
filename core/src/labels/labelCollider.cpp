@@ -15,7 +15,11 @@ namespace Tangram {
 void LabelCollider::addLabels(std::vector<std::unique_ptr<Label>>& _labels) {
 
     for (auto& label : _labels) {
-        if (label->canOcclude()) {
+        // Distance-gated peaks are resolved at runtime only. Resolving them here would use the
+        // tile's provisional priority (elevation) and a fixed tile-relative screen size, and
+        // kills are permanent: with one dense z11 tile per ~15 km, most names (the widest,
+        // optional labels) were killed here before the camera, DEM or real dominance existed.
+        if (label->canOcclude() && !label->gateOwner()) {
             m_labels.push_back(label.get());
         }
     }

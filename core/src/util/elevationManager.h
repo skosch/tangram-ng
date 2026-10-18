@@ -81,6 +81,7 @@ public:
   DepthData& getDepthData() { return m_depthData[0]; }
   bool hasTile(TileID tileId);
   void setMinZoom(int z) { m_minZoom = z; }
+  int minZoom() const { return m_minZoom; }
 
   void renderTerrainDepth(RenderState& _rs, const View& _view,
                           const std::vector<std::shared_ptr<Tile>>& _tiles);

@@ -51,6 +51,9 @@ enum class StyleParamKey : uint8_t {
     point_text,
     priority,
     priority_texture_shading,
+    // Peak-style distance gate (see Label::Options::dominanceGate). Float: minimum ratio of a
+    // peak's DEM dominance radius to its camera distance; 0 / unset disables.
+    dominance_gate,
     repeat_distance,
     repeat_group,
     size,
@@ -64,6 +67,8 @@ enum class StyleParamKey : uint8_t {
     // labels instead of one combined multi-line string with a single font. See
     // PointStyleBuilder::addFeature and TextStyleBuilder::applySecondaryTextRule.
     text2_font_family,
+    text2_font_fill,
+    text2_font_letter_spacing,
     text2_font_size,
     text2_font_weight,
     text2_source,
@@ -83,6 +88,9 @@ enum class StyleParamKey : uint8_t {
     text_font_alpha,
     text_font_family,
     text_font_fill,
+    text_font_letter_spacing,
+    text_font_letter_spacing_fit,
+    text_font_letter_spacing_max,
     text_font_size,
     text_font_stroke_alpha,
     text_font_stroke_color,
@@ -94,6 +102,8 @@ enum class StyleParamKey : uint8_t {
     text_offset,
     text_optional,
     text_order,
+    text_smooth,
+    text_path_offset,
     text_priority,
     text_repeat_distance,
     text_repeat_group,

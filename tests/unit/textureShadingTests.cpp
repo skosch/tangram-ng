@@ -243,3 +243,68 @@ TEST_CASE("Texture shading sampler - cropped pyramid matches a full-mosaic refer
         }
     }
 }
+
+// ---- peakDominanceRadius -------------------------------------------------------------------
+
+namespace {
+// Synthetic DEM in projected meters near the equator (ground == projected): a main summit and
+// a lower satellite peak `dist` metres away on a connecting ridge.
+double syntheticDem(double x, double y, double satX) {
+    auto cone = [](double dx, double dy, double h, double r) {
+        double d = std::sqrt(dx * dx + dy * dy);
+        return std::max(0.0, h * (1.0 - d / r));
+    };
+    return std::max(cone(x, y, 3000.0, 6000.0), cone(x - satX, y, 2500.0, 2000.0));
+}
+}
+
+TEST_CASE("peakDominanceRadius: summit is dominant, satellite is not", "[Core][TextureShading]") {
+    const double satX = 3000.0;
+    PeakElevationFn dem = [&](ProjectedMeters p, double& e) { e = syntheticDem(p.x, p.y, satX); return true; };
+
+    PeakDominance main = peakDominanceRadius(dem, ProjectedMeters(0, 0), 1.0);
+    REQUIRE(main.valid);
+    REQUIRE(main.complete);
+    // nothing in the scene is higher: saturates at the default max radius
+    REQUIRE(main.radiusMeters == Approx(12000.f));
+
+    // The satellite is a separate, lower summit 3 km from the main one: the first ground
+    // above it is the main cone's upper slope ~2 km away, so its dominance is a couple of km.
+    PeakDominance sat = peakDominanceRadius(dem, ProjectedMeters(satX, 0), 1.0);
+    REQUIRE(sat.valid);
+    REQUIRE(sat.radiusMeters > 500.f);
+    REQUIRE(sat.radiusMeters < 4000.f);
+    REQUIRE(sat.radiusMeters < main.radiusMeters);
+}
+
+TEST_CASE("peakDominanceRadius: a taller neighbour limits the radius", "[Core][TextureShading]") {
+    // A modest summit with a broader, 400 m taller massif 4 km away.
+    PeakElevationFn dem = [&](ProjectedMeters p, double& e) {
+        auto cone = [](double dx, double dy, double h, double r) {
+            return std::max(0.0, h * (1.0 - std::sqrt(dx * dx + dy * dy) / r));
+        };
+        e = std::max(cone(p.x, p.y, 2000.0, 1500.0), cone(p.x - 4000.0, p.y, 2400.0, 3000.0));
+        return true;
+    };
+    PeakDominance d = peakDominanceRadius(dem, ProjectedMeters(0, 0), 1.0);
+    REQUIRE(d.valid);
+    // The taller ground starts ~3 km out; the estimate (geometric mean of the last clean and
+    // first dirty ring) must land well short of the neighbour's distance.
+    REQUIRE(d.radiusMeters > 500.f);
+    REQUIRE(d.radiusMeters < 4000.f);
+}
+
+TEST_CASE("peakDominanceRadius: missing DEM at the peak is not valid, missing ring is incomplete",
+          "[Core][TextureShading]") {
+    PeakElevationFn none = [](ProjectedMeters, double&) { return false; };
+    REQUIRE_FALSE(peakDominanceRadius(none, ProjectedMeters(0, 0), 1.0).valid);
+
+    PeakElevationFn centerOnly = [](ProjectedMeters p, double& e) {
+        if (std::hypot(p.x, p.y) > 100.0) { return false; }
+        e = 1000.0;
+        return true;
+    };
+    PeakDominance d = peakDominanceRadius(centerOnly, ProjectedMeters(0, 0), 1.0);
+    REQUIRE(d.valid);
+    REQUIRE_FALSE(d.complete);
+}

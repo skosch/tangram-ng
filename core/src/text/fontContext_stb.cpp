@@ -4,6 +4,8 @@
 #include "platform.h"
 #include <algorithm>
 #include <memory>
+#include <mutex>
+#include <set>
 #ifdef FONS_WPATH
 #include <codecvt>
 #endif
@@ -173,6 +175,9 @@ bool FontContext::layoutLine(TextStyle::Parameters& _params, float x, float y,
     fonsSetFont(&state, _params.font - 1);
     fonsSetSize(&state, fonsEmSizeToSize(&state, _params.fontSize));
     fonsSetBlur(&state, _params.strokeWidth);  // pads quads by strokeWidth
+    // Letter-spacing: fontstash adds `spacing` px between every pair of adjacent glyphs
+    //  (never before the first), which is exactly tracking. _params.letterSpacing is in em.
+    fonsSetSpacing(&state, _params.letterSpacing * _params.fontSize);
 
     fonsGetAtlasSize(m_fons, &iw, &ih, NULL);
     fonsTextIterInit(&state, &iter, x, y, start, end, FONS_GLYPH_BITMAP_REQUIRED);
@@ -212,6 +217,7 @@ int FontContext::layoutMultiline(TextStyle::Parameters& _params, const std::stri
     fonsInitState(m_fons, &state);
     fonsSetFont(&state, _params.font - 1);
     fonsSetSize(&state, fonsEmSizeToSize(&state, _params.fontSize));
+    fonsSetSpacing(&state, _params.letterSpacing * _params.fontSize);  // see layoutLine()
     // pass negative integer for line width to use max chars instead of max width
     float maxChars = std::min(1U << 24, _params.maxLineWidth);
     size_t nrows = fonsBreakLines(&state, start, end, -maxChars, rows.data(), rows.size());
@@ -389,6 +395,17 @@ int FontContext::getFont(const std::string& _family, const std::string& _style,
         auto systemFontHandle = m_platform.systemFont(_family, _weight, _style);
         font = loadFontSource(alias, systemFontHandle);
         if (font >= 0) return font + 1;
+    }
+    {
+        // A scene asking for a family/weight/style it never declared (and the OS can't supply)
+        //  silently renders in the default font - say so, once per alias.
+        static std::mutex warnMutex;
+        static std::set<std::string> warned;
+        std::lock_guard<std::mutex> lock(warnMutex);
+        std::string alias = FontDescription::Alias(_family, _style, _weight);
+        if (_family != "default" && warned.insert(alias).second) {
+            LOGW("Font '%s' not found, falling back to the default font", alias.c_str());
+        }
     }
     if(_family != "default")
         return getFont("default", _style, _weight, _size);

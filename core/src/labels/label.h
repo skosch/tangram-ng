@@ -12,6 +12,8 @@
 #include <climits> // needed in aabb.h
 #include "aabb.h"
 #include "obb.h"
+#include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <cstdint>
 #include <string>
@@ -98,6 +100,20 @@ public:
         // couldn't include texture shading itself, since the sampler is main-thread-only --
         // see anchorCandidateCost()'s comment). See Label::refineAnchor().
         bool refineAnchorWithTextureShading = false;
+        // Distance-aware label density for peaks ("what's that peak on the horizon?"). 0
+        // disables. Otherwise a peak icon (and the text labels linked to it) is shown only
+        // while its DEM dominance radius (Label::dominanceMeters(): the radius within which
+        // it is the highest point, measured on the loaded DEM once the elevation mosaic is
+        // available) is at least `dominanceGate` times its distance from the camera. So a
+        // minor knoll appears only when you are close, a regional summit out to a few tens of
+        // km, and only the dominant massifs near the horizon - see LabelManager::
+        // processLabelUpdate() and Label::passesDominanceGate().
+        float dominanceGate = 0.f;
+        // Soft vertical placement preference used by Label::refineAnchor() as a small additive
+        // cost on candidate anchors: +1 = prefer placing above the icon (a peak's name), -1 =
+        // prefer below (its elevation), 0 = none. Deliberately smaller than a real ridge/
+        // vector-clutter cost difference, so it only breaks near-ties.
+        float anchorVerticalPref = 0.f;
     };
 
     static const float activation_distance_threshold;
@@ -247,6 +263,46 @@ public:
     // _definePriority=true. See LabelManager::processLabelUpdate().
     void syncRelativePriority();
 
+    // --- Distance-aware peak gate (Options::dominanceGate) ---
+    //
+    // The label whose dominance data governs this one: itself when it carries the gate (the
+    // peak icon), its relative when that does (the icon's linked name/elevation text), else
+    // null (not a gated label).
+    const Label* gateOwner() const {
+        if (m_options.dominanceGate > 0.f) { return this; }
+        if (m_relative && m_relative->m_options.dominanceGate > 0.f) { return m_relative; }
+        return nullptr;
+    }
+    // Dominance radius in ground meters, or < 0 while not yet measured (see refinePriority()).
+    float dominanceMeters() const { return m_dominanceM; }
+    // Result of the most recent gate evaluation (LabelManager::processLabelUpdate()) and the
+    // dominance it was ranked by; priorityComparator() ranks gated peaks by the latter.
+    bool gatedOut() const { return m_gatedOut; }
+    float apparentScore() const { return m_apparentScore; }
+    // Log-scale bucket (~26% steps) of apparentScore(), precomputed per frame so the sort
+    // comparator doesn't call log2 per comparison; INT_MIN when unknown.
+    int apparentBucket() const { return m_apparentBucket; }
+    void setGateResult(bool _out, float _score) {
+        m_gatedOut = _out;
+        m_apparentScore = _score;
+        m_apparentBucket = _score > 0.f ? int(std::floor(std::log2(_score) * 3.f)) : INT_MIN;
+    }
+
+    // Pure gate decision, factored out for unit testing. `wasShown` applies hysteresis (a
+    // label that is currently passing stays until it falls 15% short, so it doesn't flicker
+    // at the threshold while the camera drifts). An unmeasured dominance (< 0) never passes.
+    //
+    // Required dominance is ratio * d * d / (d + 10 km): ~ratio * d at long range, but much more
+    // lenient up close (a plain ratio * d demanded 480 m of dominance at 6 km, which hid every
+    // minor peak in the foreground, where the user wants the dense labelling).
+    static bool passesDominanceGate(float _dominanceM, float _depthM, float _ratio, bool _wasShown) {
+        if (_ratio <= 0.f) { return true; }
+        if (_dominanceM < 0.f) { return false; }
+        float d = std::max(_depthM, 1.f);
+        float need = _ratio * d * d / (d + 10000.f);
+        return _dominanceM >= (_wasShown ? 0.85f * need : need);
+    }
+
     // Current screen position of the label anchor
     glm::vec2 screenCenter() const { return glm::vec2(m_screenCenter); }
     glm::vec4 screenCoord() const { return m_screenCenter; }
@@ -375,6 +431,12 @@ protected:
     bool m_occluded;
     int m_stableFrames = 0;
 
+    // Options::dominanceGate state - see gateOwner()/setGateResult().
+    float m_dominanceM = -1.f;
+    bool m_gatedOut = false;
+    float m_apparentScore = 0.f;
+    int m_apparentBucket = INT_MIN;
+
     glm::vec4 m_screenCenter;
     float m_alpha;
 };
@@ -392,6 +454,8 @@ namespace std {
             hash_combine(seed, o.collide);
             hash_combine(seed, o.refinePriorityWithTextureShading);
             hash_combine(seed, o.refineAnchorWithTextureShading);
+            hash_combine(seed, o.dominanceGate);
+            hash_combine(seed, o.anchorVerticalPref);
             hash_combine(seed, o.repeatDistance);
             hash_combine(seed, o.repeatGroup);
             hash_combine(seed, (int)o.selectTransition.ease);

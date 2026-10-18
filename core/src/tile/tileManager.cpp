@@ -344,7 +344,15 @@ bool TileManager::updateTileSets(const View& _view) {
                 float effMaxArea = maxArea / (lodAreaBias * lodAreaBias);
                 // substantial redesign needed for something like this to work:
                 //for (auto& rs : tileSet.source->rasterSources()) { maxZoom = std::max(maxZoom, rs->maxZoom()); }
-                int maxZoom = std::min(tileSet.source->maxZoom(), viewZoomCap - zoomBias);
+                int srcZoomCap = viewZoomCap;
+                {
+                    // see ZoomOptions::minDataZoom
+                    int minDataZoom = tileSet.source->zoomOptions().minDataZoom;
+                    if (minDataZoom > 0 && _view.getIntegerLodZoom() >= minDataZoom - 1) {
+                        srcZoomCap = std::max(srcZoomCap, minDataZoom + zoomBias);
+                    }
+                }
+                int maxZoom = std::min(tileSet.source->maxZoom(), srcZoomCap - zoomBias);
                 bool stoppedByMaxZoom = tileId.z >= maxZoom;
                 bool stop = stoppedByMaxZoom || area < effMaxArea*std::exp2(2*float(zoomBias));
                 // Saliency override (elevation raster source only): salient terrain keeps
@@ -404,6 +412,17 @@ bool TileManager::updateTileSets(const View& _view) {
                         float stepExponent = tileSet.source->overzoomStepExponent();
                         int s = tileId.z + std::max(0, int(std::ceil(std::log2(area/effMaxArea)/stepExponent)));
                         visId.s = std::max(std::min(s, viewZoomCap), visId.z + zoomBias);
+                    }
+                    // minDataZoom sources (the peaks source) must not follow the view zoom with
+                    // their styling zoom: `s` is part of the tile id, so every change rebuilds
+                    // the tile and every label in it (which then re-measures, re-places and
+                    // pops back in). Quantize to two levels: the data zoom (coarse: far tiles,
+                    // a capped set of peaks) and data zoom + 2 where the tile is near enough
+                    // that the view zoom is at least that (everything, uncapped, incl. $zoom 12+).
+                    const int minDataZoom = tileSet.source->zoomOptions().minDataZoom;
+                    if (minDataZoom > 0) {
+                        visId.s = (viewZoomCap >= minDataZoom + 2) ? std::max<int>(visId.z + zoomBias, minDataZoom + 2)
+                                                                    : visId.z + zoomBias;
                     }
                     tileSet.visibleTiles.insert(visId);
                     if (demCfg.enabled && tileSet.source->isRaster() && tileSet.source->name() == "elevation") {

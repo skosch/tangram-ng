@@ -290,4 +290,64 @@ float sampleTextureShading(RasterSource& elevationSource, ProjectedMeters worldP
     return sampleFromPyramid(*hit->pyramid, raster.tileID, worldPos, mosaicW);
 }
 
+PeakDominance peakDominanceRadius(const PeakElevationFn& elevAt, ProjectedMeters pos,
+                                  double groundPerProjected, float maxRadius) {
+    PeakDominance out;
+    const double kTwoPi = 6.283185307179586;
+    double gpp = std::max(groundPerProjected, 1e-3);
+
+    double ref = 0;
+    if (!elevAt(pos, ref)) { return out; }
+    out.valid = true;
+
+    // The tagged summit is rarely exactly on the DEM's highest texel, particularly in the
+    // coarse tiles used for distant terrain: take the max over a ~60 m neighbourhood.
+    const double r60 = 60.0 / gpp;
+    for (int k = 0; k < 8; k++) {
+        double a = k * kTwoPi / 8.0, e = 0;
+        if (elevAt(ProjectedMeters(pos.x + std::cos(a) * r60, pos.y + std::sin(a) * r60), e)) {
+            ref = std::max(ref, e);
+        }
+    }
+    out.peakElev = ref;
+
+    // Polar sampling grid whose spacing is a constant fraction (~15%) of the radius, so a
+    // taller neighbour's summit cap is hit at any distance with a roughly constant ~1500
+    // samples for a fully dominant peak. Rings are visited outwards and the scan stops at the
+    // first sample above the peak, so the many minor bumps in a view exit within a few rings
+    // and cost tens of samples, not thousands.
+    const double r0 = 120.0, growth = 1.25;
+    const int kRingSamples = 36;
+    double lastClean = r0 / growth;
+    int total = 0, missing = 0;
+    bool escaped = true;
+    int ring = 0;
+    for (double R = r0; R <= maxRadius * 1.0001; R *= growth, ring++) {
+        // slack for DEM noise / resolution and for ridges that climb very gently away
+        double tol = 8.0 + 0.006 * R;
+        double rp = R / gpp;
+        // golden-ratio phase so successive rings don't line up into radial spokes
+        double phase = std::fmod(ring * 0.618034, 1.0);
+        bool clean = true;
+        for (int k = 0; k < kRingSamples && clean; k++) {
+            double a = (k + phase) * kTwoPi / kRingSamples, e = 0;
+            total++;
+            if (!elevAt(ProjectedMeters(pos.x + std::cos(a) * rp, pos.y + std::sin(a) * rp), e)) {
+                missing++;
+                continue;
+            }
+            if (e > ref + tol) { clean = false; }
+        }
+        if (!clean) {
+            out.radiusMeters = float(std::sqrt(lastClean * R));
+            escaped = false;
+            break;
+        }
+        lastClean = R;
+    }
+    if (escaped) { out.radiusMeters = maxRadius; }
+    out.complete = missing * 10 <= total * 3;  // <= 30% of samples unavailable
+    return out;
+}
+
 }

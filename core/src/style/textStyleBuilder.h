@@ -64,16 +64,34 @@ public:
     bool addStraightTextLabels(const Line& _feature, float _labelWidth,
                                const std::function<void(glm::vec2,glm::vec2)>& _onAddLabel);
 
+    // `_centered`: emit exactly one candidate spanning the whole of `_feature`, centered
+    // on its midpoint (used for polygon spines) instead of the sliding-window set of
+    // candidates used for line features.
     void addCurvedTextLabels(const Line& _feature, const TextStyle::Parameters& _params,
-                             const LabelAttributes& _attributes, const DrawRule& _rule);
+                             const LabelAttributes& _attributes, const DrawRule& _rule,
+                             bool _centered = false);
+
+    // Re-lay-out `_params`' text with the tracking that makes it span `_fit` of
+    // `_pathLengthPx` (docs/label-typography.md): never tighter than the baseline
+    // `letterSpacing`, never wider than `letterSpacingMax`. Fills `_attributes`.
+    bool prepareTrackedLabel(TextStyle::Parameters& _params, Label::Type _type,
+                             LabelAttributes& _attributes, float _pathLengthPx);
 
     // Phase 5 (docs/label-placement-plan.md): for a sufficiently elongated polygon ring,
     // build a CurvedLabel following its principal axis (reusing addCurvedTextLabels).
     // Returns false if the ring isn't a good curve candidate (too compact, degenerate, or
     // the axis couldn't be cleanly clipped to the boundary) -- caller should fall back to
     // a plain centroid point label in that case.
-    bool addCurvedPolygonLabel(const Line& _ring, const TextStyle::Parameters& _params,
+    bool addCurvedPolygonLabel(const Polygon& _polygon, const TextStyle::Parameters& _params,
                                const LabelAttributes& _attributes, const DrawRule& _rule);
+
+    // Area labelling (docs/label-typography.md, "area label planner"): one label for a lake /
+    // park / glacier polygon that never leaves the polygon. Chooses between a horizontal block
+    // (1-3 lines, tracking and line spacing stretched to the room) and a single line along the
+    // polygon's spine, and places it where there is most room. Returns true when the polygon
+    // was dealt with, *including* when there is no room and the label is deliberately dropped.
+    bool addAreaLabel(const Polygon& _polygon, const TextStyle::Parameters& _params,
+                      const DrawRule& _rule);
 
     bool handleBoundaryLabel(const Feature& _feat, const DrawRule& _rule,
                              const TextStyle::Parameters& _params);

@@ -14,6 +14,7 @@ MODULE_SOURCES = \
   unit/flyToTest.cpp \
   unit/geomTests.cpp \
   unit/jobQueueTests.cpp \
+  unit/labelPathTests.cpp \
   unit/labelsTests.cpp \
   unit/labelTests.cpp \
   unit/layerTests.cpp \

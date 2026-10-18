@@ -187,6 +187,7 @@ bool StyleContext::evalStyle(FunctionID _id, StyleParamKey _key, StyleParam::Val
             case StyleParamKey::color:
             case StyleParamKey::outline_color:
             case StyleParamKey::text_font_fill:
+            case StyleParamKey::text2_font_fill:
             case StyleParamKey::text_font_stroke_color: {
                 Color result;
                 if (StyleParam::parseColor(value, result)) {
@@ -244,6 +245,7 @@ bool StyleContext::evalStyle(FunctionID _id, StyleParamKey _key, StyleParam::Val
             case StyleParamKey::color:
             case StyleParamKey::outline_color:
             case StyleParamKey::text_font_fill:
+            case StyleParamKey::text2_font_fill:
             case StyleParamKey::text_font_stroke_color: {
                 if (len < 3 || len > 4) {
                     LOGW("Wrong array size for color: '%d'.", len);
@@ -308,6 +310,14 @@ bool StyleContext::evalStyle(FunctionID _id, StyleParamKey _key, StyleParam::Val
             case StyleParamKey::text_font_stroke_alpha:
             case StyleParamKey::text_priority:
             case StyleParamKey::text_font_stroke_width:
+            case StyleParamKey::text_font_size:
+            case StyleParamKey::text2_font_size:
+            case StyleParamKey::text_font_letter_spacing:
+            case StyleParamKey::text_font_letter_spacing_fit:
+            case StyleParamKey::text_font_letter_spacing_max:
+            case StyleParamKey::text2_font_letter_spacing:
+            case StyleParamKey::text_smooth:
+            case StyleParamKey::text_path_offset:
             case StyleParamKey::placement_min_length_ratio: {
                 _val = static_cast<float>(number);
                 break;
@@ -323,6 +333,7 @@ bool StyleContext::evalStyle(FunctionID _id, StyleParamKey _key, StyleParam::Val
             case StyleParamKey::color:
             case StyleParamKey::outline_color:
             case StyleParamKey::text_font_fill:
+            case StyleParamKey::text2_font_fill:
             case StyleParamKey::text_font_stroke_color: {
                 _val = static_cast<uint32_t>(number);
                 break;

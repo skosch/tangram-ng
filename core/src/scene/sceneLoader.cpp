@@ -717,6 +717,9 @@ std::shared_ptr<TileSource> SceneLoader::loadSource(const Node& _source, const s
     if (const auto& maxZoomNode = _source["max_zoom"]) {
         YamlUtil::getInt(maxZoomNode, zoomOptions.maxZoom);
     }
+    if (const auto& minDataZoomNode = _source["min_data_zoom"]) {
+        YamlUtil::getInt(minDataZoomNode, zoomOptions.minDataZoom);
+    }
     if (const auto& zoomOffsetNode = _source["zoom_offset"]) {
         YamlUtil::getInt(zoomOffsetNode, zoomOffset);
     }
@@ -881,6 +884,15 @@ std::shared_ptr<TileSource> SceneLoader::loadSource(const Node& _source, const s
             return nullptr;
         }
         sourcePtr->setFormat(vectorFmt);
+        if (const Node& layersNode = _source["mvt_layers"]) {
+            std::vector<std::string> mvtLayers;
+            if (layersNode.IsSequence()) {
+                for (const auto& l : layersNode) { if (l.IsScalar()) { mvtLayers.push_back(l.Scalar()); } }
+            } else if (layersNode.IsScalar()) {
+                mvtLayers.push_back(layersNode.Scalar());
+            }
+            sourcePtr->setMvtLayers(std::move(mvtLayers));
+        }
     }
 
     sourcePtr->setOfflineInfo({cachefile, url, urlOptions, vectorFmt});

@@ -408,11 +408,11 @@ void View::updateMatrices() {
         // Minimum camera clearance above terrain: a heightfield sampled at ~1 m per pixel is no
         //  longer a rock face, and looking straight at a wall from a few hundred meters shows
         //  nothing but DEM texels and procedural noise. The clearance corresponds to zoom
-        //  ASCEND_TERRAIN_MAX_ZOOM (default 16.5, ~1 m/pixel at mid latitudes), independent of the
+        //  ASCEND_TERRAIN_MAX_ZOOM (default 17.5, ~0.5 m/pixel at mid latitudes; was 16.5), independent of the
         //  (higher) overall max zoom used over flat/2D content.
         static const float terrainMaxZoom = [] {
             const char* e = std::getenv("ASCEND_TERRAIN_MAX_ZOOM");
-            return e ? float(std::atof(e)) : 16.5f;
+            return e ? float(std::atof(e)) : 17.5f;
         }();
         double minCameraDist = exp2(-std::min(m_maxZoom, terrainMaxZoom)) * worldToCameraHeight;
         double prevCamDist = exp2(-m_elevationManager->getDepthData().zoom) * worldToCameraHeight;

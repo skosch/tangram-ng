@@ -1,3 +1,5 @@
+#include <cmath>
+#include <algorithm>
 #include "data/tileSource.h"
 
 #include "data/formats/geoJson.h"
@@ -96,14 +98,63 @@ void TileSource::loadTileData(std::shared_ptr<TileTask> _task, TileTaskCb _cb) {
     }
 }
 
-std::shared_ptr<TileData> TileSource::parse(const TileTask& _task) const {
-    switch (m_format) {
-    case Format::TopoJson: return TopoJson::parseTile(_task, m_id);
-    case Format::GeoJson: return GeoJson::parseTile(_task, m_id);
-    case Format::Mvt: return Mvt::parseTile(_task, m_id);
+// The tile server writes a glacier's name only on its centroid point (poi layer); the glacier
+// POLYGON (landuse layer) carries the same `area` but no name. Area labels need the polygon, so
+// copy the name over to the polygon with the identical area (docs/label-typography.md).
+static void joinGlacierNames(TileData& _data) {
+    Layer* poi = nullptr;
+    Layer* landuse = nullptr;
+    for (auto& layer : _data.layers) {
+        if (layer.name == "poi") { poi = &layer; }
+        else if (layer.name == "landuse") { landuse = &layer; }
     }
-    assert(false);
-    return nullptr;
+    if (!poi || !landuse) { return; }
+
+    struct Named { double area; const Properties* props; };
+    std::vector<Named> named;
+    for (auto& f : poi->features) {
+        double area;
+        std::string nat, name;
+        if (f.props.getString("natural", nat) && nat == "glacier" &&
+            f.props.getString("name", name) && !name.empty() && f.props.getNumber("area", area)) {
+            named.push_back({area, &f.props});
+        }
+    }
+    if (named.empty()) { return; }
+
+    for (auto& f : landuse->features) {
+        std::string nat, name;
+        double area;
+        if (f.geometryType != GeometryType::polygons) { continue; }
+        if (!f.props.getString("natural", nat) || nat != "glacier") { continue; }
+        if (f.props.getString("name", name) && !name.empty()) { continue; }
+        if (!f.props.getNumber("area", area)) { continue; }
+        for (const auto& n : named) {
+            if (std::abs(n.area - area) <= 1e-6 * std::max(1.0, std::abs(area))) {
+                for (const char* key : {"name", "name_en", "osm_id"}) {
+                    std::string v;
+                    if (n.props->getString(key, v)) { f.props.set(key, v); }
+                }
+                break;
+            }
+        }
+    }
+}
+
+std::shared_ptr<TileData> TileSource::parse(const TileTask& _task) const {
+    std::shared_ptr<TileData> data;
+    switch (m_format) {
+    case Format::TopoJson: data = TopoJson::parseTile(_task, m_id); break;
+    case Format::GeoJson: data = GeoJson::parseTile(_task, m_id); break;
+    case Format::Mvt:
+        data = Mvt::parseTile(_task, m_id, m_mvtLayers.empty() ? nullptr : &m_mvtLayers);
+        break;
+    default:
+        assert(false);
+        return nullptr;
+    }
+    if (data) { joinGlacierNames(*data); }
+    return data;
 }
 
 void TileSource::cancelLoadingTile(TileTask& _task) {

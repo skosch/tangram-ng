@@ -84,6 +84,7 @@ MODULE_SOURCES = \
   src/util/extrude.cpp                \
   src/util/floatFormatter.cpp         \
   src/util/geom.cpp                   \
+  src/util/labelPath.cpp              \
   src/util/inputHandler.cpp           \
   src/util/jobQueue.cpp               \
   src/util/json.cpp                   \

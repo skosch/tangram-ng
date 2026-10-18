@@ -15,6 +15,7 @@
 #include "util/color.h"
 #include "util/geom.h"
 #include "util/mapProjection.h"
+#include "util/labelPath.h"
 #include "util/lineSampler.h"
 #include "util/textureShading.h"
 #include "view/view.h"
@@ -37,6 +38,18 @@
 namespace Tangram {
 
 const static std::string key_name("name");
+
+// True if any vertex of the polygon's outer ring lies on the tile boundary, i.e. the
+// polygon is (probably) a fragment of a larger feature clipped to this tile. Fit-to-path
+// tracking must not trust such a fragment's size: the neighbouring tile would compute a
+// different tracking for the same feature.
+static bool touchesTileEdge(const Polygon& _polygon) {
+    const float eps = 0.002f;
+    for (const auto& p : _polygon.front()) {
+        if (p.x < eps || p.x > 1.f - eps || p.y < eps || p.y > 1.f - eps) { return true; }
+    }
+    return false;
+}
 
 TextStyleBuilder::TextStyleBuilder(const TextStyle& _style) : m_style(_style) {}
 
@@ -306,18 +319,44 @@ bool TextStyleBuilder::addFeature(const Feature& _feat, const DrawRule& _rule) {
                 // single ring, i.e. no holes) with no line-offset/complex-shaping text,
                 // matching the preconditions addLineTextLabels already uses for curved
                 // line labels -- anything else falls back to the point label below.
+                if (params.letterSpacingFit > 0.f && !params.hasComplexShaping) {
+                    // Area label: lake / park / glacier name that must stay inside the shape.
+                    addAreaLabel(polygon, params, _rule);
+                    continue;
+                }
                 bool curved = false;
-                if (polygon.size() == 1 && !params.hasComplexShaping &&
-                    params.labelOptions.offset == glm::vec2(0)) {
-                    curved = addCurvedPolygonLabel(polygon.front(), params, attrib, _rule);
+                if (!params.hasComplexShaping && params.labelOptions.offset == glm::vec2(0)) {
+                    curved = addCurvedPolygonLabel(polygon, params, attrib, _rule);
                 }
 
                 if (!curved) {
                     glm::vec2 c;
                     c = centroid(polygon.front().begin(), polygon.front().end());
-                    params.labelOptions.anchors = salienceOrderedAnchors(
-                        params.labelOptions.anchors, c, glm::vec2(attrib.width, attrib.height), 0.f);
-                    addLabel(Label::Type::point, {{ c }}, params, attrib, _rule);
+
+                    // A compact polygon (round lake, small park) can still be tracked out to
+                    // fill its width: fit the label to the horizontal chord through the
+                    // centroid.
+                    TextStyle::Parameters pointParams = params;
+                    LabelAttributes pointAttrib = attrib;
+                    if (params.letterSpacingFit > 0.f && !touchesTileEdge(polygon)) {
+                        glm::vec2 s, e;
+                        if (clipLineToPolygon(c, glm::vec2(1.f, 0.f), polygon.front().begin(),
+                                              polygon.front().end(), s, e)) {
+                            LabelAttributes tracked;
+                            TextStyle::Parameters trackedParams = params;
+                            trackedParams.wordWrap = false;
+                            if (prepareTrackedLabel(trackedParams, Label::Type::point, tracked,
+                                                    glm::length(e - s) * m_tileSize)) {
+                                pointParams = trackedParams;
+                                pointAttrib = tracked;
+                            }
+                        }
+                    }
+
+                    pointParams.labelOptions.anchors = salienceOrderedAnchors(
+                        pointParams.labelOptions.anchors, c,
+                        glm::vec2(pointAttrib.width, pointAttrib.height), 0.f);
+                    addLabel(Label::Type::point, {{ c }}, pointParams, pointAttrib, _rule);
                 }
             }
 
@@ -424,7 +463,8 @@ bool TextStyleBuilder::addStraightTextLabels(const Line& _line, float _labelWidt
 //#define TANGRAM_NEW_CURVED_LABELS
 
 void TextStyleBuilder::addCurvedTextLabels(const Line& _line, const TextStyle::Parameters& _params,
-                                           const LabelAttributes& _attributes, const DrawRule& _rule) {
+                                           const LabelAttributes& _attributes, const DrawRule& _rule,
+                                           bool _centered) {
 
     // Size of pixel in tile coordinates
     const float pixelSize = 1.0f/m_tileSize;
@@ -458,7 +498,18 @@ void TextStyleBuilder::addCurvedTextLabels(const Line& _line, const TextStyle::P
     std::vector<LineRange> ranges;
     size_t npoints = sampler.numPoints();  // this can be less than _line.size() if _line has duplicate points
 
-    for (size_t i = 0; i < npoints-1; i++) {
+    if (_centered && npoints >= 2) {
+        // One candidate spanning the whole (pre-smoothed, pre-trimmed) path, centered on its
+        // midpoint: the spine of a polygon. No window sliding, no direction-change splits
+        // (the spine is already a calm curve; updateScreenTransform still rejects folds).
+        float sumAngle = 0.f;
+        for (size_t k = 1; k + 1 < npoints; k++) {
+            sumAngle += std::abs(perpDotProduct(sampler.segmentDirection(k - 1), sampler.segmentDirection(k)));
+        }
+        ranges.push_back(LineRange{0, npoints, 0, sumAngle});
+    }
+
+    for (size_t i = 0; !_centered && i < npoints-1; i++) {
 #ifdef TANGRAM_NEW_CURVED_LABELS
         // only process labels starting in this tile
         const auto& p0 = sampler.point(i);
@@ -607,41 +658,513 @@ void TextStyleBuilder::addCurvedTextLabels(const Line& _line, const TextStyle::P
 }
 
 // Elongation ratio (major/minor axis, see util/geom.h PolygonAxis) above which a polygon
-// label is curved along its principal axis instead of sitting at a bare centroid point.
+// label is curved along its spine instead of sitting at a bare centroid point.
 // Tuned by eye; per docs/label-placement-plan.md Phase 5 this needs human visual tuning.
 static constexpr float kPolygonLabelElongationThreshold = 1.5f;
 
-bool TextStyleBuilder::addCurvedPolygonLabel(const Line& _ring, const TextStyle::Parameters& _params,
-                                             const LabelAttributes& _attributes, const DrawRule& _rule) {
-    if (_ring.size() < 3) { return false; }
+bool TextStyleBuilder::prepareTrackedLabel(TextStyle::Parameters& _params, Label::Type _type,
+                                           LabelAttributes& _attributes, float _pathLengthPx) {
+    const float base = _params.letterSpacing;
+    if (_params.letterSpacingFit <= 0.f || _pathLengthPx <= 0.f) {
+        return prepareLabel(_params, _type, _attributes);
+    }
 
-    PolygonAxis axis = polygonPrincipalAxis(_ring.begin(), _ring.end());
+    // Width is affine in the tracking: w(ls) = w(base) + gaps * (ls - base) * fontSize.
+    // Measure the slope with a second probe instead of counting clusters by hand, so it
+    // is exact for whatever the shaper decided (ligatures, combining marks, line breaks).
+    const size_t quadsStart = m_quads.size();
+    constexpr float kProbe = 0.2f;
+
+    LabelAttributes a0, a1;
+    _params.letterSpacing = base;
+    if (!prepareLabel(_params, _type, a0)) { return false; }
+    _params.letterSpacing = base + kProbe;
+    if (!prepareLabel(_params, _type, a1)) { return false; }
+    m_quads.resize(quadsStart);  // drop both probes' quads
+
+    float gaps = (a1.width - a0.width) / (kProbe * _params.fontSize);
+    float ls = base;
+    if (gaps > 0.5f) {
+        float target = _pathLengthPx * _params.letterSpacingFit;
+        float extra = (target - a0.width) / (gaps * _params.fontSize);
+        ls = std::min(base + std::max(extra, 0.f), std::max(_params.letterSpacingMax, base));
+    }
+    _params.letterSpacing = ls;
+    return prepareLabel(_params, _type, _attributes);
+}
+
+// ---------------------------------------------------------------------------------------
+// Area label planner (docs/label-typography.md)
+// ---------------------------------------------------------------------------------------
+
+// A tile's polygon is only a fragment of the real feature. Edges that lie ON the tile boundary
+// are clip edges, not shoreline: the feature goes on in the neighbouring tile. Treat them as
+// open by pushing them outwards a little, so a name wider than one tile can still be placed
+// (the neighbouring tiles' fragments compete for the same name via a repeat group).
+static std::vector<glm::vec2> extendOpenTileEdges(const std::vector<glm::vec2>& ring, float maxDepth) {
+    const float eps = 0.003f;
+    std::vector<glm::vec2> out;
+    const size_t n = ring.size();
+    for (size_t i = 0; i < n; i++) {
+        glm::vec2 a = ring[i], b = ring[(i + 1) % n];
+        out.push_back(a);
+        glm::vec2 nrm(0.f);
+        if (a.x < eps && b.x < eps) { nrm = {-1.f, 0.f}; }
+        else if (a.x > 1.f - eps && b.x > 1.f - eps) { nrm = {1.f, 0.f}; }
+        else if (a.y < eps && b.y < eps) { nrm = {0.f, -1.f}; }
+        else if (a.y > 1.f - eps && b.y > 1.f - eps) { nrm = {0.f, 1.f}; }
+        float len = glm::length(b - a);
+        if ((nrm.x != 0.f || nrm.y != 0.f) && len > 1e-4f) {
+            // How far the feature may be assumed to continue: a thin lake crossing the tile
+            // edge continues a little (and may bend away), a park spanning most of the edge
+            // continues a lot.
+            float depth = std::min(maxDepth, 0.35f * len);
+            out.push_back(a + nrm * depth);
+            out.push_back(b + nrm * depth);
+        }
+    }
+    return out;
+}
+
+static size_t utf8Length(const std::string& s) {
+    size_t n = 0;
+    for (unsigned char c : s) { if ((c & 0xC0) != 0x80) { n++; } }
+    return n;
+}
+
+// Line breaking for area labels. Text is cut into tokens at spaces and at '\n', which the scene
+// uses as a SOFT HYPHEN ("Theodul\ngletscher"): unbroken it reads "Theodulgletscher", broken it
+// reads "Theodul-" / "gletscher". Nothing else is ever split.
+struct BreakToken { std::string text; bool soft = false; };  // `soft`: soft hyphen follows
+
+static std::vector<BreakToken> tokenizeForBreaks(const std::string& text) {
+    std::vector<BreakToken> toks;
+    std::string cur;
+    for (char c : text) {
+        if (c == ' ' || c == '\n') {
+            if (!cur.empty()) { toks.push_back({cur, c == '\n'}); cur.clear(); }
+            else if (c == '\n' && !toks.empty()) { toks.back().soft = true; }
+        } else {
+            cur.push_back(c);
+        }
+    }
+    if (!cur.empty()) { toks.push_back({cur, false}); }
+    return toks;
+}
+
+// Text for lines made of tokens [cuts[i-1]+1 .. cuts[i]]; `cuts` are indices of the last token of
+// each line but the final one. Also returns the length of the longest line in characters.
+static std::string joinLines(const std::vector<BreakToken>& toks, const std::vector<size_t>& cuts,
+                             size_t& longest) {
+    std::string out;
+    size_t lineLen = 0;
+    longest = 0;
+    size_t cutIdx = 0;
+    for (size_t i = 0; i < toks.size(); i++) {
+        out += toks[i].text;
+        lineLen += utf8Length(toks[i].text);
+        if (i + 1 == toks.size()) { break; }
+        if (cutIdx < cuts.size() && cuts[cutIdx] == i) {
+            if (toks[i].soft) { out += "-"; lineLen += 1; }
+            out += "\n";
+            longest = std::max(longest, lineLen);
+            lineLen = 0;
+            cutIdx++;
+        } else if (!toks[i].soft) {
+            out += " ";
+            lineLen += 1;
+        }
+    }
+    longest = std::max(longest, lineLen);
+    return out;
+}
+
+// Best balanced split of the tokens into exactly `lines` lines (smallest longest line, soft
+// hyphen breaks slightly disfavoured). Returns false if there are too few tokens.
+static bool bestLineBreaks(const std::vector<BreakToken>& toks, int lines, std::string& textOut) {
+    const size_t n = toks.size();
+    if (lines < 1 || n < size_t(lines)) { return false; }
+    std::vector<size_t> best, cuts;
+    float bestCost = 1e30f;
+    auto consider = [&](const std::vector<size_t>& c) {
+        size_t longest;
+        joinLines(toks, c, longest);
+        float cost = float(longest);
+        for (size_t k : c) { if (toks[k].soft) { cost += 2.5f; } }
+        if (cost < bestCost) { bestCost = cost; best = c; }
+    };
+    if (lines == 1) { consider({}); }
+    else if (lines == 2) { for (size_t a = 0; a + 1 < n; a++) { consider({a}); } }
+    else { for (size_t a = 0; a + 2 < n; a++) { for (size_t b = a + 1; b + 1 < n; b++) { consider({a, b}); } } }
+    if (bestCost > 1e29f) { return false; }
+    size_t longest;
+    textOut = joinLines(toks, best, longest);
+    return true;
+}
+
+bool TextStyleBuilder::addAreaLabel(const Polygon& _polygon, const TextStyle::Parameters& _params,
+                                    const DrawRule& _rule) {
+    if (_polygon.empty() || _polygon.front().size() < 3) { return true; }
+
+    const float ps = m_tileSize;               // tile units -> px
+    const float pixelSize = 1.f / ps;
+    const float pixelScale = m_style.pixelScale();
+
+    // Rings (outer ring with its open tile edges pushed out), in tile units and in px.
+    std::vector<std::vector<glm::vec2>> ringsTile, ringsPx, realPx;
+    const float kExtend = 0.5f;  // max tile units pushed out past an open clip edge
+    for (size_t r = 0; r < _polygon.size(); r++) {
+        std::vector<glm::vec2> ring;
+        ring.reserve(_polygon[r].size());
+        for (const auto& pt : _polygon[r]) { ring.emplace_back(pt.x, pt.y); }
+        if (ring.size() < 3) { continue; }
+        {
+            std::vector<glm::vec2> rpx(ring.size());
+            for (size_t i = 0; i < ring.size(); i++) { rpx[i] = ring[i] * ps; }
+            realPx.push_back(simplifyPolyline(rpx, 0.35f * pixelScale));
+            if (realPx.back().size() < 3) { realPx.pop_back(); }
+        }
+        if (r == 0) { ring = extendOpenTileEdges(ring, kExtend); }
+        ringsTile.push_back(ring);
+        std::vector<glm::vec2> px(ring.size());
+        for (size_t i = 0; i < ring.size(); i++) { px[i] = ring[i] * ps; }
+        ringsPx.push_back(simplifyPolyline(px, 0.35f * pixelScale));
+        if (ringsPx.back().size() < 3) { ringsPx.pop_back(); ringsTile.pop_back(); }
+    }
+    if (ringsPx.empty() || realPx.empty()) { return true; }
+
+    InsideMask mask;       // polygon + its open tile edges pushed out (search space)
+    if (!mask.build(ringsPx)) { return true; }
+
+    TextStyle::Parameters base = _params;
+    base.labelOptions.anchors = {LabelProperty::Anchor::center};
+    base.labelOptions.offset = glm::vec2(0.f);
+    base.pathOffset = 0.f;
+
+    const float fs = base.fontSize;
+    const float lsMin = std::max(base.letterSpacing, 0.f);
+    const float lsMax = std::max(base.letterSpacingMax, lsMin);
+    const float fill = Tangram::clamp(base.letterSpacingFit, 0.3f, 0.95f);
+    const float spMin = std::max(base.lineSpacing, 0.15f * fs);
+    const float spMax = std::max(3.f * fs, spMin);
+    const float margin = (2.f + 0.5f * base.strokeWidth) * pixelScale;
+    constexpr float kProbe = 0.2f;
+
+    // Measure the text as it would be laid out (quads are dropped again).
+    auto measure = [&](TextStyle::Parameters p, float ls, float sp, Label::Type type,
+                       LabelAttributes& a) {
+        p.letterSpacing = ls;
+        p.lineSpacing = sp;
+        const size_t q = m_quads.size();
+        a = LabelAttributes{};
+        bool ok = prepareLabel(p, type, a);
+        m_quads.resize(q);
+        return ok;
+    };
+
+    {   // apply the text transform once, so word splitting sees the final string
+        LabelAttributes tmp;
+        TextStyle::Parameters p = base;
+        p.wordWrap = false;
+        if (!measure(p, lsMin, spMin, Label::Type::point, tmp)) { return true; }
+        base.text = p.text;
+    }
+
+    const std::vector<BreakToken> toks = tokenizeForBreaks(base.text);
+    if (toks.empty()) { return true; }
+
+    struct Choice {
+        bool valid = false;
+        TextStyle::Parameters params;
+        float ls = 0.f, sp = 0.f, w = 0.f, h = 0.f, cx = 0.f, cy = 0.f, avail = 0.f, score = 0.f;
+        int lines = 1;
+    };
+
+    // Vertical room at x-centre `cx` for a box `w` wide, growing symmetrically about `cy`.
+    auto verticalRoom = [&](float cx, float cy, float w, float h0, float hCap) {
+        float lo = h0, hi = std::max(hCap, h0);
+        if (!mask.rectInside({cx - w * 0.5f - margin, cy - hi * 0.5f - margin},
+                             {cx + w * 0.5f + margin, cy + hi * 0.5f + margin})) {
+            for (int it = 0; it < 8; it++) {
+                float mid = 0.5f * (lo + hi);
+                if (mask.rectInside({cx - w * 0.5f - margin, cy - mid * 0.5f - margin},
+                                    {cx + w * 0.5f + margin, cy + mid * 0.5f + margin})) { lo = mid; }
+                else { hi = mid; }
+            }
+            return lo;
+        }
+        return hi;
+    };
+
+    auto shapeMatch = [](float boxAspect, float regionAspect) {
+        float d = std::abs(std::log(std::max(boxAspect, 0.05f) / std::max(regionAspect, 0.05f)));
+        return Tangram::clamp(1.f - 0.35f * d, 0.25f, 1.f);
+    };
+
+    // Other map content under a candidate box (ferry routes, roads, shorelines), sampled from
+    // the tile's coarse occupancy grid: a label should not be struck through by a ferry line.
+    std::function<float(glm::vec2, glm::vec2)> busy = [&](glm::vec2 lo, glm::vec2 hi) {
+        float cost = 0.f;
+        if (!m_anchorOccupancyGrid) { return cost; }
+        {
+            int hits = 0, total = 0;
+            for (int iy = 0; iy < 3; iy++) {
+                for (int ix = 0; ix < 8; ix++) {
+                    glm::vec2 q = lo + (hi - lo) * glm::vec2((ix + 0.5f) / 8.f, (iy + 0.5f) / 3.f);
+                    total++;
+                    if (m_anchorOccupancyGrid->sample(q * pixelSize) > 0.3f) { hits++; }
+                }
+            }
+            cost += float(hits) / float(total);
+        }
+        return cost;
+    };
+
+    // --- horizontal blocks, 1..3 lines ---------------------------------------------------
+    Choice horizontal;
+    float room1 = 0.f, avail1 = 0.f;
+    bool tall = true;  // until a single line is shown to sit comfortably
+    const int maxLines = int(std::min<size_t>(3, toks.size()));
+    for (int k = 1; k <= maxLines; k++) {
+        TextStyle::Parameters p = base;
+        if (!bestLineBreaks(toks, k, p.text)) { continue; }
+        if (k == 1) {
+            p.wordWrap = false;
+        } else {
+            p.wordWrap = true;                 // only the explicit line breaks apply
+            p.maxLines = k;
+            p.maxLineWidth = 1u << 20;
+            p.align = TextLabelProperty::Align::center;
+        }
+        if (k > 1 && !tall && horizontal.valid) { break; }
+
+        LabelAttributes a0, a1;
+        if (!measure(p, lsMin, spMin, Label::Type::point, a0)) { continue; }
+        if (!measure(p, lsMin + kProbe, spMin, Label::Type::point, a1)) { continue; }
+        const float slopeW = (a1.width - a0.width) / kProbe;  // px per em of tracking
+        const float w0 = a0.width, h0 = a0.height;
+        const float wTrackMax = w0 + slopeW * (lsMax - lsMin);
+
+        InsideMask::Band band;
+        if (!mask.widestBand(h0 + 2.f * margin, w0 + 2.f * margin,
+                             (wTrackMax + 2.f * margin) / fill, band, busy, fill)) { continue; }
+        const float avail = band.width - 2.f * margin;
+
+        float w = Tangram::clamp(avail * fill, w0, std::max(wTrackMax, w0));
+        float ls = slopeW > 1.f ? lsMin + (w - w0) / slopeW : lsMin;
+        ls = Tangram::clamp(ls, lsMin, lsMax);
+        w = w0 + slopeW * (ls - lsMin);
+
+        const float hCap = k == 1 ? 12.f * h0 : h0 + (k - 1) * (spMax - spMin);
+        const float room = verticalRoom(band.cx, band.cy, w, h0, hCap);
+        if (k == 1) {
+            room1 = room; avail1 = avail;
+            tall = room >= 0.7f * avail;
+        }
+
+        float h = h0, sp = spMin;
+        if (k > 1) {
+            h = Tangram::clamp(room * 0.8f, h0, hCap);
+            sp = spMin + (h - h0) / float(k - 1);
+        }
+        if (k > 1 && !tall) { continue; }
+
+        Choice c;
+        c.valid = true; c.params = p; c.ls = ls; c.sp = sp; c.w = w; c.h = h;
+        c.cx = band.cx; c.cy = band.cy; c.avail = avail; c.lines = k;
+        c.score = shapeMatch(w / h, avail / std::max(room, h0)) * std::pow(0.85f, float(k - 1));
+        if (!horizontal.valid || c.score > horizontal.score) { horizontal = c; }
+    }
+
+    // --- one line along the spine ---------------------------------------------------------
+    Choice path;
+    std::vector<glm::vec2> pathTile;
+    float pathTurning = 0.f;
+    PolygonAxis axis = polygonPrincipalAxis(ringsTile.front().begin(), ringsTile.front().end());
+    if (axis.elongation >= 1.8f) {
+        TextStyle::Parameters p = base;
+        p.wordWrap = false;
+        if (!bestLineBreaks(toks, 1, p.text)) { p.text = base.text; }
+        LabelAttributes a0, a1;
+        if (measure(p, lsMin, spMin, Label::Type::line, a0) &&
+            measure(p, lsMin + kProbe, spMin, Label::Type::line, a1)) {
+            const float slopeW = (a1.width - a0.width) / kProbe;
+            const float w0 = a0.width, h0 = a0.height;
+            const float wTrackMax = w0 + slopeW * (lsMax - lsMin);
+            const float sigma = (p.pathSmoothing > 0.f ? p.pathSmoothing : 14.f * pixelScale) * pixelSize;
+
+            PolygonCenterline spine;
+            if (polygonCenterline(ringsTile, axis.direction, (h0 + 2.f * margin) * pixelSize,
+                                  (w0 + 2.f * margin) * pixelSize, sigma, spine)) {
+                std::vector<glm::vec2> sp;
+                for (const auto& q : spine.points) { sp.push_back(q * ps); }
+                const float step = std::max(2.f * pixelScale, mask.cell());
+                sp = resamplePolyline(sp, step);
+                const size_t n = sp.size();
+
+                // Local clearance on both sides of the spine, and the longest run where the
+                // whole text strip fits.
+                const float half = h0 * 0.5f + margin;
+                std::vector<float> wid(n, 0.f);
+                std::vector<char> clear(n, 0);
+                for (size_t i = 0; i < n; i++) {
+                    glm::vec2 t = sp[std::min(i + 1, n - 1)] - sp[i > 0 ? i - 1 : 0];
+                    float tl = glm::length(t);
+                    if (tl < 1e-6f) { continue; }
+                    t /= tl;
+                    glm::vec2 nrm(-t.y, t.x);
+                    float d1 = mask.rayLength(sp[i], nrm, 4.f * h0);
+                    float d2 = mask.rayLength(sp[i], -nrm, 4.f * h0);
+                    wid[i] = d1 + d2;
+                    clear[i] = (d1 >= half && d2 >= half && mask.pointInside(sp[i])) ? 1 : 0;
+                }
+                size_t bestS = 0, bestE = 0;
+                for (size_t i = 0; i < n;) {
+                    if (!clear[i]) { i++; continue; }
+                    size_t s = i;
+                    while (i < n && clear[i]) { i++; }
+                    if (i - s > bestE - bestS) { bestS = s; bestE = i; }
+                }
+                const float runLen = float(bestE - bestS > 0 ? bestE - bestS - 1 : 0) * step;
+                if (runLen >= w0 + 2.f * margin) {
+                    const float avail = runLen - 2.f * margin;
+                    float w = Tangram::clamp(avail * fill, w0, std::max(wTrackMax, w0));
+                    float ls = slopeW > 1.f ? Tangram::clamp(lsMin + (w - w0) / slopeW, lsMin, lsMax) : lsMin;
+                    w = w0 + slopeW * (ls - lsMin);
+
+                    // Slide the window to the thickest part of the run.
+                    const size_t wn = std::min(bestE - bestS, size_t(std::ceil((w + 2.f * margin) / step)) + 1);
+                    std::vector<float> pre(n + 1, 0.f);
+                    for (size_t i = 0; i < n; i++) { pre[i + 1] = pre[i] + std::min(wid[i], 4.f * h0); }
+                    size_t bestStart = bestS;
+                    float bestMean = -1.f;
+                    for (size_t s0 = bestS; s0 + wn <= bestE; s0++) {
+                        float mean = (pre[s0 + wn] - pre[s0]) / float(wn);
+                        float centre = 0.5f * (bestS + bestE) - 0.5f * (s0 + s0 + wn);
+                        mean -= 0.01f * std::abs(centre) * step;  // prefer the middle on ties
+                        if (mean > bestMean) { bestMean = mean; bestStart = s0; }
+                    }
+                    float meanWid = std::max((pre[bestStart + wn] - pre[bestStart]) / float(wn), h0);
+
+                    size_t pad = std::min<size_t>(2, bestStart > bestS ? bestStart - bestS : 0);
+                    size_t padE = std::min<size_t>(2, bestE > bestStart + wn ? bestE - (bestStart + wn) : 0);
+                    for (size_t i = bestStart - pad; i < bestStart + wn + padE; i++) {
+                        pathTile.push_back(sp[i] * pixelSize);
+                    }
+
+                    // Reject strongly bent paths: angle between the first and last thirds.
+                    float turning = 0.f;
+                    if (pathTile.size() >= 6) {
+                        size_t m = pathTile.size();
+                        glm::vec2 d1 = pathTile[m / 3] - pathTile[0];
+                        glm::vec2 d2 = pathTile[m - 1] - pathTile[2 * m / 3];
+                        float l1 = glm::length(d1), l2 = glm::length(d2);
+                        if (l1 > 1e-9f && l2 > 1e-9f) {
+                            turning = std::acos(Tangram::clamp(glm::dot(d1, d2) / (l1 * l2), -1.f, 1.f));
+                        }
+                    }
+                    pathTurning = turning;
+                    path.valid = pathTile.size() >= 2 && turning < 0.9f;
+                    path.params = p; path.ls = ls; path.w = w; path.h = h0; path.avail = avail;
+                    path.score = shapeMatch(w / h0, avail / meanWid);
+                }
+            }
+        }
+    }
+
+    // Lakes, glaciers: follow the shape of the water / ice (a tongue, a cirque) unless there is
+    // plenty of room around the name -- then plain horizontal type reads best. Parks
+    // (smooth == 0) are set as a line-broken block and bent only if no block fits.
+    const bool bendFirst = base.pathSmoothing > 0.f;
+    const bool roomy = horizontal.valid && mask.insideArea() >= 0.5f * ps * ps &&
+                       horizontal.avail >= 1.5f * horizontal.w;
+    bool usePath = path.valid && (!horizontal.valid || (bendFirst && !roomy));
+
+    const Choice& pick = usePath ? path : horizontal;
+    if (!pick.valid) { return true; }  // no room: no label
+
+    // --- emit ----------------------------------------------------------------------------
+    TextStyle::Parameters params = pick.params;
+    params.letterSpacing = pick.ls;
+    params.lineSpacing = usePath ? params.lineSpacing : pick.sp;
+
+    // One label per feature: all fragments of this name compete, the roomiest wins.
+    hash_combine(params.labelOptions.repeatGroup, params.text);
+    params.labelOptions.repeatDistance = std::max(params.labelOptions.repeatDistance, 1200.f * pixelScale);
+    params.labelOptions.priority += 0.03f * (1.f - std::min(1.f, pick.avail / (3.f * pick.w)));
+
+    LabelAttributes attrib;
+    if (usePath) {
+        if (!prepareLabel(params, Label::Type::line, attrib)) { return true; }
+        const size_t before = m_labels.size();
+        addCurvedTextLabels(pathTile, params, attrib, _rule, true);
+        (void)before;
+        return true;
+    }
+
+    const size_t quadsStart = m_quads.size();
+    if (!prepareLabel(params, Label::Type::point, attrib)) { return true; }
+    // Verify with the real layout: never trespass.
+    glm::vec2 lo(pick.cx - attrib.width * 0.5f - margin, pick.cy - attrib.height * 0.5f - margin);
+    glm::vec2 hi(pick.cx + attrib.width * 0.5f + margin, pick.cy + attrib.height * 0.5f + margin);
+    if (!mask.rectInside(lo, hi)) {
+        m_quads.resize(quadsStart);
+        return true;
+    }
+
+    addLabel(Label::Type::point, {{ glm::vec2(pick.cx, pick.cy) * pixelSize }}, params, attrib, _rule);
+    return true;
+}
+
+bool TextStyleBuilder::addCurvedPolygonLabel(const Polygon& _polygon, const TextStyle::Parameters& _params,
+                                             const LabelAttributes& _attributes, const DrawRule& _rule) {
+    if (_polygon.empty() || _polygon.front().size() < 3) { return false; }
+    const Line& ring = _polygon.front();
+
+    PolygonAxis axis = polygonPrincipalAxis(ring.begin(), ring.end());
     if (axis.elongation < kPolygonLabelElongationThreshold) { return false; }
 
-    glm::vec2 start, end;
-    if (!clipLineToPolygon(axis.center, axis.direction, _ring.begin(), _ring.end(), start, end)) {
+    const float pixelSize = 1.0f / m_tileSize;
+
+    // A path label is a single line of text, whatever the point-label wrapping said.
+    TextStyle::Parameters params = _params;
+    params.wordWrap = false;
+    LabelAttributes attrib;
+    const size_t quadsStart = m_quads.size();
+    if (!prepareLabel(params, Label::Type::line, attrib)) { return false; }
+
+    // Where does a text strip of this height physically fit? Same 0.6 length heuristic as
+    // addCurvedTextLabels: the label may be a little longer than the spine at the tile's
+    // own zoom, since it is shown over [z, z+1).
+    const float minWidth = (attrib.height * 1.1f + 2.f) * pixelSize;
+    const float minLength = attrib.width * pixelSize * 0.6f;
+    const float sigma = (params.pathSmoothing > 0.f ? params.pathSmoothing : 14.f * m_style.pixelScale()) * pixelSize;
+
+    PolygonCenterline spine;
+    if (!polygonCenterline(_polygon, axis.direction, minWidth, minLength, sigma, spine)) {
+        m_quads.resize(quadsStart);
         return false;
     }
 
-    // Trim inward by a small margin so the text doesn't touch the shoreline/boundary.
-    float pixelSize = 1.0f / m_tileSize;
-    float chordLen = glm::length(end - start);
-    if (chordLen < 1e-9f) { return false; }
-    glm::vec2 dir = (end - start) / chordLen;
-    float margin = std::min(8.f * pixelSize, 0.2f * chordLen);
-    start += dir * margin;
-    end -= dir * margin;
+    // Keep the glyphs off the shoreline/boundary at both tips.
+    const float margin = std::min(6.f * pixelSize, 0.1f * spine.length);
+    std::vector<glm::vec2> path = trimPolyline(spine.points, margin, margin);
+    if (path.size() < 2) { m_quads.resize(quadsStart); return false; }
 
-    // Same minimal-length heuristic addCurvedTextLabels uses internally -- check it here
-    // too so we can cleanly fall back to a point label instead of silently adding nothing.
-    float minLength = _attributes.width * pixelSize * 0.6f;
-    if (glm::length(end - start) < minLength) { return false; }
-
-    Line line = { start, end };
+    // Fit-to-spine tracking (lakes, parks, glaciers: "L A C   L É M A N" filling the lake).
+    if (params.letterSpacingFit > 0.f && !touchesTileEdge(_polygon)) {
+        m_quads.resize(quadsStart);
+        attrib = LabelAttributes{};
+        if (!prepareTrackedLabel(params, Label::Type::line, attrib,
+                                 polylineLength(path) * m_tileSize)) {
+            return false;
+        }
+    }
 
     size_t labelsBefore = m_labels.size();
-    addCurvedTextLabels(line, _params, _attributes, _rule);
-    return m_labels.size() > labelsBefore;
+    addCurvedTextLabels(path, params, attrib, _rule, true);
+    if (m_labels.size() == labelsBefore) { return false; }
+    return true;
 }
 
 void TextStyleBuilder::addLineTextLabels(const Feature& _feat, const TextStyle::Parameters& _params,
@@ -651,7 +1174,35 @@ void TextStyleBuilder::addLineTextLabels(const Feature& _feat, const TextStyle::
         addLabel(Label::Type::line, {{ a, b }}, _params, _attributes, _rule);
     };
 
-    for (auto& line : _feat.lines) {
+    const float pixelSize = 1.0f / m_tileSize;
+
+    for (const auto& rawLine : _feat.lines) {
+
+        // Typographic smoothing (docs/label-typography.md): follow the large-scale shape of
+        // a ridge / valley / river, not its digitizing noise.
+        Line smoothed;
+        if (_params.pathSmoothing > 0.f && rawLine.size() > 2) {
+            smoothed = smoothPolyline(rawLine, 3.f * pixelSize, _params.pathSmoothing * pixelSize);
+        }
+        Line shifted;
+        if (_params.pathOffset != 0.f && (smoothed.empty() ? rawLine : smoothed).size() >= 2) {
+            // Set the name beside the line, not on it: shift the path perpendicular to itself,
+            // to the left of the reading direction (i.e. above it for left-to-right text).
+            shifted = smoothed.empty() ? rawLine : smoothed;
+            if (shifted.back().x < shifted.front().x) { std::reverse(shifted.begin(), shifted.end()); }
+            Line src = shifted;
+            const float d = _params.pathOffset * pixelSize;
+            for (size_t i = 0; i < src.size(); i++) {
+                glm::vec2 t = glm::vec2(src[std::min(i + 1, src.size() - 1)]) -
+                              glm::vec2(src[i > 0 ? i - 1 : 0]);
+                float tl = glm::length(t);
+                if (tl < 1e-9f) { continue; }
+                t /= tl;
+                shifted[i].x = src[i].x - t.y * d;
+                shifted[i].y = src[i].y + t.x * d;
+            }
+        }
+        const Line& line = !shifted.empty() ? shifted : (smoothed.empty() ? rawLine : smoothed);
 
         if (!addStraightTextLabels(line, _attributes.width, straightLabelCb) &&
             line.size() > 2 && !_params.hasComplexShaping &&
@@ -716,6 +1267,16 @@ TextStyle::Parameters TextStyleBuilder::applyRule(const DrawRule& _rule,
         LOGW("Missing font for %s / %s / %s / %d", fontFamily->c_str(), fontStyle->c_str(), fontWeight->c_str(), p.fontSize);
         return p;
     }
+
+    // Typography (docs/label-typography.md): tracking in em, optional fit-to-path tracking,
+    // path smoothing radius (px).
+    _rule.get(StyleParamKey::text_font_letter_spacing, p.letterSpacing);
+    _rule.get(StyleParamKey::text_font_letter_spacing_fit, p.letterSpacingFit);
+    _rule.get(StyleParamKey::text_font_letter_spacing_max, p.letterSpacingMax);
+    _rule.get(StyleParamKey::text_smooth, p.pathSmoothing);
+    p.pathSmoothing *= m_style.pixelScale();
+    _rule.get(StyleParamKey::text_path_offset, p.pathOffset);
+    p.pathOffset *= m_style.pixelScale();
     _rule.get(StyleParamKey::text_font_fill, p.fill);
     float alpha = 1;
     if (_rule.get(StyleParamKey::text_font_alpha, alpha)) {
@@ -911,6 +1472,15 @@ TextStyle::Parameters TextStyleBuilder::applySecondaryTextRule(const DrawRule& _
         p.text.clear();
         return p;
     }
+
+    // Tracking is a per-label-weight property: the secondary label (an elevation figure,
+    // say) must not inherit the primary name's letter-spacing.
+    p.letterSpacing = 0.f;
+    p.letterSpacingFit = 0.f;
+    p.pathSmoothing = 0.f;
+    p.pathOffset = 0.f;
+    _rule.get(StyleParamKey::text2_font_letter_spacing, p.letterSpacing);
+    _rule.get(StyleParamKey::text2_font_fill, p.fill);  // else: the primary label's fill
 
     std::hash<TextStyle::Parameters> hash;
     p.labelOptions.paramHash = hash(p);

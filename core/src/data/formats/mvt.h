@@ -50,7 +50,10 @@ namespace Mvt {
 
     Layer getLayer(ParserContext& _ctx, protobuf::message _layerIn);
 
-    std::shared_ptr<TileData> parseTile(const TileTask& _task, int32_t _sourceId);
+    // `_layerFilter`: if non-null and non-empty, only layers with these names are decoded
+// (the rest are skipped without touching their features) - see TileSource::mvtLayers().
+std::shared_ptr<TileData> parseTile(const TileTask& _task, int32_t _sourceId,
+                                    const std::vector<std::string>* _layerFilter = nullptr);
 
 } // namespace Mvt
 

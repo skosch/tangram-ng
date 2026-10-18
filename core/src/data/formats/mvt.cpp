@@ -333,7 +333,8 @@ Layer Mvt::getLayer(ParserContext& _ctx, protobuf::message _layerIn) {
     return layer;
 }
 
-std::shared_ptr<TileData> Mvt::parseTile(const TileTask& _task, int32_t _sourceId) {
+std::shared_ptr<TileData> Mvt::parseTile(const TileTask& _task, int32_t _sourceId,
+                                         const std::vector<std::string>* _layerFilter) {
 
     auto tileData = std::make_shared<TileData>();
 
@@ -349,7 +350,20 @@ std::shared_ptr<TileData> Mvt::parseTile(const TileTask& _task, int32_t _sourceI
     try {
         while(item.next()) {
             if(item.tag == LAYER) {
-                tileData->layers.push_back(getLayer(ctx, item.getMessage()));
+                protobuf::message layerMsg = item.getMessage();
+                if(_layerFilter && !_layerFilter->empty()) {
+                    // peek the layer name on a copy of the message
+                    std::string name;
+                    protobuf::message peek = layerMsg;
+                    while(peek.next()) {
+                        if(peek.tag == LAYER_NAME) { name = peek.string(); break; }
+                        peek.skip();
+                    }
+                    if(std::find(_layerFilter->begin(), _layerFilter->end(), name) == _layerFilter->end()) {
+                        continue;
+                    }
+                }
+                tileData->layers.push_back(getLayer(ctx, layerMsg));
             } else {
                 item.skip();
             }

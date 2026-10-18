@@ -17,6 +17,9 @@
 #include "util/lineSampler.h"
 #include "view/view.h"
 
+#include <algorithm>
+#include <unordered_set>
+
 namespace Tangram {
 
 
@@ -35,7 +38,45 @@ void IconMesh::setTextLabels(std::unique_ptr<StyledMesh> _textLabels) {
     textLabels = std::move(_textLabels);
 }
 
+// Distance-gated peaks (Label::Options::dominanceGate) skip build-time collision (see
+// LabelCollider::addLabels), which used to thin a dense tile as a side effect. Without it a
+// z11 tile carries a few hundred peaks x 3 labels, all updated and sorted every frame while
+// visible, so cap what a coarse tile hands over: the best by provisional priority (named
+// first, then real prominence tag / height). Tiles styled at z13+ are mostly off screen
+// and exempt - that is where "many labels, even minor peaks" is wanted.
+void PointStyleBuilder::capGatedLabels() {
+    constexpr size_t kMaxGatedPerCoarseTile = 100;
+    if (m_styleZoom >= 13) { return; }
+
+    std::vector<Label*> icons;
+    for (auto& l : m_labels) {
+        if (l->options().dominanceGate > 0.f && l->state() != Label::State::dead) {
+            icons.push_back(l.get());
+        }
+    }
+    if (icons.size() <= kMaxGatedPerCoarseTile) { return; }
+
+    std::stable_sort(icons.begin(), icons.end(), [](const Label* a, const Label* b) {
+        if (a->options().priority != b->options().priority) {
+            return a->options().priority < b->options().priority;
+        }
+        return a->id() < b->id();
+    });
+    std::unordered_set<const Label*> killed;
+    for (size_t i = kMaxGatedPerCoarseTile; i < icons.size(); i++) {
+        icons[i]->enterState(Label::State::dead, 0.f);
+        killed.insert(icons[i]);
+    }
+    auto& textLabels = *static_cast<TextStyleBuilder&>(*m_textStyleBuilder).labels();
+    for (auto& t : textLabels) {
+        if (t->relative() && killed.count(t->relative())) {
+            t->enterState(Label::State::dead, 0.f);
+        }
+    }
+}
+
 void PointStyleBuilder::addLayoutItems(LabelCollider& _layout) {
+    capGatedLabels();
     _layout.addLabels(m_labels);
     m_textStyleBuilder->addLayoutItems(_layout);
 }
@@ -151,6 +192,8 @@ auto PointStyleBuilder::applyRule(const DrawRule& _rule) const -> Parameters {
     // suppress it per-feature when a real OSM `prominence` tag is already present, since that's
     // a strictly better signal and the JS priority: function already used it.
     _rule.get(StyleParamKey::priority_texture_shading, p.labelOptions.refinePriorityWithTextureShading);
+    // Distance-aware peak density gate, see Label::Options::dominanceGate.
+    _rule.get(StyleParamKey::dominance_gate, p.labelOptions.dominanceGate);
     _rule.get(StyleParamKey::sprite_default, p.spriteDefault);
     p.dynamicTexture = _rule.get(StyleParamKey::texture, p.texture);
 
@@ -645,6 +688,13 @@ bool PointStyleBuilder::addFeature(const Feature& _feat, const DrawRule& _rule) 
                 params.labelOptions.anchors = textStyleBuilder.salienceOrderedAnchors(
                     params.labelOptions.anchors, p, glm::vec2(attrib.width, attrib.height), iconRadiusPx);
 
+                // A feature with both a name and a secondary (elevation) label: the name
+                // prefers to sit above the elevation. See Options::anchorVerticalPref - only a
+                // soft tie-break in Label::refineAnchor(), never ahead of ridge avoidance.
+                if (_rule.contains(StyleParamKey::text2_source)) {
+                    params.labelOptions.anchorVerticalPref = 1.f;
+                }
+
                 textStyleBuilder.addLabel(Label::Type::point, {{p, p}}, params, attrib, _rule);
 
                 bool definePriority = !_rule.contains(StyleParamKey::text_priority);
@@ -727,7 +777,12 @@ bool PointStyleBuilder::addFeature(const Feature& _feat, const DrawRule& _rule) 
                     // about 3x too far, should be the same distance as the name"): same
                     // gap scale as the primary (see below), so an independently-placed
                     // elevation label sits exactly as close to the icon as the name does.
-                    params2.labelOptions.anchorGapScale = 0.25f;
+                    //
+                    // Inherited from the primary (applySecondaryTextRule() copies its
+                    // Parameters wholesale), so the single `anchor_gap_scale` in the scene
+                    // controls both - it used to be a literal here that had to be kept in
+                    // sync by hand.
+                    params2.labelOptions.anchorVerticalPref = -1.f;  // elevation below the name
 
                     // Real bug found via an earlier user report ("elevation number isn't
                     // showing at all"): applySecondaryTextRule() copies the primary

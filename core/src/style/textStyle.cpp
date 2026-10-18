@@ -95,10 +95,13 @@ void TextStyle::onBeginDrawFrame(RenderState& rs, const View& _view) {
         m_shaderProgram->setUniformi(rs, m_mainUniforms.uBackgroundTex, bgTexUnit);
     }
 
-    // Not yet visually tuned - see m_mainUniforms.uHaloLuminanceDark's comment for why
-    // these are plain constants rather than scene-config-driven.
-    m_shaderProgram->setUniformf(rs, m_mainUniforms.uHaloLuminanceDark, 0.35f);
-    m_shaderProgram->setUniformf(rs, m_mainUniforms.uHaloLuminanceLight, 0.75f);
+    // Halo only where the (black) text would genuinely be hard to read: full strength on
+    // near-black backgrounds, gone by a dim mid-dark grey - black text is still legible on
+    // merely dim terrain, and a halo there just reads as a white smear. (Was 0.35 / 0.75,
+    // which put a halo on most shaded rock.) Plain constants, see
+    // m_mainUniforms.uHaloLuminanceDark's comment for why they aren't scene-config-driven.
+    m_shaderProgram->setUniformf(rs, m_mainUniforms.uHaloLuminanceDark, 0.20f);
+    m_shaderProgram->setUniformf(rs, m_mainUniforms.uHaloLuminanceLight, 0.55f);
 
     if (m_sdf) {
         m_shaderProgram->setUniformi(rs, m_mainUniforms.uPass, 1);

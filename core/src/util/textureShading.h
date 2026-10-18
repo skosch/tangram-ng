@@ -3,6 +3,8 @@
 #include "tile/tileID.h"
 #include "util/mapProjection.h"
 
+#include <functional>
+
 namespace Tangram {
 
 class RasterSource;
@@ -55,5 +57,34 @@ float sampleTextureShadingAtMosaic(const Texture& mosaic, TileID tileId, Project
 // docs/label-placement-plan.md Phase 2 for the investigation and the main-thread integration
 // (LabelManager per-frame update) it led to instead.
 float sampleTextureShading(RasterSource& elevationSource, ProjectedMeters worldPos, bool& ok);
+
+// --- Peak dominance ---------------------------------------------------------------------
+//
+// Distance-aware label density needs a per-peak "how much does this stand out" number that
+// scales with distance the way apparent size does. Topographic isolation does exactly that:
+// the radius within which the peak is the highest point. A knoll that is merely a shoulder of
+// its neighbour has an isolation of a few hundred metres and is worth a label only when you
+// are standing next to it; the Matterhorn's is ~9 km and is worth one from 90 km away.
+//
+// Pure function over an elevation callback so it is unit-testable with a synthetic DEM and
+// independent of RasterSource/ElevationManager.
+//
+//  elevAt(pos, elev): fill `elev` (metres) and return true, or return false where no DEM is
+//                     available at `pos` (projected meters).
+//  groundPerProjected: ground meters per projected (Web Mercator) meter at `pos`, i.e.
+//                      cos(latitude). Radii below are ground meters.
+//  maxRadius:         ground meters; returned radius saturates here.
+struct PeakDominance {
+    bool valid = false;      // false: no DEM at the peak position itself, retry later
+    bool complete = true;    // false: many ring samples were unavailable (neighbour tiles not
+                             //  resident yet), the radius may be an over-estimate
+    float radiusMeters = 0.f;
+    double peakElev = 0.0;   // reference height used (DEM max in a ~60 m neighbourhood)
+};
+
+using PeakElevationFn = std::function<bool(ProjectedMeters pos, double& elev)>;
+
+PeakDominance peakDominanceRadius(const PeakElevationFn& elevAt, ProjectedMeters pos,
+                                  double groundPerProjected, float maxRadius = 12000.f);
 
 }
