@@ -20,6 +20,7 @@ class Style;
 class View;
 struct StyledMesh;
 class AnchorOccupancyGrid;
+class WaterMask;
 
 struct Raster {
     TileID tileID;
@@ -85,6 +86,11 @@ public:
     void setAnchorOccupancyGrid(std::shared_ptr<const AnchorOccupancyGrid> _grid) { m_anchorOccupancyGrid = std::move(_grid); }
     const std::shared_ptr<const AnchorOccupancyGrid>& anchorOccupancyGrid() const { return m_anchorOccupancyGrid; }
 
+    /* This tile's water polygons (util/waterMask.h), for builders that need to know what runs over
+     * water (protected-area edge band turns blue there). Null if the tile has no water layer. */
+    void setWaterMask(std::shared_ptr<const WaterMask> _mask) { m_waterMask = std::move(_mask); }
+    const std::shared_ptr<const WaterMask>& waterMask() const { return m_waterMask; }
+
     /* Update the Tile considering the current view */
     void update(const View& _view, float _dt);
 
@@ -129,6 +135,7 @@ private:
     std::vector<std::unique_ptr<StyledMesh>> m_geometry;
     std::vector<Raster> m_rasters;
     std::shared_ptr<const AnchorOccupancyGrid> m_anchorOccupancyGrid;
+    std::shared_ptr<const WaterMask> m_waterMask;
 
     mutable size_t m_memoryUsage = 0;
 

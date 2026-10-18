@@ -80,6 +80,8 @@ typedef std::function<void(const glm::vec3& coord, const glm::vec3& normal, cons
 /* PolygonBuilder context,
  * see Builders::buildPolygon() and Builders::buildPolygonExtrusion()
  */
+class WaterMask;
+
 struct PolygonBuilder {
     std::vector<uint16_t> indices; // indices for drawing the polyon as triangles are added to this vector
     std::vector<int> used;
@@ -184,6 +186,20 @@ public:
      * @_ctx output vectors, see <PolygonBuilder>
      */
     static void buildPolygon(const Polygon& _polygon, float _height, PolygonBuilder& _ctx);
+
+    /* Build a soft band along the INSIDE of every ring of a polygon (park / protected-area edge).
+     * The mesh is a strip per boundary edge whose vertices all lie ON the boundary; the vertex shader
+     * (polygon.vs, TANGRAM_EDGE_BAND) pushes them inward by the band's screen-pixel width, so the
+     * width is constant on screen and identical across tiles whatever zoom each was built at:
+     *   a_normal.xy = inward offset direction * miter / 2.5, a_normal.z = +1 land / -1 water,
+     *   a_texcoord.x = fraction across the band (0 boundary .. 1 inner edge),
+     *   a_texcoord.y = depth cap in tile units (1 = none) where a far boundary is close.
+     * _width (tile units) is only the nominal width, used for sampling density and how far to look
+     * for the far side. Rows are sampled at the terrain grid spacing so every vertex drapes on 3D
+     * terrain individually. Edges are split where they cross _water (may be null) so each piece is
+     * wholly land or wholly water. Unless keepTileEdges, tile-edge cuts are omitted.
+     */
+    static void buildPolygonEdgeBand(const Polygon& _polygon, float _width, float _lift, const WaterMask* _water, PolygonBuilder& _ctx);
 
     /* Build extruded 'walls' from a polygon
      * @_polygon input coordinates describing the polygon

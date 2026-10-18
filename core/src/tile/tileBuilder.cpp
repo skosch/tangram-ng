@@ -7,6 +7,7 @@
 #include "data/tileSource.h"
 #include "gl/mesh.h"
 #include "labels/anchorOccupancyGrid.h"
+#include "util/waterMask.h"
 #include "log.h"
 #include "scene/dataLayer.h"
 #include "scene/scene.h"
@@ -140,6 +141,8 @@ void TileBuilder::build(Tile& tile, const TileData& _tileData, const TileSource&
     if (auto grid = AnchorOccupancyGrid::build(_tileData)) {
         tile.setAnchorOccupancyGrid(std::move(grid));
     }
+
+    if (auto water = WaterMask::build(_tileData)) { tile.setWaterMask(std::move(water)); }
 
     for (auto& builder : m_styleBuilder) {
         if (builder.second) { builder.second->setup(tile); }

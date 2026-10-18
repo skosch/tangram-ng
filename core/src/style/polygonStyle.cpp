@@ -13,6 +13,8 @@
 #include "util/builders.h"
 #include "util/color.h"
 #include "util/extrude.h"
+#include "util/mapProjection.h"
+#include "util/waterMask.h"
 
 #include "glm/vec2.hpp"
 #include "glm/vec3.hpp"
@@ -114,6 +116,8 @@ public:
         m_tileUnitsPerMeter = _tile.getInverseScale();
         auto id = _tile.getID();
         m_zoom = id.z;
+        m_overzoom2 = exp2(float(id.s) - float(id.z));
+        m_water = _tile.waterMask();
         m_meshData.clear();
         // activeTerrainGrid() is sized for the worst-case overzoom (style's data source vs. the
         //  elevation source's max_zoom), but most tiles aren't overzoomed at all - id.s > id.z only
@@ -208,6 +212,8 @@ private:
 
     float m_tileUnitsPerMeter = 0;
     int m_zoom = 0;
+    float m_overzoom2 = 1.f;
+    std::shared_ptr<const WaterMask> m_water;
 
 };
 
@@ -254,18 +260,44 @@ bool PolygonStyleBuilder<V>::addPolygon(const Polygon& _polygon, const Propertie
 
     m_builder.keepTileEdges = p.keepTileEdges;
 
+    // A polygon rule with an `outline: width` draws a soft band along the INSIDE of the polygon's
+    //  edge instead of its fill (park / protected-area edge): see Builders::buildPolygonEdgeBand.
+    //  Width is in screen pixels at the tile's styling zoom, so it stays ~constant while overzoomed.
+    float bandWidth = 0.f;
+    {
+        auto& bw = _rule.findParameter(StyleParamKey::outline_width);
+        if (bw.valid()) {
+            // `px` = screen pixels at the CURRENT reference zoom (the one the terrain lattice
+            //  uses), identical for every tile built at the same time whatever its own zoom, so
+            //  neighbouring tiles of different LOD get the same band width (no seam at the tile
+            //  edge). A stops list is evaluated like any other width, at this tile's zoom.
+            float px = 0.f;
+            if (bw.stops && bw.value.is<float>()) { px = bw.value.get<float>(); }
+            else if (bw.value.is<StyleParam::Width>()) { px = bw.value.get<StyleParam::Width>().value; }
+            int ref = terrainMeshRefZoom() - terrainMeshZoomBias();
+            if (ref > 22) { ref = m_zoom; }   // not set yet
+            ref = std::max(ref, m_zoom);
+            bandWidth = px / float(MapProjection::tileSize()) / exp2(float(ref - m_zoom));
+        }
+    }
+
     m_builder.addVertex = [this, p](const glm::vec3& coord,
                                  const glm::vec3& normal,
                                  const glm::vec2& uv) {
         m_meshData.vertices.push_back({ coord, p.order, normal, uv, p.color, p.selectionColor });
     };
 
-    if (p.minHeight != p.height) {
-        Builders::buildPolygonExtrusion(_polygon, p.minHeight,
-                                        p.height, m_builder);
-    }
+    if (bandWidth > 0.f) {
+        // lifted 2 m so it never z-fights the terrain it is draped on
+        Builders::buildPolygonEdgeBand(_polygon, bandWidth, 2.f * m_tileUnitsPerMeter, m_water.get(), m_builder);
+    } else {
+        if (p.minHeight != p.height) {
+            Builders::buildPolygonExtrusion(_polygon, p.minHeight,
+                                            p.height, m_builder);
+        }
 
-    Builders::buildPolygon(_polygon, p.height, m_builder);
+        Builders::buildPolygon(_polygon, p.height, m_builder);
+    }
 
     m_meshData.indices.insert(m_meshData.indices.end(),
                               m_builder.indices.begin(),

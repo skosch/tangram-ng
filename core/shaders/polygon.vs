@@ -66,11 +66,30 @@ vec3 worldNormal() {
     #endif
 }
 
+#if defined(TANGRAM_EDGE_BAND) && !defined(TANGRAM_RASTER_STYLE) && defined(TANGRAM_USE_TEX_COORDS)
+// Protected-area edge band (Builders::buildPolygonEdgeBand): every vertex arrives ON the boundary and is
+// pushed inward here by EDGE_BAND_PX screen pixels (at the map center), so the band keeps its width on
+// screen at any zoom and across tiles built at different zooms. a_normal.xy = inward direction * miter
+// / 2.5, a_texcoord.x = fraction across the band, a_texcoord.y = depth cap in tile units.
+float edgeBandExtent() {  // how far the inner edge is from the boundary, in tile units
+    float unitsPerPixel = u_meters_per_pixel / u_model[0][0];
+    return min(float(EDGE_BAND_PX) * unitsPerPixel, a_texcoord.y);
+}
+vec4 edgeBandPosition(vec4 p) {
+    p.xy += a_normal.xy * 2.5 * (edgeBandExtent() * a_texcoord.x);
+    return p;
+}
+#endif
+
 vec4 modelPositionBaseZoom() {
     #ifdef TANGRAM_RASTER_STYLE
         return vec4(UNPACK_POSITION(a_position.xy), 0.0, 1.0);
     #else
-        return vec4(UNPACK_POSITION(a_position.xyz), 1.0);
+        vec4 p = vec4(UNPACK_POSITION(a_position.xyz), 1.0);
+        #if defined(TANGRAM_EDGE_BAND) && defined(TANGRAM_USE_TEX_COORDS)
+            p = edgeBandPosition(p);
+        #endif
+        return p;
     #endif
 }
 
