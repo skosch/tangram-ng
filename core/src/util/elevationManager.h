@@ -68,6 +68,22 @@ public:
   // `tex` for tile `id`. Idempotent; thread-safe only against OTHER textures (call it from the
   // worker that owns a freshly decoded, not yet published texture).
   static void precomputeTileInfo(Texture& tex, TileID id);
+
+  // Thread-safe, per-region roughness for tile builders running on worker threads (the texture
+  // cache itself is main-thread only). Filled by precomputeTileInfo for the tile's OWN texture.
+  // The tile is divided into kFlatBlocks^2 blocks, each holding the max |4-neighbour Laplacian|
+  // (meters) of its texels, so a polygon can ask about just the ground it covers: a lake in a
+  // valley is "flat" even when peaks share its tile, while bare rock on a summit never is.
+  static constexpr int kFlatBlocks = 16;
+  struct TileFlat {
+    int texels = 0;           // node-registered edge size of the tile's DEM
+    float texelMeters = 0.f;  // ground size of one texel
+    float lapMax[kFlatBlocks * kFlatBlocks] = {};  // row = tile-local y (south -> north)
+    // max over the blocks overlapping [x0,x1]x[y0,y1] (tile-local, clamped to [0,1]), dilated by
+    //  one block so neighbouring relief that the polygon's triangles reach into counts too
+    float maxLap(float x0, float y0, float x1, float y1) const;
+  };
+  static std::shared_ptr<const TileFlat> tileFlatness(TileID id);
   int32_t elevationSourceId() const;
   float getDepth(glm::vec2 screenpos);
 

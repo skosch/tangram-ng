@@ -639,7 +639,9 @@ void TextStyleBuilder::addCurvedTextLabels(const Line& _line, const TextStyle::P
 
         uint32_t selectionColor = 0;
         if (_params.interactive) {
-            selectionColor = _rule.featureSelection->nextColorIdentifier();
+            // markers have no tile FeatureSelection: use the colour their rule was given
+            selectionColor = _rule.featureSelection ? _rule.featureSelection->nextColorIdentifier()
+                                                    : _rule.selectionColor;
         }
 
         m_labels.emplace_back(new CurvedLabel(l, _params.labelOptions, prio,

@@ -45,6 +45,12 @@ struct ViewState {
     float fractZoom;
     glm::vec2 viewportSize;
     float tileSize;
+    // Terrain bend ("curved world", View::setTerrainBend): a point at ground distance d (projected
+    //  meters) from the view center is lowered by bendTan*(sqrt(d^2 + R^2) - R), R = bendRadius.
+    //  bendTan already includes the tilt ramp; 0 = no bend. Used to keep CPU label projection
+    //  consistent with the vertex shader (terrain-3d.yaml).
+    float bendTan = 0.f;
+    float bendRadius = 1.f;
 };
 
 class ElevationManager;
@@ -254,6 +260,27 @@ public:
     // Get y screen position of horizon (< 0 or > screen height indicates horizon not visible)
     float horizonScreenPosition();
 
+    // Terrain bend ("curved world", Heinrich Berann panorama look): the terrain, and everything
+    //  draped on it, droops away from the view center along a hyperbola,
+    //    drop(d) = slope * ramp(pitch) * (sqrt(d^2 + R^2) - R),   R = radiusMult * eye distance,
+    //  which is parabolic (a gentle sphere-like curvature) for d << R and tends to a straight slope of
+    //  `slope` (rise/run, i.e. tan of the asymptotic droop angle) for d >> R - so it never rolls up
+    //  into a ball however far we look. ramp fades the bend in between 20 and 55 degrees of camera
+    //  pitch, so top-down views are untouched. MUST match the position block in terrain-3d.yaml.
+    void setTerrainBend(float _slope, float _radiusMult) { m_bendSlope = _slope; m_bendRadiusMult = _radiusMult; }
+    float terrainBendSlope() const { return m_bendSlope; }
+    float terrainBendRamp() const;               // 0..1 from the current pitch
+    float terrainBendRadius() const;             // R, projected meters
+    float terrainBendDrop(glm::dvec2 _relMeters) const;   // meters, >= 0
+    // Screen y of the far edge of the (bent) terrain, where the sky begins; falls back to the flat
+    //  horizon when there is no bend.
+    float bentHorizonScreenPosition();
+
+    // Sky gradient colors (SkyManager), set by the app from the scene's globals.
+    void setSkyColors(const glm::vec4& _horizon, const glm::vec4& _zenith) { m_skyHorizon = _horizon; m_skyZenith = _zenith; }
+    const glm::vec4& skyHorizonColor() const { return m_skyHorizon; }
+    const glm::vec4& skyZenithColor() const { return m_skyZenith; }
+
     // Get the set of all tiles visible at the current position and zoom.
     //void getVisibleTiles(const std::function<void(TileID)>& _tileCb, int zoomBias, TileID tile = TileID(0,0,0)) const;
     float getTileScreenArea(TileID tile) const;
@@ -342,6 +369,10 @@ protected:
 
     float m_yaw = 0.f;
     float m_pitch = 0.f;
+    float m_bendSlope = 0.f;
+    float m_bendRadiusMult = 1.5f;
+    glm::vec4 m_skyHorizon = glm::vec4(0.7f, 0.8f, 0.9f, 1.f);
+    glm::vec4 m_skyZenith = glm::vec4(0.4f, 0.6f, 0.9f, 1.f);
 
     float m_zoom = 0.f;
     float m_worldBoundsMinZoom = 0.f;

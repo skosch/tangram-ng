@@ -73,6 +73,10 @@ public:
 
     size_t bufferSize() const;
 
+    // instance count for the draw calls issued by draw() (set by Style::draw from the style's `instances` param; shells
+    //  for the forest trees use gl_InstanceID). Global because the mesh is reached through the StyledMesh interface.
+    static int drawInstances;
+
 protected:
 
     // Used in draw for legth and offsets: sumIndices, sumVertices

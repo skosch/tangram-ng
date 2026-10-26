@@ -209,6 +209,10 @@ void GL::drawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *ind
     GL_CHECK(glDrawElements(mode, count, type, indices ));
 }
 
+void GL::drawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const GLvoid *indices, GLsizei instances) {
+    GL_CHECK(glDrawElementsInstanced(mode, count, type, indices, instances));
+}
+
 void GL::uniform1f(GLint location, GLfloat v0) {
     GL_CHECK(glUniform1f(location, v0));
 }

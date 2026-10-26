@@ -144,6 +144,8 @@ void MeshBase::upload(RenderState& rs) {
     m_isUploaded = true;
 }
 
+int MeshBase::drawInstances = 1;
+
 bool MeshBase::draw(RenderState& rs, ShaderProgram& _shader, bool _useVao) {
     bool useVao = _useVao && Hardware::supportsVAOs;
 
@@ -195,8 +197,13 @@ bool MeshBase::draw(RenderState& rs, ShaderProgram& _shader, bool _useVao) {
 
         // Draw as elements or arrays
         if (nIndices > 0) {
-            GL::drawElements(m_drawMode, nIndices, GL_UNSIGNED_SHORT,
-                             (void*)(indiceOffset * sizeof(GLushort)));
+            if (drawInstances > 1) {
+                GL::drawElementsInstanced(m_drawMode, nIndices, GL_UNSIGNED_SHORT,
+                                          (void*)(indiceOffset * sizeof(GLushort)), drawInstances);
+            } else {
+                GL::drawElements(m_drawMode, nIndices, GL_UNSIGNED_SHORT,
+                                 (void*)(indiceOffset * sizeof(GLushort)));
+            }
         } else if (nVertices > 0) {
             GL::drawArrays(m_drawMode, 0, nVertices);
         }

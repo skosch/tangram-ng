@@ -1,3 +1,5 @@
+#include <mutex>
+#include <unordered_map>
 #include "util/elevationManager.h"
 
 #include "debug/profiler.h"
@@ -161,6 +163,7 @@ struct ElevTexInfo {
   uint32_t magic = 0xE1E7E1E7u;  // != kElevationMosaicInfoMagic (data/rasterSource.h)
   float min, max;
   float lapRms;
+  float blockLap[ElevationManager::kFlatBlocks * ElevationManager::kFlatBlocks] = {};
   ElevationManager::DemFacingStats facing;
 };
 
@@ -211,6 +214,12 @@ ElevTexInfo* elevTexInfo(Texture& tex, TileID id)
           size_t i = size_t(y)*w + x;
           float l = 4*at(i) - at(i - 1) - at(i + 1) - at(i - w) - at(i + w);
           sum += double(l)*l;
+          {
+            constexpr int nb = ElevationManager::kFlatBlocks;
+            int bx = std::min(nb - 1, x*nb/w), by = std::min(nb - 1, y*nb/h);
+            float& bl = info.blockLap[by*nb + bx];
+            bl = std::max(bl, std::fabs(l));
+          }
           float q = std::fabs(l)*invH;
           if(q >= ElevationManager::kDemTierLo[0]) {
             int t = 0;
@@ -233,9 +242,50 @@ ElevTexInfo* elevTexInfo(Texture& tex, TileID id)
 }
 }  // namespace
 
+namespace {
+std::mutex s_flatMutex;
+std::unordered_map<uint64_t, std::shared_ptr<const ElevationManager::TileFlat>> s_flat;
+inline uint64_t flatKey(TileID id)
+{
+  return (uint64_t(uint32_t(id.z)) << 56) ^ (uint64_t(uint32_t(id.x)) << 28) ^ uint64_t(uint32_t(id.y));
+}
+}  // namespace
+
+constexpr int ElevationManager::kFlatBlocks;
+
+float ElevationManager::TileFlat::maxLap(float x0, float y0, float x1, float y1) const
+{
+  const int nb = kFlatBlocks;
+  auto blk = [&](float v) { return std::max(0, std::min(nb - 1, int(std::floor(v * nb)))); };
+  int bx0 = std::max(0, blk(x0) - 1), bx1 = std::min(nb - 1, blk(x1) + 1);
+  int by0 = std::max(0, blk(y0) - 1), by1 = std::min(nb - 1, blk(y1) + 1);
+  float m = 0.f;
+  for(int by = by0; by <= by1; ++by) {
+    for(int bx = bx0; bx <= bx1; ++bx) { m = std::max(m, lapMax[by*nb + bx]); }
+  }
+  return m;
+}
+
 void ElevationManager::precomputeTileInfo(Texture& tex, TileID id)
 {
-  if(tex.bufferData()) { elevTexInfo(tex, TileID(id.x, id.y, id.z)); }
+  if(!tex.bufferData()) { return; }
+  TileID key(id.x, id.y, id.z);
+  auto* info = elevTexInfo(tex, key);
+  auto flat = std::make_shared<TileFlat>();
+  const int w = tex.width();
+  flat->texels = w - (w % 2);
+  flat->texelMeters = info->facing.texelMeters;
+  std::copy(info->blockLap, info->blockLap + kFlatBlocks*kFlatBlocks, flat->lapMax);
+  std::lock_guard<std::mutex> lock(s_flatMutex);
+  if(s_flat.size() > 4096) { s_flat.clear(); }  // misses fall back to the full grid
+  s_flat[flatKey(key)] = flat;
+}
+
+std::shared_ptr<const ElevationManager::TileFlat> ElevationManager::tileFlatness(TileID id)
+{
+  std::lock_guard<std::mutex> lock(s_flatMutex);
+  auto it = s_flat.find(flatKey(TileID(id.x, id.y, id.z)));
+  return it == s_flat.end() ? nullptr : it->second;
 }
 
 glm::vec2 ElevationManager::getMinMaxElev(TileID tileId, int ancestors)

@@ -119,7 +119,7 @@ void LabelManager::processLabelUpdate(const ViewState& _viewState, const LabelSe
     bool drawAllLabels = Tangram::getDebugFlag(DebugFlags::draw_all_labels);
 
     // use blendOrder == INT_MAX to indicate debug style
-    glm::mat4 elevMVP;
+    glm::mat4 elevMVP, modelMat0{1.f};
     bool recalcPos = false, behindCam = false;
     bool useElev = _elevManager && _style->blendOrder() < INT_MAX;
     // hasTile() is a pure function of the tile (it samples the tile center, always evaluated
@@ -157,9 +157,35 @@ void LabelManager::processLabelUpdate(const ViewState& _viewState, const LabelSe
             modelMat[3][0] = float(relorigin.x);
             modelMat[3][1] = float(relorigin.y);
             elevMVP = depthData.viewProj * modelMat;
+            modelMat0 = modelMat;
             recalcPos = true;
         }
     }
+
+    // Terrain bend (View::setTerrainBend): the vertex shader lowers terrain and everything draped
+    //  on it with distance from the view center, so a label's anchor must be lowered by the same
+    //  amount or it floats above the bent ground. The drop is constant per label, so instead of
+    //  touching its coordinates we shift the mvp's translation by drop * (z column): equivalent to
+    //  moving the anchor down by `drop` before projecting.
+    const bool bendOn = _viewState.bendTan > 0.f;
+    double bendUnit = 1.0;  // meters per tile/marker coordinate unit
+    glm::mat4 bendModel{1.f};
+    if (bendOn) {
+        if (_tile) { bendUnit = _tile->getScale(); bendModel = _tile->getModelMatrix(); }
+        else if (_marker) {
+            bendUnit = _marker->extent();
+            if (bendUnit <= 0) { bendUnit = MapProjection::metersPerTileAtZoom(_marker->builtZoomLevel()); }
+            bendModel = _marker->modelMatrix();
+        }
+    }
+    auto bendShift = [&](const glm::mat4& m, const glm::mat4& model, const glm::vec3& center) {
+        glm::vec2 rel = glm::vec2(model * glm::vec4(center, 1.f));
+        double R = _viewState.bendRadius;
+        double drop = _viewState.bendTan * (std::sqrt(double(rel.x)*rel.x + double(rel.y)*rel.y + R*R) - R);
+        glm::mat4 out = m;
+        out[3] -= float(drop / bendUnit) * m[2];
+        return out;
+    };
 
     for (auto& label : _labelSet->getLabels()) {
         if (!drawAllLabels && (label->state() == Label::State::dead) ) {
@@ -269,7 +295,9 @@ void LabelManager::processLabelUpdate(const ViewState& _viewState, const LabelSe
         glm::vec4 screenCoord = label->screenCoord();   //glm::vec4(0);
         if (recalcPos) {
             auto worldPos = glm::vec4(label->modelCenter(), 1.f);
-            screenCoord = worldToScreenSpace(elevMVP, worldPos, _viewState.viewportSize, behindCam);
+            // elevMVP's model matrix is relative to the depth data's (previous) view center
+            screenCoord = worldToScreenSpace(bendOn ? bendShift(elevMVP, modelMat0, label->modelCenter()) : elevMVP,
+                                             worldPos, _viewState.viewportSize, behindCam);
         }
 
         Range transformRange;
@@ -278,7 +306,9 @@ void LabelManager::processLabelUpdate(const ViewState& _viewState, const LabelSe
         // Use extendedBounds when labels take part in collision detection.
         auto bounds = (_onlyRender || !label->canOcclude()) ? screenBounds : extendedBounds;
 
-        const glm::mat4& mvp = _tile ? _tile->mvp() : _marker->modelViewProjectionMatrix();
+        const glm::mat4& mvp0 = _tile ? _tile->mvp() : _marker->modelViewProjectionMatrix();
+        const glm::mat4 mvpBent = bendOn ? bendShift(mvp0, bendModel, label->modelCenter()) : mvp0;
+        const glm::mat4& mvp = bendOn ? mvpBent : mvp0;
         bool updated;
         {
             ProfileAccum _pa(m_prof[kProfUpdate], m_profOn);

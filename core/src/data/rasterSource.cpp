@@ -199,6 +199,90 @@ void encodeElevationPixel(GLubyte* p, double value, int bpp, bool isFloat) {
     if (bpp >= 4) { p[3] = 255; }
 }
 
+// Quantisation-aware edge-preserving blur of one elevation tile, in place (experiment against
+// the stair-step "terraces" integer-metre / coarsely quantised DEMs show on gentle slopes).
+// A small bilateral kernel whose range sigma is tied to the quantisation step q: height
+// differences up to ~q are treated as quantisation noise and averaged away, larger ones as real
+// relief (cliffs, ridges) and left alone. The result is then clamped to within q/2 of the
+// original sample, since the true height of a value rounded to q lies in [h - q/2, h + q/2]; so
+// the filter can never move the surface further than the data's own precision allows. Several
+// passes diffuse across wider plateaus while the clamp (always against the ORIGINAL) bounds the
+// total change. The outermost `kRadius` texels are left untouched so neighbouring tiles, which
+// share edge samples, stay seamless.
+// Env: ASCEND_DEM_DEQUANT = q in metres (default 1, 0 = off), ASCEND_DEM_DEQUANT_PASSES (default 2).
+void dequantiseElevationTile(GLubyte* data, int W, int bpp, bool isFloat) {
+    static const float q = []() {
+        const char* e = std::getenv("ASCEND_DEM_DEQUANT");
+        return e ? std::max(0.f, float(std::atof(e))) : 1.f;
+    }();
+    static const int passes = []() {
+        const char* e = std::getenv("ASCEND_DEM_DEQUANT_PASSES");
+        return e ? std::min(8, std::max(1, std::atoi(e))) : 2;
+    }();
+    PROFILE_SCOPE("dem:dequantise");
+    constexpr int kRadius = 2;
+    if (q <= 0.f || !data || W < 4 * kRadius + 1 || bpp < 3) { return; }
+
+    const size_t n = size_t(W) * size_t(W);
+    std::vector<float> orig(n), cur(n), next(n);
+    for (size_t i = 0; i < n; i++) {
+        orig[i] = float(decodeElevationPixel(data + i * size_t(bpp), bpp, isFloat));
+    }
+    cur = orig;
+    next = orig;
+
+    // spatial weights (sigma 1.2 texels) over the (2R+1)^2 window
+    float ws[2 * kRadius + 1][2 * kRadius + 1];
+    for (int dy = -kRadius; dy <= kRadius; dy++) {
+        for (int dx = -kRadius; dx <= kRadius; dx++) {
+            ws[dy + kRadius][dx + kRadius] = std::exp(-float(dx * dx + dy * dy) / (2.f * 1.2f * 1.2f));
+        }
+    }
+    const float half = 0.5f * q;
+    // Range weight: Tukey biweight (1 - (d/c)^2)^2, zero beyond c -- close to a Gaussian of sigma
+    //  1.2 q for c = 2.7 q, but pure arithmetic, so the row loops below vectorise (no exp / lookup).
+    const float invC2 = 1.f / ((2.7f * q) * (2.7f * q));
+    const int x0 = kRadius, x1 = W - kRadius, nx = x1 - x0;
+    std::vector<float> rowSum(size_t(nx), 0.f), rowW(size_t(nx), 0.f);
+
+    for (int pass = 0; pass < passes; pass++) {
+        for (int y = kRadius; y < W - kRadius; y++) {
+            float* __restrict sum = rowSum.data();
+            float* __restrict wsum = rowW.data();
+            std::fill(sum, sum + nx, 0.f);
+            std::fill(wsum, wsum + nx, 0.f);
+            const float* __restrict ctr = &cur[size_t(y) * size_t(W) + size_t(x0)];
+            for (int dy = -kRadius; dy <= kRadius; dy++) {
+                for (int dx = -kRadius; dx <= kRadius; dx++) {
+                    const float ww = ws[dy + kRadius][dx + kRadius];
+                    const float* __restrict src = &cur[size_t(y + dy) * size_t(W) + size_t(x0 + dx)];
+                    for (int x = 0; x < nx; x++) {
+                        const float d = src[x] - ctr[x];
+                        const float t = std::max(1.f - d * d * invC2, 0.f);
+                        const float w = ww * t * t;
+                        sum[x] += w * src[x];
+                        wsum[x] += w;
+                    }
+                }
+            }
+            float* __restrict out = &next[size_t(y) * size_t(W) + size_t(x0)];
+            const float* __restrict org = &orig[size_t(y) * size_t(W) + size_t(x0)];
+            for (int x = 0; x < nx; x++) {
+                const float r = sum[x] / wsum[x];   // the centre tap alone has weight > 0
+                out[x] = std::min(org[x] + half, std::max(org[x] - half, r));
+            }
+        }
+        cur.swap(next);
+    }
+
+    for (int y = kRadius; y < W - kRadius; y++) {
+        for (int x = kRadius; x < W - kRadius; x++) {
+            size_t i = size_t(y) * size_t(W) + size_t(x);
+            encodeElevationPixel(data + i * size_t(bpp), double(cur[i]), bpp, isFloat);
+        }
+    }
+}
+
 // Nearest-sampled 65x65 lattice-node grid for one tile's OWN raw buffer, replicating exactly
 // what the terrain mesh vertex shader reads (RasterStyle::build: resolution=64 fixed; elevation
 // source `filtering: nearest`): node (i, j) at tile-local (u, v) = (i/64, j/64) reads the texel
@@ -805,7 +889,13 @@ std::unique_ptr<Texture> RasterSource::createTexture(TileID _tile, const std::ve
     // Elevation tiles (CPU buffer kept): compute min/max, Laplacian RMS and the salient-texel
     // facing table here on the decode worker instead of lazily on the main thread the first
     // time the LOD selector or labels ask for it.
-    if (tex && m_keepTextureData) { ElevationManager::precomputeTileInfo(*tex, _tile); }
+    if (tex && m_keepTextureData) {
+        if (tex->bufferData() && tex->width() == tex->height()) {
+            dequantiseElevationTile(tex->bufferData(), tex->width(), int(tex->bufferSize() / (size_t(tex->width()) * size_t(tex->height()))),
+                                    tex->getOptions().pixelFormat == PixelFormat::FLOAT);
+        }
+        ElevationManager::precomputeTileInfo(*tex, _tile);
+    }
     return tex;
 }
 

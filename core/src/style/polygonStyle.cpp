@@ -1,5 +1,7 @@
 #include "style/polygonStyle.h"
 #include <cstdlib>
+#include <atomic>
+#include <cstdio>
 
 #include "gl/mesh.h"
 #include "gl/shaderProgram.h"
@@ -11,6 +13,7 @@
 #include "scene/drawRule.h"
 #include "tile/tile.h"
 #include "util/builders.h"
+#include "util/elevationManager.h"
 #include "util/color.h"
 #include "util/extrude.h"
 #include "util/mapProjection.h"
@@ -116,6 +119,7 @@ public:
         m_tileUnitsPerMeter = _tile.getInverseScale();
         auto id = _tile.getID();
         m_zoom = id.z;
+        m_tileX = uint32_t(id.x); m_tileY = uint32_t(id.y);
         m_overzoom2 = exp2(float(id.s) - float(id.z));
         m_water = _tile.waterMask();
         m_meshData.clear();
@@ -150,6 +154,10 @@ public:
         m_builder.gridRes = m_style.activeTerrainGrid() > 0
             ? std::min(m_style.activeTerrainGrid(), kTerrainMeshGridRes << gridLevels)
             : 0;
+        // Relief-adaptive grid (per polygon, see adaptGrid in addPolygon): remember this tile's
+        //  per-region DEM roughness; null (elevation not decoded yet) keeps the full grid.
+        m_flat = m_builder.gridRes > 0 ? ElevationManager::tileFlatness(TileID(id.x, id.y, id.z)) : nullptr;
+        m_polysTotal = m_polysReduced = 0;
         // DIAGNOSTIC (2026-10-12, drape patches): ASCEND_POLY_GRID=N forces the draped polygon grid
         //  to min(style ceiling, N) regardless of the tile's styling zoom, to test whether polygon
         //  triangles chording across the terrain lattice (grid coarser than lattice) causes the
@@ -161,6 +169,7 @@ public:
             }();
             if (forced > 0) { m_builder.gridRes = std::min(m_style.activeTerrainGrid(), forced); }
         }
+        m_baseGrid = m_builder.gridRes;
         // TEMP DIAGNOSTIC (rock-texture-v2 round 18, "torn holes while panning at zoom 16+,
         //  angle-dependent" investigation): rounds 14-17 refuted the composite-data-mismatch,
         //  gridRes-staleness, elevation-shelf-pinning, and OSM-coverage-gap hypotheses in
@@ -212,14 +221,27 @@ private:
 
     float m_tileUnitsPerMeter = 0;
     int m_zoom = 0;
+    uint32_t m_tileX = 0, m_tileY = 0;
     float m_overzoom2 = 1.f;
     std::shared_ptr<const WaterMask> m_water;
+
+    // relief-adaptive grid state (setup() / addPolygon())
+    int m_baseGrid = 0;
+    std::shared_ptr<const ElevationManager::TileFlat> m_flat;
+    int m_polysTotal = 0, m_polysReduced = 0;
+
+    int adaptGrid(const Polygon& _polygon) const;
 
 };
 
 template <class V>
 std::unique_ptr<StyledMesh> PolygonStyleBuilder<V>::build() {
     if (m_meshData.vertices.empty()) { return nullptr; }
+    static const bool adaptLog = getenv("ASCEND_POLY_ADAPT_LOG") != nullptr;
+    if (adaptLog && m_baseGrid > 0) {
+        fprintf(stderr, "polyadapt %s: base=%d %s polys=%d reduced=%d verts=%zu\n", m_style.getName().c_str(),
+                m_baseGrid, m_flat ? "dem" : "NO-DEM", m_polysTotal, m_polysReduced, m_meshData.vertices.size());
+    }
 
     auto mesh = std::make_unique<Mesh<V>>(m_style.vertexLayout(),
                                                       m_style.drawMode());
@@ -253,12 +275,48 @@ auto PolygonStyleBuilder<V>::parseRule(const DrawRule& _rule, const Properties& 
     return p;
 }
 
+// Relief-adaptive polygon grid. The tile-wide sizing in setup() is a worst case for steep ground,
+//  but a lake or farmland polygon in a valley doesn't need it: halve the grid while the estimated
+//  chord error over the ground THIS polygon covers stays under a tolerance. Chord error of a cell
+//  k texels wide ~ (max second difference per texel) * k^2/8, with the max-|Laplacian| of the
+//  polygon's bbox blocks (dilated by one) standing in for the second difference. Because it is
+//  max-based, any summit, ridge or cliff under the polygon keeps the full grid - exposed rock is
+//  never coarsened. Unknown terrain (elevation not decoded yet) keeps the full grid too.
+template <class V>
+int PolygonStyleBuilder<V>::adaptGrid(const Polygon& _polygon) const {
+    static const float tol = [] {
+        const char* e = getenv("ASCEND_POLY_ADAPT_TOL");
+        return e ? float(atof(e)) : 1.0f;  // in DEM texels of ground distance; 0 = off
+    }();
+    int grid = m_baseGrid;
+    if (grid <= 32 || tol <= 0.f || !m_flat || _polygon.empty() || _polygon[0].empty()) { return grid; }
+    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+    for (auto& pt : _polygon[0]) {
+        x0 = std::min(x0, pt.x); x1 = std::max(x1, pt.x);
+        y0 = std::min(y0, pt.y); y1 = std::max(y1, pt.y);
+    }
+    const float lap = m_flat->maxLap(x0, y0, x1, y1);
+    const float tolM = tol * m_flat->texelMeters;
+    while (grid > 32) {
+        float k = float(m_flat->texels) / float(grid / 2);
+        if (lap * k * k / 8.f > tolM) { break; }
+        grid /= 2;
+    }
+    return grid;
+}
+
 template <class V>
 bool PolygonStyleBuilder<V>::addPolygon(const Polygon& _polygon, const Properties& _props, const DrawRule& _rule) {
 
     auto p = parseRule(_rule, _props);
 
     m_builder.keepTileEdges = p.keepTileEdges;
+    m_builder.edgeDistCap = m_style.edgeDistance() > 0.f ? m_style.edgeDistance() * m_tileUnitsPerMeter : 0.f;
+    if (m_baseGrid > 0) {
+        m_builder.gridRes = adaptGrid(_polygon);
+        ++m_polysTotal;
+        if (m_builder.gridRes < m_baseGrid) { ++m_polysReduced; }
+    }
 
     // A polygon rule with an `outline: width` draws a soft band along the INSIDE of the polygon's
     //  edge instead of its fill (park / protected-area edge): see Builders::buildPolygonEdgeBand.
@@ -296,7 +354,19 @@ bool PolygonStyleBuilder<V>::addPolygon(const Polygon& _polygon, const Propertie
                                             p.height, m_builder);
         }
 
-        Builders::buildPolygon(_polygon, p.height, m_builder);
+        if (m_style.treeScatter() > 0.f) {
+            // whole trees on a world-anchored grid (spacing constant in metres from zoom 15 in, doubling per zoom out, so a tile
+            //  always carries at most 160^2 trees); the vertex positions are the tree BASES, the shader builds the crosses
+            auto& ts = m_builder.trees;
+            ts.on = true;
+            ts.cells = std::max(8, 160 >> std::max(0, m_zoom - 15));
+            ts.tileX = m_tileX; ts.tileY = m_tileY;
+            ts.tileScale = 1.f / m_tileUnitsPerMeter;
+            ts.featherM = m_style.treeScatter();
+            Builders::buildTreeScatter(_polygon, m_builder);
+        } else {
+            Builders::buildPolygon(_polygon, p.height, m_builder);
+        }
     }
 
     m_meshData.indices.insert(m_meshData.indices.end(),

@@ -102,6 +102,22 @@ struct PolygonBuilder {
     //  See Builders::buildPolygon().
     int gridRes = 0;
 
+    // if > 0 (tile units), polygon vertices carry the distance to the polygon's boundary instead of the usual
+    //  [0,1] texcoord: uv = (min(dist, cap) / cap, 0). The forest-trees style uses it as a per-pixel tree density
+    //  (thin out whole crowns near the outline). Needs the grid path (gridRes > 0) for interior vertices; a polygon
+    //  that is not grid-tessellated gets uv.x = 1 (no feathering) or 0 (tiny polygon: all boundary).
+    float edgeDistCap = 0.f;
+
+    // forest-trees (style param `tree_scatter`): instead of a filled polygon, scatter whole trees on a world-anchored jittered grid
+    //  inside the polygon: one cross of 3 vertical quads per tree (Builders::buildTreeScatter). Per-tree thinning near the outline.
+    struct TreeScatter {
+        bool on = false;
+        int cells = 0;             // grid cells per tile side (spacing = 1 / cells in tile units)
+        uint32_t tileX = 0, tileY = 0;
+        float tileScale = 1.f;     // projected metres per tile unit
+        float featherM = 20.f;     // projected metres over which the density ramps 0 -> 1 from the outline
+    } trees;
+
     // A single feature's grid tessellation can need more vertices than a uint16 index can address
     //  (large/complex polygon at high gridRes); buildPolygonGrid (builders.cpp) then flushes what
     //  it has as its own indexed sub-range and keeps going with a fresh 0-based vertex block,
@@ -199,6 +215,7 @@ public:
      * terrain individually. Edges are split where they cross _water (may be null) so each piece is
      * wholly land or wholly water. Unless keepTileEdges, tile-edge cuts are omitted.
      */
+    static void buildTreeScatter(const Polygon& _polygon, PolygonBuilder& _ctx);
     static void buildPolygonEdgeBand(const Polygon& _polygon, float _width, float _lift, const WaterMask* _water, PolygonBuilder& _ctx);
 
     /* Build extruded 'walls' from a polygon

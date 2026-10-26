@@ -9,6 +9,8 @@
 #include "gl/framebuffer.h"
 #include "gl/shaderProgram.h"
 #include "labels/labelManager.h"
+#include "labels/areaLabelManager.h"
+#include "labels/areaRegistry.h"
 #include "marker/markerManager.h"
 #include "scene/dataLayer.h"
 #include "scene/importer.h"
@@ -57,6 +59,8 @@ Scene::Scene(Platform& _platform,
     m_tileManager = std::make_unique<TileManager>(_platform, *m_tileWorker, m_prana);
     m_markerManager = std::make_unique<MarkerManager>(*this,
         _oldScene && _options.preserveMarkers ? _oldScene->m_markerManager.get() : NULL);
+    m_areaRegistry = std::make_shared<AreaRegistry>();
+    m_areaLabelManager = std::make_unique<AreaLabelManager>(*this, m_areaRegistry);
 }
 
 ScenePrana::~ScenePrana() {
@@ -685,10 +689,17 @@ Scene::UpdateState Scene::update(RenderState& _rs, View& _view, float _dt) {
         viewChanged = _view.update();
     }
 
+    bool areaLabelsChanged = false;
+    {
+        PROFILE_SCOPE("AreaLabelUpdate");
+        areaLabelsChanged = m_areaLabelManager->update(_view, _dt, *m_tileManager, *m_markerManager);
+    }
+
     MarkerManager::UpdateState markersState;
     {
         PROFILE_SCOPE("MarkerUpdate");
         markersState = m_markerManager->update(_view, _dt);
+        markersState.dirty |= areaLabelsChanged;
     }
 
     bool tilesChanged = m_tileManager->updateTileSets(_view);
@@ -771,7 +782,7 @@ Scene::UpdateState Scene::update(RenderState& _rs, View& _view, float _dt) {
 
     m_labelManager->updateLabelSet(_view, _dt, *this, tiles, markers, !changed);
 
-    return { m_tileManager->numLoadingTiles() > 0, m_labelManager->needUpdate(), markersState.easing };
+    return { m_tileManager->numLoadingTiles() > 0 || m_areaLabelManager->pending(), m_labelManager->needUpdate(), markersState.easing };
 }
 
 void Scene::renderBeginFrame(RenderState& _rs) {

@@ -34,6 +34,8 @@ class FeatureSelection;
 class FontContext;
 class FrameBuffer;
 class Importer;
+class AreaLabelManager;
+class AreaRegistry;
 class LabelManager;
 class Light;
 class MapProjection;
@@ -199,6 +201,8 @@ public:
     TileManager* tileManager() const { return m_tileManager.get(); }
     LabelManager* labelManager() const { return m_labelManager.get(); }
     MarkerManager* markerManager() const { return m_markerManager.get(); }
+    AreaLabelManager* areaLabelManager() const { return m_areaLabelManager.get(); }
+    std::shared_ptr<AreaRegistry> areaRegistry() const { return m_areaRegistry; }
     ElevationManager* elevationManager() const { return m_elevationManager.get(); }
 
     const SceneError* errors() const {
@@ -329,6 +333,8 @@ protected:
     std::unique_ptr<TileWorker> m_tileWorker;
     std::unique_ptr<TileManager> m_tileManager;
     std::unique_ptr<MarkerManager> m_markerManager;
+    std::shared_ptr<AreaRegistry> m_areaRegistry;
+    std::unique_ptr<AreaLabelManager> m_areaLabelManager;
     std::unique_ptr<LabelManager> m_labelManager;
     std::unique_ptr<ElevationManager> m_elevationManager;
     std::unique_ptr<SkyManager> m_skyManager;

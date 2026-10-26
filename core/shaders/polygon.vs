@@ -54,6 +54,12 @@ varying vec3 v_normal;
 
 #define UNPACK_POSITION(x) (x / 8192.0)
 
+#ifdef TANGRAM_RASTER_STYLE
+// terrain mesh skirt vertices (rasterStyle.cpp) are flagged by x + 2.0
+varying float v_is_skirt;
+float rasterSkirtFlag() { return UNPACK_POSITION(a_position.x) > 1.5 ? 1.0 : 0.0; }
+#endif
+
 vec4 worldPosition() {
     return v_world_position;
 }
@@ -83,7 +89,7 @@ vec4 edgeBandPosition(vec4 p) {
 
 vec4 modelPositionBaseZoom() {
     #ifdef TANGRAM_RASTER_STYLE
-        return vec4(UNPACK_POSITION(a_position.xy), 0.0, 1.0);
+        return vec4(UNPACK_POSITION(a_position.xy) - vec2(2.0 * rasterSkirtFlag(), 0.0), 0.0, 1.0);
     #else
         vec4 p = vec4(UNPACK_POSITION(a_position.xyz), 1.0);
         #if defined(TANGRAM_EDGE_BAND) && defined(TANGRAM_USE_TEX_COORDS)
@@ -139,6 +145,10 @@ void main() {
 
     #ifdef TANGRAM_MODEL_POSITION_BASE_ZOOM_VARYING
         v_modelpos_base_zoom = modelPositionBaseZoom();
+    #endif
+
+    #ifdef TANGRAM_RASTER_STYLE
+        v_is_skirt = rasterSkirtFlag();
     #endif
 
     v_normal = normalize(u_normal_matrix * worldNormal());

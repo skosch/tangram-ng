@@ -16,6 +16,7 @@
 #include "style/textStyle.h"
 #include "style/pointStyle.h"
 #include "style/rasterStyle.h"
+#include "style/areaLabelStyle.h"
 #include "style/contourTextStyle.h"
 #include "scene/dataLayer.h"
 #include "scene/filters.h"
@@ -911,6 +912,7 @@ Scene::Styles SceneLoader::applyStyles(const Node& _node, SceneTextures& _textur
     styles.emplace_back(new PointStyle("points"));
     styles.emplace_back(new RasterStyle("raster"));
     styles.emplace_back(new ContourTextStyle("contour-labels"));
+    styles.emplace_back(new AreaLabelStyle("area-labels"));
 #ifdef TANGRAM_CONTOUR_DEBUG
     styles.emplace_back(new ContourDebugStyle("contour-debug"));
 #endif
@@ -1040,6 +1042,15 @@ void SceneLoader::loadStyleProps(const Node& _styleNode, Style& _style, SceneTex
         else { LOGW("Invalid blend mode '%s'", blendMode.c_str()); }
     }
 
+    if (const Node& stencilWriteNode = _styleNode["stencil_write"]) {
+        bool boolValue;
+        if (YamlUtil::getBool(stencilWriteNode, boolValue)) { _style.setStencilWrite(boolValue ? 1 : 0); }
+    }
+    if (const Node& stencilSkipNode = _styleNode["stencil_skip"]) {
+        bool boolValue;
+        if (YamlUtil::getBool(stencilSkipNode, boolValue)) { _style.setStencilSkip(boolValue); }
+    }
+
     if (const Node& blendOrderNode = _styleNode["blend_order"]) {
         int blendOrderValue;
         if (YamlUtil::getInt(blendOrderNode, blendOrderValue)) {
@@ -1069,6 +1080,29 @@ void SceneLoader::loadStyleProps(const Node& _styleNode, Style& _style, SceneTex
             }
         } else {
             LOGW("terrain_grid style parameter is only supported for polygon styles");
+        }
+    }
+
+    if (const Node& treeScatterNode = _styleNode["tree_scatter"]) {
+        float v = 0.f;
+        if (auto polygonStyle = dynamic_cast<PolygonStyle*>(&_style)) {
+            if (YamlUtil::getFloat(treeScatterNode, v)) { polygonStyle->setTreeScatter(v); }
+        } else {
+            LOGW("tree_scatter style parameter is only supported for polygon styles");
+        }
+    }
+
+    if (const Node& instancesNode = _styleNode["instances"]) {
+        int n = 1;
+        if (YamlUtil::getInt(instancesNode, n)) { _style.setInstances(n); }
+    }
+
+    if (const Node& edgeDistNode = _styleNode["edge_distance"]) {
+        float edgeDist = 0.f;
+        if (auto polygonStyle = dynamic_cast<PolygonStyle*>(&_style)) {
+            if (YamlUtil::getFloat(edgeDistNode, edgeDist)) { polygonStyle->setEdgeDistance(edgeDist); }
+        } else {
+            LOGW("edge_distance style parameter is only supported for polygon styles");
         }
     }
 

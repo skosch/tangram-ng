@@ -174,7 +174,10 @@ void FrameBuffer::init(RenderState& _rs) {
     GL::genRenderbuffers(1, &m_glDepthRenderBufferHandle);
     GL::bindRenderbuffer(GL_RENDERBUFFER, m_glDepthRenderBufferHandle);
     GL::renderbufferStorage(GL_RENDERBUFFER, m_depthFormat, m_width, m_height);
-    GL::framebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+    // a combined depth-stencil format needs the combined attachment point (the stencil bit marks that
+    //  forest etc. is lit by its own shading, see Style::m_stencilWrite)
+    GL::framebufferRenderbuffer(GL_FRAMEBUFFER,
+                                m_depthFormat == GL_DEPTH24_STENCIL8 ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT,
                                 GL_RENDERBUFFER, m_glDepthRenderBufferHandle);
 
     GLenum status = GL::checkFramebufferStatus(GL_FRAMEBUFFER);

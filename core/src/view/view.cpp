@@ -90,8 +90,53 @@ ViewState View::state() const {
         m_type == CameraType::perspective ? m_pos.z/exp2(-m_baseZoom) : powf(2.f, m_zoom),
         m_zoom - std::floor(m_zoom),
         glm::vec2(m_vpWidth, m_vpHeight),
-        (float)MapProjection::tileSize() * m_pixelScale
+        (float)MapProjection::tileSize() * m_pixelScale,
+        m_bendSlope * terrainBendRamp(),
+        terrainBendRadius()
     };
+}
+
+float View::terrainBendRamp() const {
+    if (m_bendSlope <= 0.f) { return 0.f; }
+    float t = glm::clamp((m_pitch - glm::radians(20.f)) / (glm::radians(55.f) - glm::radians(20.f)), 0.f, 1.f);
+    return t * t * (3.f - 2.f * t);
+}
+
+float View::terrainBendRadius() const {
+    return std::max(m_bendRadiusMult * glm::length(m_eye), 1.f);
+}
+
+float View::terrainBendDrop(glm::dvec2 _relMeters) const {
+    float ramp = terrainBendRamp();
+    if (ramp <= 0.f) { return 0.f; }
+    double R = terrainBendRadius();
+    double d2 = _relMeters.x*_relMeters.x + _relMeters.y*_relMeters.y;
+    return float(m_bendSlope * ramp * (std::sqrt(d2 + R*R) - R));
+}
+
+// The terrain ends at the far plane, where the shader fades it fully into the haze color. Find the
+//  ground distance D ahead of the view center at which the bent surface reaches that depth
+//  (bisection - view depth grows monotonically with D), and project that point.
+float View::bentHorizonScreenPosition() {
+    if (m_pitch == 0 || terrainBendRamp() <= 0.f || m_type != CameraType::perspective) { return horizonScreenPosition(); }
+    if (m_dirtyMatrices) { updateMatrices(); }
+
+    float farDepth = m_proj[3][2] / (m_proj[2][2] + 1.f);
+    glm::vec2 fwd = -glm::normalize(glm::vec2(m_eye));
+    auto pointAt = [&](double D) {
+        return glm::vec4(float(D) * fwd.x, float(D) * fwd.y, -terrainBendDrop(glm::dvec2(D * fwd.x, D * fwd.y)), 1.f);
+    };
+    auto depthAt = [&](double D) { return -(m_view * pointAt(D)).z; };
+
+    double lo = 0, hi = 1e3 * std::max(1.f, glm::length(m_eye));
+    if (depthAt(hi) < farDepth) { return horizonScreenPosition(); }
+    for (int i = 0; i < 40; i++) {
+        double mid = 0.5 * (lo + hi);
+        if (depthAt(mid) < farDepth) { lo = mid; } else { hi = mid; }
+    }
+    glm::vec4 clip = worldToClipSpace(m_viewProj, pointAt(hi));
+    glm::vec3 ndc = clipSpaceToNdc(clip);
+    return ndcToScreenSpace(ndc, glm::vec2(m_vpWidth, m_vpHeight)).y;
 }
 
 void View::setViewport(int _x, int _y, int _width, int _height) {
@@ -528,7 +573,7 @@ glm::vec2 View::lngLatToScreenPosition(double lng, double lat, bool& outsideView
     glm::dvec2 relativeMeters = getRelativeMeters(absoluteMeters);
     bool ok;
     double elev = m_elevationManager ? m_elevationManager->getElevation(absoluteMeters, ok) : 0;
-    glm::vec4 worldPosition(relativeMeters, elev, 1.0);
+    glm::vec4 worldPosition(relativeMeters, elev - terrainBendDrop(relativeMeters), 1.0);
     glm::vec4 clip = worldToClipSpace(m_viewProj, worldPosition);
     glm::vec3 ndc = clipSpaceToNdc(clip);
     outsideViewport = clipSpaceIsBehindCamera(clip) || abs(ndc.x) > 1 || abs(ndc.y) > 1;

@@ -112,6 +112,41 @@ void RasterStyle::build(const Scene& _scene) {
                 index++;
             }
         }
+        if (terrain) {
+            // Skirts (2026-10-24, "dark wall lines along tile borders"): neighboring terrain tiles
+            //  can differ in lattice density and in DEM resolution/zoom, so their border heights
+            //  disagree by metres (T-junctions + different source samples) and the unconnected
+            //  meshes leave a crack that shows the dark clear color / far terrain through it.
+            //  Each edge vertex gets a twin flagged by x + 2.0 (polygon.vs decodes it); the
+            //  terrain-3d position block drops flagged vertices by terrainSkirtDrop() (elevation.yaml),
+            //  hanging a vertical curtain under the border that closes any crack.
+            const uint16_t base = uint16_t((resolution + 1) * (resolution + 1));
+            const uint32_t n1 = resolution + 1;
+            // 4 edges, n1 twins each: 0 = y0 (col 0), 1 = y1 (col res), 2 = x0 (row 0), 3 = x1 (row res)
+            for (uint32_t e = 0; e < 4; e++) {
+                for (uint32_t i = 0; i <= resolution; i++) {
+                    float x = (e < 2) ? i * elementSize : (e == 2 ? 0.f : 1.f);
+                    float y = (e >= 2) ? i * elementSize : (e == 0 ? 0.f : 1.f);
+                    meshData.vertices.push_back({{x + 2.f, y}});
+                }
+            }
+            for (uint32_t e = 0; e < 4; e++) {
+                for (uint32_t i = 0; i < resolution; i++) {
+                    uint32_t a, b;  // top-surface edge vertices i, i+1 (index = col * n1 + row)
+                    if (e == 0)      { a = i;               b = i + 1; }
+                    else if (e == 1) { a = resolution * n1 + i; b = a + 1; }
+                    else if (e == 2) { a = i * n1;          b = (i + 1) * n1; }
+                    else             { a = i * n1 + resolution; b = (i + 1) * n1 + resolution; }
+                    uint16_t sa = uint16_t(base + e * n1 + i), sb = uint16_t(sa + 1);
+                    meshData.indices.push_back(uint16_t(a));
+                    meshData.indices.push_back(uint16_t(b));
+                    meshData.indices.push_back(sa);
+                    meshData.indices.push_back(uint16_t(b));
+                    meshData.indices.push_back(sb);
+                    meshData.indices.push_back(sa);
+                }
+            }
+        }
         meshData.offsets.emplace_back(meshData.indices.size(), meshData.vertices.size());
         auto rasterMesh = std::make_unique<Mesh<RasterVertex>>(vertexLayout(), drawMode());
         rasterMesh->compile(meshData);

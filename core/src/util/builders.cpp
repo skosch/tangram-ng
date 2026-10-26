@@ -55,6 +55,57 @@ bool isOutsideTile(const glm::vec2& p) {
             (p.y < tile_min) || (p.y > tile_max));
 }
 
+// Distance to the polygon boundary (capped), via a uniform bucket grid over the polygon's bbox. Segments lying ON
+//  the tile / tile-buffer clip lines are not real boundaries and are skipped.
+struct EdgeDistField {
+    float cap = 0.f, cell = 1.f;
+    glm::vec2 org;
+    int nx = 1, ny = 1;
+    std::vector<std::pair<glm::vec2, glm::vec2>> segs;
+    std::vector<std::vector<uint32_t>> buckets;
+
+    void build(const Tangram::Polygon& _poly, glm::vec2 _min, glm::vec2 _max, float _cap) {
+        cap = _cap;
+        const float tol = 0.0005f;
+        for (auto& ring : _poly) {
+            size_t n = ring.size();
+            for (size_t i = 0; i < n; i++) {
+                glm::vec2 a = ring[i], b = ring[(i + 1) % n];
+                if (a == b) { continue; }
+                bool clipX = std::abs(a.x - b.x) < 1e-6f && (a.x <= tol || a.x >= 1.f - tol);
+                bool clipY = std::abs(a.y - b.y) < 1e-6f && (a.y <= tol || a.y >= 1.f - tol);
+                if (clipX || clipY) { continue; }
+                segs.emplace_back(a, b);
+            }
+        }
+        glm::vec2 ext = _max - _min + glm::vec2(2.f * cap);
+        cell = std::max(cap, std::max(ext.x, ext.y) / 256.f);
+        org = _min - glm::vec2(cap);
+        nx = std::max(1, int(std::ceil(ext.x / cell)));
+        ny = std::max(1, int(std::ceil(ext.y / cell)));
+        buckets.assign(size_t(nx) * size_t(ny), {});
+        for (uint32_t k = 0; k < segs.size(); k++) {
+            glm::vec2 lo = glm::min(segs[k].first, segs[k].second) - glm::vec2(cap);
+            glm::vec2 hi = glm::max(segs[k].first, segs[k].second) + glm::vec2(cap);
+            int x0 = std::max(0, int(std::floor((lo.x - org.x) / cell))), x1 = std::min(nx - 1, int(std::floor((hi.x - org.x) / cell)));
+            int y0 = std::max(0, int(std::floor((lo.y - org.y) / cell))), y1 = std::min(ny - 1, int(std::floor((hi.y - org.y) / cell)));
+            for (int y = y0; y <= y1; y++) { for (int x = x0; x <= x1; x++) { buckets[size_t(y) * nx + x].push_back(k); } }
+        }
+    }
+    float dist(glm::vec2 p) const {
+        int cx = int(std::floor((p.x - org.x) / cell)), cy = int(std::floor((p.y - org.y) / cell));
+        if (cx < 0 || cy < 0 || cx >= nx || cy >= ny) { return cap; }
+        float best = cap * cap;
+        for (uint32_t k : buckets[size_t(cy) * nx + cx]) {
+            glm::vec2 a = segs[k].first, ab = segs[k].second - a, ap = p - a;
+            float t = glm::clamp(glm::dot(ap, ab) / std::max(glm::dot(ab, ab), 1e-20f), 0.f, 1.f);
+            glm::vec2 d = ap - t * ab;
+            best = std::min(best, glm::dot(d, d));
+        }
+        return std::sqrt(best);
+    }
+};
+
 // --- grid tessellation for terrain-draped polygons (see PolygonBuilder::gridRes) ---
 
 // Sutherland-Hodgman clip of a convex loop against an axis-aligned half-plane. Only valid for
@@ -157,6 +208,8 @@ static void buildPolygonGrid(const Polygon& _polygon, float _height, glm::vec2 _
     //  points on shared edges are computed bit-identically on both sides (see clipConvexAxis),
     //  so this also merges cell corners and grid-line crossings (no cracks, no duplicates)
     std::unordered_map<uint64_t, uint16_t> vertMap;
+    EdgeDistField edgeField;
+    if (_ctx.edgeDistCap > 0.f) { edgeField.build(_polygon, _min, _max, _ctx.edgeDistCap); }
     // NOT necessarily 0: buildPolygonExtrusion (polygonStyle.cpp addPolygon) may already have
     //  pushed wall indices into _ctx.indices for this same feature before grid tessellation
     //  runs (extrude + terrain_grid on the same style) - chunk index counts must exclude those.
@@ -171,7 +224,9 @@ static void buildPolygonGrid(const Polygon& _polygon, float _height, glm::vec2 _
         auto it = vertMap.find(key);
         if (it != vertMap.end()) { return it->second; }
         glm::vec3 coord(p.x, p.y, _height);
-        if (_ctx.useTexCoords) {
+        if (_ctx.edgeDistCap > 0.f) {
+            _ctx.addVertex(coord, glm::vec3(0.f, 0.f, 1.f), glm::vec2(edgeField.dist(p) / _ctx.edgeDistCap, 0.f));
+        } else if (_ctx.useTexCoords) {
             glm::vec2 uv(mapRange01(p.x, _min.x, _max.x), mapRange01(p.y, _max.y, _min.y));
             _ctx.addVertex(coord, glm::vec3(0.f, 0.f, 1.f), uv);
         } else {
@@ -313,6 +368,96 @@ static void buildPolygonGrid(const Polygon& _polygon, float _height, glm::vec2 _
                 // convex partial piece: split on the terrain diagonal, fan-triangulate each part
                 //  (winding preserved by the clipping)
                 emitCellPiece(piece, gx, gy);
+            }
+        }
+    }
+}
+
+// ---- tree scatter (see PolygonBuilder::TreeScatter) ----
+namespace {
+inline uint32_t treePcg(uint32_t v) {
+    uint32_t s = v * 747796405u + 2891336453u;
+    uint32_t w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+}
+
+void Builders::buildTreeScatter(const Polygon& _polygon, PolygonBuilder& _ctx) {
+    const auto& ts = _ctx.trees;
+    if (_polygon.empty() || _polygon[0].size() < 3 || ts.cells <= 0) { return; }
+    const int N = ts.cells;
+    glm::vec2 mn(std::numeric_limits<float>::max()), mx(std::numeric_limits<float>::lowest());
+    for (auto& p : _polygon[0]) { mn = glm::min(mn, p); mx = glm::max(mx, p); }
+    int i0 = std::max(0, int(std::floor(mn.x * N))), i1 = std::min(N - 1, int(std::floor(mx.x * N)));
+    int j0 = std::max(0, int(std::floor(mn.y * N))), j1 = std::min(N - 1, int(std::floor(mx.y * N)));
+    if (i1 < i0 || j1 < j0) { return; }
+
+    // edges bucketed per grid row (point-in-polygon by crossing parity, only the edges of the tree's own row)
+    struct Seg { glm::vec2 a, b; };
+    std::vector<Seg> segs;
+    for (auto& ring : _polygon) {
+        size_t n = ring.size();
+        for (size_t k = 0; k < n; k++) {
+            glm::vec2 a = ring[k], b = ring[(k + 1) % n];
+            if (a.y != b.y) { segs.push_back({a, b}); }
+        }
+    }
+    std::vector<std::vector<uint32_t>> rows(size_t(j1 - j0 + 1));
+    for (uint32_t k = 0; k < segs.size(); k++) {
+        float ylo = std::min(segs[k].a.y, segs[k].b.y), yhi = std::max(segs[k].a.y, segs[k].b.y);
+        int r0 = std::max(j0, int(std::floor(ylo * N))), r1 = std::min(j1, int(std::floor(yhi * N)));
+        for (int r = r0; r <= r1; r++) { rows[size_t(r - j0)].push_back(k); }
+    }
+
+    const float spacing = 1.f / float(N);                       // tile units
+    const float feather = ts.featherM / ts.tileScale;           // tile units
+    EdgeDistField field;
+    field.build(_polygon, mn, mx, std::max(feather * 1.05f, spacing));
+    const float crownR = 0.27f * spacing;
+    const float spacingM = spacing * ts.tileScale;              // projected metres (shader scales the tree size by this)
+
+    size_t chunkIndexStart = _ctx.indices.size();
+    for (int j = j0; j <= j1; j++) {
+        const auto& row = rows[size_t(j - j0)];
+        if (row.empty()) { continue; }
+        for (int i = i0; i <= i1; i++) {
+            uint32_t gi = ts.tileX * uint32_t(N) + uint32_t(i), gj = ts.tileY * uint32_t(N) + uint32_t(j);
+            uint32_t h0 = treePcg(gi ^ treePcg(gj + 0x9E3779B9u));
+            float u[4];
+            for (int k = 0; k < 4; k++) { u[k] = float(treePcg(h0 + uint32_t(k) * 0x85EBCA6Bu)) * (1.f / 4294967296.f); }
+            if (u[2] > 0.92f) { continue; }                      // a few empty cells
+            glm::vec2 p((float(i) + 0.5f + (u[0] - 0.5f) * 0.9f) * spacing, (float(j) + 0.5f + (u[1] - 0.5f) * 0.9f) * spacing);
+            // inside? (even-odd over all rings: holes work)
+            bool inside = false;
+            for (uint32_t k : row) {
+                const Seg& s = segs[k];
+                if ((s.a.y > p.y) != (s.b.y > p.y)) {
+                    float xc = s.a.x + (p.y - s.a.y) / (s.b.y - s.a.y) * (s.b.x - s.a.x);
+                    if (xc > p.x) { inside = !inside; }
+                }
+            }
+            if (!inside) { continue; }
+            // thinning: this tree is kept iff its random id is below the density at ITS OWN position - whole trees only
+            float d = field.dist(p);
+            float rho = glm::clamp((d - crownR) / std::max(feather - crownR, 1e-6f), 0.f, 1.f);
+            if (u[3] >= rho) { continue; }
+            if (_ctx.numVertices + 12 > 65000) {
+                _ctx.chunkOffsets.emplace_back(_ctx.indices.size() - chunkIndexStart, _ctx.numVertices);
+                chunkIndexStart = _ctx.indices.size();
+                _ctx.numVertices = 0;
+            }
+            float rnd = float(treePcg(h0 ^ 0x68E31DA4u)) * (1.f / 4294967296.f);
+            glm::vec2 uv(rnd, std::min(spacingM / 256.f, 1.f));
+            for (int pl = 0; pl < 3; pl++) {
+                uint16_t b = uint16_t(_ctx.numVertices);
+                const float cu[4] = { -1.f, 1.f, 1.f, -1.f }, cv[4] = { 0.f, 0.f, 1.f, 1.f };
+                for (int c = 0; c < 4; c++) {
+                    _ctx.addVertex(glm::vec3(p.x, p.y, 0.f), glm::vec3(cu[c], cv[c], float(pl) * 40.f / 127.f), uv);
+                    _ctx.numVertices++;
+                }
+                // both windings: the crosses are seen from every side
+                const uint16_t tri[12] = { 0, 1, 2, 0, 2, 3, 0, 2, 1, 0, 3, 2 };
+                for (uint16_t t : tri) { _ctx.indices.push_back(uint16_t(b + t)); }
             }
         }
     }
@@ -583,7 +728,10 @@ void Builders::buildPolygon(const Polygon& _polygon, float _height, PolygonBuild
         auto& p = _polygon[ring][src - offset];
         glm::vec3 coord(p.x, p.y, _height);
 
-        if (_ctx.useTexCoords) {
+        if (_ctx.edgeDistCap > 0.f) {
+            // not grid-tessellated: every vertex is a boundary point of a tiny polygon (gridRes > 0), or no terrain
+            _ctx.addVertex(coord, glm::vec3(0.0, 0.0, 1.0), glm::vec2(_ctx.gridRes > 0 ? 0.f : 1.f, 0.f));
+        } else if (_ctx.useTexCoords) {
             glm::vec2 uv(mapRange01(coord.x, min.x, max.x), mapRange01(coord.y, max.y, min.y));
 
             _ctx.addVertex(coord, glm::vec3(0.0, 0.0, 1.0), uv);

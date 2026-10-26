@@ -67,6 +67,10 @@ public:
 
     void clearMesh();
 
+    // True once a build for builtZoomLevel() has run, even if it produced no mesh (an area label
+    // that does not fit at this zoom): without this an empty result is rebuilt every frame.
+    bool isBuilt() const { return m_built; }
+
     void setTexture(std::unique_ptr<Texture> texture);
 
     // Set an ease for the origin of this marker in Mercator meters.
@@ -151,6 +155,8 @@ protected:
     uint32_t m_styleId = 0;
 
     int m_builtZoomLevel = -1;
+
+    bool m_built = false;
 
     uint32_t m_selectionColor = 0;
 

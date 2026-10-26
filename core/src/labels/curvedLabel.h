@@ -49,6 +49,17 @@ public:
 
     void applyAnchor(LabelProperty::Anchor _anchor) override;
 
+    void setCandidatePriority(float _p) { m_prio = _p; }
+
+    /// Area labels: the path is a stretch of a shape's spine, longer than the text. The text stays
+    /// where it is (anchored to the map) until it would leave the view or no longer fit between
+    /// the shores; only then does it move, to the place nearest the middle of the view. `_clearance` is the inscribed
+    /// radius at each vertex (model units), `_halfHeight` the clearance the text needs (px).
+    /// `_slot` > 0: a spare place beside the best one (the label manager takes the first of a
+    /// group that is not blocked by another label).
+    void setSlide(const std::vector<glm::vec2>& _path, const std::vector<float>& _clearance, float _halfHeight,
+                  float _margin, int _slot);
+
     float candidatePriority() const override {
         return m_prio;
     }
@@ -66,6 +77,16 @@ protected:
     size_t m_screenAnchorPoint;
 
     float m_prio = 0;
+
+    std::vector<float> m_slideClear;
+    std::vector<float> m_slideArc;   // arc length of each vertex in model units
+    float m_slideS = -1.f;           // where the text sits (model arc length); kept until it must move
+    float m_slideHalfH = 0.f;
+    float m_slideMargin = 0.f;
+    int m_slideSlot = 0;
+
+    bool slideTransform(const std::vector<glm::vec2>& _screen, glm::vec2 _view, ScreenTransform& _transform,
+                        bool _noFlip);
 };
 
 }

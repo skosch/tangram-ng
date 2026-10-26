@@ -22,10 +22,22 @@ public:
     void setTerrainGrid(int _res) { m_terrainGrid = _res; }
     int activeTerrainGrid() const { return m_activeTerrainGrid; }
 
+    // 'edge_distance' style parameter (projected metres, 0 = off): vertex texcoord.x = distance to the polygon
+    //  boundary / this cap (see PolygonBuilder::edgeDistCap). Implies texcoords.
+    void setEdgeDistance(float _m) { m_edgeDistance = _m; }
+    float edgeDistance() const { return m_edgeDistance; }
+
+    // 'tree_scatter' style parameter (projected metres, 0 = off): draw whole trees scattered inside the polygon instead of its fill
+    //  (Builders::buildTreeScatter); the value is the feather length over which the tree density ramps up from the outline.
+    void setTreeScatter(float _m) { m_treeScatter = _m; }
+    float treeScatter() const { return m_treeScatter; }
+
 protected:
 
     int m_terrainGrid = 0;
     int m_activeTerrainGrid = 0;
+    float m_edgeDistance = 0.f;
+    float m_treeScatter = 0.f;
 
 };
 

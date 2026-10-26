@@ -150,6 +150,8 @@ void LabelCollider::process(TileID _tileID, float _tileInverseScale, float _tile
         0.f, // fractZoom
         screenSize, // viewPortSize
         _tileSize, // screenTileSize
+        0.f, // bendTan (no terrain bend for the offscreen collider)
+        1.f, // bendRadius
     };
 
     m_obbs.clear();

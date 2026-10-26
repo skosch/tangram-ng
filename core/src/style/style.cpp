@@ -332,6 +332,23 @@ void Style::onBeginDrawFrame(RenderState& rs, const View& _view) {
         default:
             break;
     }
+
+    // stencil bit 0x80 = "does its own terrain lighting" (see style.h). Raw GL calls on purpose: the translucent
+    //  de-dup pass in draw() sets stencil state behind RenderState's cache.
+    if (m_stencilWrite >= 0) {
+        GL::enable(GL_STENCIL_TEST);
+        GL::stencilMask(0x80);
+        GL::stencilFunc(GL_ALWAYS, m_stencilWrite ? 0x80 : 0x00, 0x80);
+        GL::stencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+    } else if (m_stencilSkip) {
+        GL::enable(GL_STENCIL_TEST);
+        GL::stencilMask(0x00);
+        GL::stencilFunc(GL_NOTEQUAL, 0x80, 0x80);
+        GL::stencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+    } else {
+        GL::disable(GL_STENCIL_TEST);
+        GL::stencilMask(0xFF);
+    }
 }
 
 void Style::drawSelectionFrame(RenderState& rs, const View& _view,
@@ -451,14 +468,17 @@ bool Style::draw(RenderState& rs, const View& _view,
             GL::depthFunc(GL_EQUAL);
 
             GL::enable(GL_STENCIL_TEST);
+            // bit 0x80 belongs to stencil_write/stencil_skip (see style.h): this de-dup pass only uses 0x7F
+            GL::stencilMask(0x7F);
             GL::clear(GL_STENCIL_BUFFER_BIT);
-            GL::stencilFunc(GL_EQUAL, GL_ZERO, 0xFF);
+            GL::stencilFunc(GL_EQUAL, GL_ZERO, 0x7F);
             GL::stencilOp(GL_KEEP, GL_KEEP, GL_INCR);
 
             for (const auto &tile : _tiles) { draw(rs, *tile); }
             for (const auto &marker : _markers) { draw(rs, *marker); }
 
             GL::disable(GL_STENCIL_TEST);
+            GL::stencilMask(0xFF);
             GL::depthFunc(GL_LESS);
         }
     }
@@ -480,10 +500,12 @@ bool Style::draw(RenderState& rs, const Tile& _tile) {
     setupTileShaderUniforms(rs, _tile, *m_shaderProgram, m_mainUniforms);
 
     Profiler::counterAdd("drawCalls", 1);
+    MeshBase::drawInstances = std::max(m_instances, 1);
     if (!styleMesh->draw(rs, *m_shaderProgram)) {
         LOGN("Mesh built by style %s cannot be drawn", m_name.c_str());
         styleMeshDrawn = false;
     }
+    MeshBase::drawInstances = 1;
 
     rs.resetTextureUnit(prevTexUnit);
 

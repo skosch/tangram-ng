@@ -70,6 +70,7 @@ MODULE_SOURCES = \
   src/style/style.cpp                 \
   src/style/textStyle.cpp             \
   src/style/textStyleBuilder.cpp      \
+  src/style/areaLabelStyle.cpp        \
   src/style/contourTextStyle.cpp      \
   src/text/fontContext.cpp            \
   src/text/textUtil.cpp               \
@@ -84,6 +85,9 @@ MODULE_SOURCES = \
   src/util/extrude.cpp                \
   src/util/floatFormatter.cpp         \
   src/util/geom.cpp                   \
+  src/labels/areaLabelManager.cpp     \
+  src/labels/areaRegistry.cpp         \
+  src/util/areaShape.cpp              \
   src/util/labelPath.cpp              \
   src/util/inputHandler.cpp           \
   src/util/jobQueue.cpp               \

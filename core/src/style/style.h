@@ -145,6 +145,13 @@ protected:
     Blending m_blend = Blending::opaque;
     int m_blendOrder = -1;
 
+    /* Stencil bit 0x80 marks "this pixel does its own terrain lighting": a style with stencil_write
+     *  sets it where it draws (stencil_write: true) or clears it (false); a style with stencil_skip
+     *  (the hillshade veil) does not draw where it is set. -1 = unused. */
+    int m_stencilWrite = -1;
+    int m_instances = 1;
+    bool m_stencilSkip = false;
+
     /* Draw mode to pass into <Mesh>es created with this style */
     GLenum m_drawMode;
 
@@ -253,6 +260,10 @@ public:
 
     void setBlendMode(Blending _blendMode) { m_blend = _blendMode; }
     void setBlendOrder(int _blendOrder) { m_blendOrder = _blendOrder; }
+    void setStencilWrite(int _v) { m_stencilWrite = _v; }
+    // 'instances' style param: every mesh of this style is drawn this many times (gl_InstanceID in the vertex shader)
+    void setInstances(int _n) { m_instances = _n; }
+    void setStencilSkip(bool _v) { m_stencilSkip = _v; }
 
     /* Whether or not the style is animated */
     bool isAnimated() { return m_animated; }

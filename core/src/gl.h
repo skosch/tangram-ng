@@ -249,6 +249,12 @@ typedef char            GLchar;
 #define GL_COLOR_ATTACHMENT0            0x8CE0
 #define GL_DEPTH_ATTACHMENT             0x8D00
 #define GL_STENCIL_ATTACHMENT           0x8D20
+#ifndef GL_DEPTH24_STENCIL8
+#define GL_DEPTH24_STENCIL8             0x88F0
+#endif
+#ifndef GL_DEPTH_STENCIL_ATTACHMENT
+#define GL_DEPTH_STENCIL_ATTACHMENT     0x821A
+#endif
 #define GL_NONE                         0
 #define GL_FRAMEBUFFER_COMPLETE         0x8CD5
 #define GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT 0x8CD6
@@ -402,6 +408,8 @@ struct GL {
     static void drawArrays(GLenum mode, GLint first, GLsizei count );
     static void drawElements(GLenum mode, GLsizei count,
                              GLenum type, const GLvoid *indices );
+    static void drawElementsInstanced(GLenum mode, GLsizei count,
+                             GLenum type, const GLvoid *indices, GLsizei instances);
 
     static void uniform1f(GLint location, GLfloat v0);
     static void uniform2f(GLint location, GLfloat v0, GLfloat v1);

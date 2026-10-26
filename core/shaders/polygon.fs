@@ -26,6 +26,7 @@ varying vec3 v_normal;
 
 #ifdef TANGRAM_RASTER_STYLE
     uniform vec4 u_color;
+    varying float v_is_skirt;  // terrain mesh skirt fragment (rasterStyle.cpp)
 #else
     varying vec4 v_color;
 #endif

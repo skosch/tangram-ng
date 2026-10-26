@@ -81,6 +81,7 @@ void Marker::setMesh(uint32_t styleId, uint32_t zoom, std::unique_ptr<StyledMesh
     m_mesh = std::move(mesh);
     m_styleId = styleId;
     m_builtZoomLevel = zoom;
+    m_built = true;
 
     float scale;
     if (m_feature && m_feature->geometryType == GeometryType::points) {
@@ -93,6 +94,7 @@ void Marker::setMesh(uint32_t styleId, uint32_t zoom, std::unique_ptr<StyledMesh
 
 void Marker::clearMesh() {
     m_mesh.reset();
+    m_built = false;
 }
 
 void Marker::setEase(const glm::dvec2& dest, float duration, EaseType e) {

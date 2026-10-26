@@ -306,7 +306,7 @@ MarkerManager::UpdateState MarkerManager::update(const View& _view, float _dt) {
         if (!marker->isVisible()) { continue; }
 
         int builtZoom = marker->builtZoomLevel();
-        if (m_zoom != builtZoom || !marker->mesh()) {
+        if (m_zoom != builtZoom || !marker->isBuilt()) {
             if (builtZoom < 0) { buildStyling(*marker); }
 
             // prevent continuous rendering if marker styling fails

@@ -508,7 +508,7 @@ void Map::render() {
             // 24-bit depth: the default framebuffer's depth precision is relied on by draped
             //  polygons coinciding with the terrain surface
             impl->sceneBuffer = std::make_unique<FrameBuffer>(scaledW, scaledH, false, GL_RGBA8,
-                                                              GL_DEPTH_COMPONENT24, true);
+                                                              GL_DEPTH24_STENCIL8, true);
         }
         scaledTarget = impl->sceneBuffer->applyAsRenderTarget(renderState, impl->background.toColorF());
         if (scaledTarget) {
